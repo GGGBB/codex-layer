@@ -68,6 +68,91 @@ fn compaction_trigger_detection() {
 }
 
 #[test]
+fn compaction_trigger_is_detected_in_any_position() {
+    // GAP_ANALYSIS P0-5：旧实现只看「从尾部数第一个带 type 的 item」，
+    // trigger 一旦被客户端放到中间就整轮漏检。
+    let mid_trigger = json!({
+        "model": "m",
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "x" }] },
+            { "type": "compaction_trigger" },
+            { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "y" }] }
+        ]
+    });
+    assert!(request_has_compaction_trigger(&mid_trigger), "非末尾 trigger 也必须检出");
+
+    // 末尾是无 type 的空壳 item 时，旧实现会停在它前面那一项；放宽后不再受位序影响。
+    let trigger_then_tail_item = json!({
+        "model": "m",
+        "input": [
+            { "type": "compaction_trigger" },
+            { "id": "tail_without_type" }
+        ]
+    });
+    assert!(request_has_compaction_trigger(&trigger_then_tail_item));
+}
+
+#[tokio::test]
+async fn compaction_trigger_is_stripped_from_every_position_for_chat_upstream() {
+    // GAP_ANALYSIS P0-5：ChatCompletions 上游的压缩轮必须把全部 trigger
+    // 剥净并注入摘要指令；旧实现只弹尾部，中间那份会原样透给上游。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        r#"{"id":"resp_strip","object":"response","status":"completed","output":[]}"#.to_string(),
+    ));
+    let settings = BackendSettings {
+        active_relay_id: "strip".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "strip".to_string(),
+            name: "strip".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            base_url: format!("http://{address}/v1"),
+            api_key: "sk-strip".to_string(),
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+    let request_body = json!({
+        "model": "deepseek-v4-flash",
+        "stream": false,
+        "input": [
+            { "type": "message", "role": "user",
+              "content": [{ "type": "input_text", "text": "older turn" }] },
+            { "type": "compaction_trigger" },
+            { "type": "message", "role": "assistant",
+              "content": [{ "type": "output_text", "text": "older answer" }] },
+            { "type": "compaction_trigger" }
+        ]
+    });
+    let result = open_responses_proxy_request_with_settings(
+        &serde_json::to_string(&request_body).unwrap(),
+        settings,
+    )
+    .await
+    .unwrap();
+    let (headers, upstream_body) = server.await.unwrap();
+    assert_eq!(result.status_code, 200);
+    assert!(
+        headers.starts_with("POST /v1/chat/completions HTTP/1.1"),
+        "{headers}"
+    );
+    let forwarded = upstream_body.to_string();
+    assert!(
+        !forwarded.contains("compaction_trigger"),
+        "全部 trigger 必须剥净: {forwarded}"
+    );
+    assert!(
+        forwarded.contains("CONTEXT CHECKPOINT COMPACTION"),
+        "检出压缩轮后必须注入摘要指令: {forwarded}"
+    );
+}
+
+#[test]
 fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
     let converted = responses_to_chat_completions(json!({
         "model": "deepseek-v4-flash",

@@ -208,37 +208,24 @@ const COMPACTION_SUMMARY_INSTRUCTION: &str = "You are performing a CONTEXT CHECK
 const COMPACTION_REPLAY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. Here is the summary produced by the other language model:\n";
 
 /// 判断 Responses 请求体是否为 codex v2 远程压缩请求：
-/// input 末尾（允许中间有尾随的空壳 item）存在 `compaction_trigger`。
+/// 当前 Codex 把 trigger 追加在 input 末尾；这里仍接受任意位置，避免漏检。
 pub fn request_has_compaction_trigger(body: &Value) -> bool {
     body.get("input")
         .and_then(Value::as_array)
-        .and_then(|items| {
-            items
-                .iter()
-                .rev()
-                .find(|item| item.get("type").and_then(Value::as_str).is_some())
-                .map(|item| {
-                    item.get("type").and_then(Value::as_str) == Some(COMPACTION_TRIGGER_TYPE)
-                })
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some(COMPACTION_TRIGGER_TYPE)
+            })
         })
-        .unwrap_or(false)
 }
 
-/// 从请求 input 中剥离 `compaction_trigger` 控制项，返回去掉后的请求体。
-/// codex 只把它放在 input 末尾，其余位置的按未知类型忽略。
+/// 从请求 input 中剥离全部 `compaction_trigger` 控制项，返回去掉后的请求体。
+/// 只在确认上游没有原生 compaction 项、需要改写成普通摘要请求时调用。
 fn strip_compaction_trigger(mut body: Value) -> Value {
-    if let Some(items) = body
-        .get_mut("input")
-        .and_then(Value::as_array_mut)
-        .filter(|items| !items.is_empty())
-    {
-        while items
-            .last()
-            .and_then(|item| item.get("type").and_then(Value::as_str))
-            == Some(COMPACTION_TRIGGER_TYPE)
-        {
-            items.pop();
-        }
+    if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+        items.retain(|item| {
+            item.get("type").and_then(Value::as_str) != Some(COMPACTION_TRIGGER_TYPE)
+        });
     }
     body
 }
