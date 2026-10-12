@@ -152,6 +152,63 @@ async fn compaction_trigger_is_stripped_from_every_position_for_chat_upstream() 
     );
 }
 
+#[tokio::test]
+async fn json_compaction_summary_on_stream_request_is_not_flagged_as_stream() {
+    // GAP_ANALYSIS P0-6：请求 stream=true、但兼容上游直接回 application/json 摘要时
+    //（部分网关无视 stream），旧实现仍把响应标为 stream，上游返回的 JSON 会被
+    // 当成 SSE 解析，提出 0 段文本后只能给出 failed 压缩响应。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let summary = r#"{"id":"resp_json_summary","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"COMPACTED_JSON_SUMMARY"}]}]}"#;
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        summary.to_string(),
+    ));
+    let settings = BackendSettings {
+        active_relay_id: "json-summary".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "json-summary".to_string(),
+            name: "json-summary".to_string(),
+            protocol: RelayProtocol::ChatCompletions,
+            base_url: format!("http://{address}/v1"),
+            api_key: "sk-json-summary".to_string(),
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    };
+    let request_body = json!({
+        "model": "deepseek-v4-flash",
+        "stream": true,
+        "input": [
+            { "type": "message", "role": "user",
+              "content": [{ "type": "input_text", "text": "long history" }] },
+            { "type": "compaction_trigger" }
+        ]
+    });
+    let result = open_responses_proxy_request_with_settings(
+        &serde_json::to_string(&request_body).unwrap(),
+        settings,
+    )
+    .await
+    .unwrap();
+    let (headers, upstream_body) = server.await.unwrap();
+    assert!(
+        headers.starts_with("POST /v1/chat/completions HTTP/1.1"),
+        "{headers}"
+    );
+    assert!(upstream_body["stream"].as_bool().unwrap_or(false), "请求侧仍按 stream 转发");
+    assert_eq!(result.status_code, 200);
+    assert!(result.compaction, "压缩轮标记必须保留");
+    assert!(
+        !result.is_stream,
+        "application/json 摘要不得标记为 stream，否则会被送进 SSE 解析路径"
+    );
+    assert!(result.content_type.contains("application/json"));
+}
+
 #[test]
 fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
     let converted = responses_to_chat_completions(json!({

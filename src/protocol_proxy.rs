@@ -1415,9 +1415,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             "headerTimeoutSeconds": header_timeout.as_secs()
         }),
     );
+    // 请求侧 stream=true 但上游回的是 JSON 摘要：判定为非流式，交非流式包装器。
+    let json_compaction = is_compaction_request
+        && content_type
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
     Ok(UpstreamProxyResponse {
         status_code,
-        is_stream: is_stream || content_type.contains("text/event-stream"),
+        // GAP_ANALYSIS P0-6：请求了 SSE 的兼容上游也可能直接返回 JSON 摘要
+        // （部分网关无视 stream 直接回 application/json）。若仍按请求侧 stream
+        // 标记，main.rs 会把 JSON 摘要丢进 SSE 解析路径，提出 0 段文本后
+        // 只能给出 failed 压缩响应。这里改由响应侧 content-type 决断，
+        // JSON 摘要交给非流式包装器。
+        is_stream: (is_stream && !json_compaction) || content_type.contains("text/event-stream"),
         content_type,
         wire_api,
         compaction: is_compaction_request,
