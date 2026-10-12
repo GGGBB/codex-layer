@@ -41,6 +41,7 @@ use codex_layer::protocol_proxy::{
     open_image_edits_proxy_request, open_image_generations_proxy_request,
     open_models_proxy_request, open_responses_proxy_request_for_path_with_session_headers,
     responses_error_from_upstream, wrap_non_stream_response_as_compaction,
+    upstream_conversion_error_response,
 };
 
 /// 请求体上限（含解压后），与 CodexPlusPlus 的协议代理一致：32 MB。
@@ -347,6 +348,21 @@ fn proxy_error(path: &str, status: StatusCode, message: &str) -> Response {
     )
 }
 
+/// 转换层主动拒答的出口：闸门错误返回结构化的 Responses 错误（400 +
+/// 可行动文案），其余错误保持原有的 502 + 文本消息行为不变。
+fn proxy_conversion_error(path: &str, error: &anyhow::Error) -> Response {
+    if let Some((status_code, body)) = upstream_conversion_error_response(error) {
+        let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
+        let _ = log_event(
+            "codex_layer.conversion_rejected",
+            json!({ "path": path, "status": status_code, "error": error.to_string() }),
+        );
+        tracing::warn!(target: "codex-layer", path = %path, error = %error, "转换层拒绝请求");
+        return json_response(status, body);
+    }
+    proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string())
+}
+
 fn json_response(status: StatusCode, value: Value) -> Response {
     let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
     Response::builder()
@@ -485,7 +501,7 @@ async fn responses_proxy(
     .await
     {
         Ok(upstream) => upstream,
-        Err(error) => return proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string()),
+        Err(error) => return proxy_conversion_error(path, &error),
     };
     if !upstream.is_success() {
         return match upstream_error(upstream, path).await {
@@ -568,7 +584,7 @@ async fn chat_completions_proxy(body: &str, user_agent: Option<&str>, path: &str
     let upstream = match open_chat_completions_proxy_request(body, user_agent).await
     {
         Ok(upstream) => upstream,
-        Err(error) => return proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string()),
+        Err(error) => return proxy_conversion_error(path, &error),
     };
     let status = StatusCode::from_u16(upstream.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = if upstream.content_type.is_empty() {

@@ -13,8 +13,9 @@ use codex_layer::protocol_proxy::{
     open_responses_proxy_request_with_settings_for_path_and_session_headers,
     request_has_compaction_trigger, responses_compact_url, responses_error_from_upstream,
     responses_to_chat_completions, responses_to_chat_completions_with_options,
-    send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
-    upstream_stream_header_timeout, wrap_non_stream_response_as_compaction,
+    send_upstream_request_with_header_timeout, upstream_conversion_error_response,
+    upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
+    wrap_non_stream_response_as_compaction,
 };
 use codex_layer::relay_config::test_relay_profile;
 use codex_layer::settings::{
@@ -298,10 +299,10 @@ fn legacy_session_replays_bare_summary_regardless_of_content_shape() {
 }
 
 #[test]
-fn mixed_session_unmarked_compaction_item_is_not_replayed() {
-    // 新格式已在该会话出现之后，未标记项不能再当自家摘要回放
-    // （GAP_ANALYSIS P0-2；P0-3 会把这个位置升级为显式 400）。
-    let converted = responses_to_chat_completions(json!({
+fn mixed_session_unmarked_compaction_item_fails_loud() {
+    // 新格式已在该会话出现之后，未标记项既不能当自家摘要回放，也不能静默丢弃
+    // （GAP_ANALYSIS P0-2 命名空间 + P0-3 fail-loud 闸门）。
+    let error = responses_to_chat_completions(json!({
         "model": "deepseek-v4-flash",
         "input": [
             local_compaction_item("MARKED_SUMMARY"),
@@ -310,12 +311,14 @@ fn mixed_session_unmarked_compaction_item_is_not_replayed() {
               "content": [{ "type": "input_text", "text": "current task" }] }
         ]
     }))
-    .unwrap();
-    let serialized = converted["messages"].to_string();
-    assert!(serialized.contains("MARKED_SUMMARY"), "带标记摘要必须回放：{serialized}");
+    .expect_err("未标记的原生状态必须明确报错，不得静默抽成空任务");
+    // 错误码在结构化错误体里（Display 只给用户看的可行动文案，不带码）。
+    let (status, body) = upstream_conversion_error_response(&error).expect("闸门给状态码");
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "native_compaction_unsupported");
     assert!(
-        !serialized.contains("UNMARKED_SENTINEL"),
-        "未标记项不得被伪造成摘要文本：{serialized}"
+        !body.to_string().contains("UNMARKED_SENTINEL"),
+        "错误体不得回显 opaque 原文：{body}"
     );
 }
 
@@ -359,45 +362,102 @@ fn encrypted_content_part_in_agent_message_is_forwarded_in_order() {
 }
 
 #[test]
-fn opaque_encrypted_content_part_fails_loud() {
-    // opaque（base64 高熵）形态的 encrypted_content 片段无法在 Chat 协议里表达，
-    // 必须返回明确的不支持错误（fail loud），而不是静默删除后继续发空任务。
-    // 这串是随机字节 base64 后的典型密文编码形态。
+fn chat_conversion_rejects_opaque_encrypted_agent_content_without_echoing_payload() {
+    // GAP_ANALYSIS P0-3：opaque 片段、空片段、顶层独立 encrypted_content 项
+    // 都要给出结构化错误，且错误不回显原文。
     let opaque = "mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh";
-    let err = responses_to_chat_completions(json!({
-        "model": "deepseek-v4-flash",
-        "input": [
-            { "type": "agent_message", "id": "amsg_opaque",
-              "content": [{ "type": "encrypted_content", "encrypted_content": opaque }] }
-        ]
-    }))
-    .expect_err("opaque 片段应触发明确错误，不得静默透传或静默丢弃");
-    let message = err.to_string();
-    assert!(
-        message.contains("encrypted_content") && message.contains("opaque"),
-        "错误信息必须可诊断，点明 encrypted_content 无法在当前 Chat 转换中表达：{message}"
-    );
+    for input in [
+        // agent 消息里的 opaque 片段（text 与 encrypted_content 两种键名写法）。
+        json!([{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"Payload:"},
+            {"type":"encrypted_content","text":opaque}
+        ]}]),
+        json!([{"type":"agent_message","content":[
+            {"type":"encrypted_content","encrypted_content":opaque}
+        ]}]),
+        // 顶层独立 encrypted_content item：旧实现落到兜底分支静默丢弃。
+        json!([{"type":"encrypted_content","encrypted_content":opaque}]),
+        json!({"type":"encrypted_content","encrypted_content":opaque}),
+        // 顶层明文形态同样走闸门：本层保不住 agent 消息的角色与结构，不假装能转。
+        json!([{"type":"encrypted_content","encrypted_content":"AGENT_PAYLOAD_SENTINEL"}]),
+        // 空片段：#2474 语义，静默跳过等于发出被抽空内容的请求。
+        json!([{"type":"message","role":"user","content":[{"type":"encrypted_content"}]}]),
+        json!([{"type":"message","role":"user","content":[{"type":"encrypted_content","text":""}]}]),
+    ] {
+        for standard in [false, true] {
+            let error = responses_to_chat_completions_with_options(
+                json!({"model":"custom-model","input":input}),
+                standard,
+                false,
+            )
+            .expect_err(
+                "opaque / 空 / 顶层加密 agent 内容必须明确拒绝，不能静默丢弃或当作文本转发",
+            );
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains("unsupported_encrypted_agent_content"),
+                "错误必须带错误码：{diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(opaque),
+                "错误不得回显 opaque 原文：{diagnostic}"
+            );
+        }
+    }
 }
 
 #[test]
-fn standalone_encrypted_content_item_is_no_longer_expanded() {
-    // 维护者异议成立：顶层独立 encrypted_content 项在真实流量里 0 命中，
-    // 把它改写成 user 消息可能丢失角色与结构。该展开分支已删除，
-    // 此形态回到上游默认行为：不再被展开成 user 消息。
-    let converted = responses_to_chat_completions(json!({
+fn chat_conversion_rejects_invalid_local_compaction_history() {
+    // GAP_ANALYSIS P0-3：带本项目命名空间但解不出摘要的项属「新格式损坏」，
+    // 既不能回放也不能静默抽成空任务。
+    for content in [
+        "codexlayer:summary:v1:not-json",
+        "codexlayer:summary:v1:{}",
+        "codexlayer:summary:v1:\"\"",
+        "codexlayer:summary:v2:\"future-format\"",
+    ] {
+        for input in [
+            json!([{"type": "compaction", "encrypted_content": content}]),
+            json!({"type": "compaction", "encrypted_content": content}),
+        ] {
+            let error = responses_to_chat_completions(json!({
+                "model": "deepseek-v4-flash",
+                "input": input,
+            }))
+            .expect_err("命名空间内不可用的项必须报错，不得静默丢弃：{content}");
+            let (status, body) = upstream_conversion_error_response(&error).expect("闸门给状态码");
+            assert_eq!(status, 400, "错误码位置：{content}");
+            assert_eq!(
+                body["error"]["code"], "native_compaction_unsupported",
+                "错误码位置：{content}"
+            );
+        }
+    }
+}
+
+#[test]
+fn future_format_item_disables_legacy_replay_for_unmarked_item() {
+    // 命名空间族守卫：本层读不懂的 v2 项出现后，同段 input 里的未标记项
+    // 必须走闸门报错，不能再被旧格式回退当成摘要播放。回退判据若只认
+    // v1 前缀，本用例在修复前会把 NATIVE_OPAQUE_SENTINEL 回放进 user 文本。
+    let error = responses_to_chat_completions(json!({
         "model": "deepseek-v4-flash",
         "input": [
             { "type": "message", "role": "user",
               "content": [{ "type": "input_text", "text": "current task" }] },
-            { "type": "encrypted_content", "encrypted_content": "AGENT_PAYLOAD_SENTINEL" }
+            { "type": "compaction", "encrypted_content": "codexlayer:summary:v2:\"future-format\"" },
+            { "type": "compaction", "encrypted_content": "NATIVE_OPAQUE_SENTINEL" }
         ]
     }))
-    .unwrap();
-
-    let serialized = converted["messages"].to_string();
+    .expect_err("族内未来版本项必须关闭旧格式回退，未标记项不得被回放");
+    let (status, body) = upstream_conversion_error_response(&error).expect("闸门给状态码");
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "native_compaction_unsupported");
+    let serialized = body.to_string();
     assert!(
-        !serialized.contains("AGENT_PAYLOAD_SENTINEL"),
-        "独立 encrypted_content 项不应再被展开成 user 消息：{serialized}"
+        !serialized.contains("NATIVE_OPAQUE_SENTINEL")
+            && !serialized.contains("codexlayer:summary:v2:"),
+        "错误体不得回显原文：{serialized}"
     );
 }
 
@@ -504,6 +564,47 @@ fn wrap_non_stream_response_produces_single_compaction_item() {
             .count(),
         1
     );
+}
+
+#[test]
+fn gates_map_to_actionable_responses_errors() {
+    // GAP_ANALYSIS P0-3：闸门要给出可行动的文案与错误码，而不是笼统的转换失败。
+    let native = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            local_compaction_item("MARKED_SUMMARY"),
+            { "type": "compaction", "encrypted_content": "OPAQUE_NATIVE" }
+        ]
+    }))
+    .expect_err("混合会话的原生状态必须报错");
+    let (status, body) = upstream_conversion_error_response(&native).expect("闸门给状态码");
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "native_compaction_unsupported");
+    assert_eq!(body["error"]["type"], "compaction_incompatible");
+    // 文案可行动：换 Responses 上游或新开会话。
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("Responses upstream") && message.contains("new conversation"),
+        "{message}"
+    );
+
+    let agent_content = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [{ "type": "encrypted_content" }],
+    }))
+    .expect_err("空片段必须报错");
+    let (status, body) = upstream_conversion_error_response(&agent_content).expect("闸门给状态码");
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "unsupported_encrypted_agent_content");
+    assert_eq!(body["error"]["param"], "input");
+
+    // 普通请求不是闸门错误：普通历史轮要照常转换。
+    let ok = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [{ "type": "message", "role": "user",
+          "content": [{ "type": "input_text", "text": "normal turn" }] }],
+    }));
+    assert!(ok.is_ok(), "普通请求必须照常转换");
 }
 
 #[test]

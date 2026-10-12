@@ -206,6 +206,9 @@ const COMPACTION_OUTPUT_TYPE: &str = "compaction";
 /// 后缀为 JSON string，不依赖客户端可能丢弃的 item id 或额外字段。
 /// 命名空间用本项目标识，不携带上游产品名。
 const LOCAL_COMPACTION_PREFIX: &str = "codexlayer:summary:v1:";
+/// 命名空间族（不含版本号）。旧格式的一次性回退展开必须避开整个族：
+/// 未来版本（如 v2）的项属「本层读不懂的新格式」，回放成文本等于猜测语义。
+const LOCAL_COMPACTION_NAMESPACE: &str = "codexlayer:summary:";
 /// 本地代理生成摘要时注入的 user 指令（对齐 openai/codex prompts/templates/compact/prompt.md）。
 const COMPACTION_SUMMARY_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.";
 /// 历史回放时 `compaction` item 展开成的文本前缀（对齐 codex SUMMARY_PREFIX 语义）。
@@ -363,6 +366,77 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
+/// Chat 转换遇到无法表达的加密 agent 内容时的结构化错误（GAP_ANALYSIS P0-3）：
+/// 不能静默跳过空片段后继续发一个被抽空任务内容的请求。
+#[derive(Debug)]
+pub struct UnsupportedEncryptedAgentContent;
+
+impl std::fmt::Display for UnsupportedEncryptedAgentContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported_encrypted_agent_content: Chat Completions 上游无法处理加密的 agent 消息内容，请使用支持该协议的 Responses 上游"
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedEncryptedAgentContent {}
+
+impl UnsupportedEncryptedAgentContent {
+    pub fn response_body(&self) -> Value {
+        json!({"error":{
+            "type":"invalid_request_error",
+            "code":"unsupported_encrypted_agent_content",
+            "param":"input",
+            "message":self.to_string()
+        }})
+    }
+}
+
+/// 历史里的原生压缩状态无法转成文本摘要时的结构化错误（GAP_ANALYSIS P0-3）：
+/// 错误体给可行动文案（换 Responses 上游或新开会话），不假装能转换。
+#[derive(Debug)]
+pub struct NativeCompactionUnsupported {
+    message: &'static str,
+}
+
+impl NativeCompactionUnsupported {
+    pub fn history() -> Self {
+        Self {
+            message: "This compaction checkpoint cannot be converted to a text summary. Use a compatible Responses upstream or start a new conversation.",
+        }
+    }
+}
+
+impl std::fmt::Display for NativeCompactionUnsupported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for NativeCompactionUnsupported {}
+
+impl NativeCompactionUnsupported {
+    pub fn response_body(&self) -> Value {
+        json!({"error":{
+            "message": self.to_string(),
+            "type": "compaction_incompatible",
+            "code": "native_compaction_unsupported"
+        }})
+    }
+}
+
+/// 转换层主动拒答的映射：把闸门错误换成（状态码, 错误体），其余错误返回 None。
+pub fn upstream_conversion_error_response(error: &anyhow::Error) -> Option<(u16, Value)> {
+    if let Some(gate) = error.downcast_ref::<NativeCompactionUnsupported>() {
+        return Some((400, gate.response_body()));
+    }
+    if let Some(gate) = error.downcast_ref::<UnsupportedEncryptedAgentContent>() {
+        return Some((400, gate.response_body()));
+    }
+    None
+}
+
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     responses_to_chat_completions_with_options(body, false, false)
 }
@@ -373,8 +447,13 @@ pub fn responses_to_chat_completions_with_options(
     stabilize_prompt_prefix: bool,
 ) -> anyhow::Result<Value> {
     // 本地摘要先就地展开（只认命名空间内的项），剩下的 `compaction` 项
-    // 都是上游原生状态，不得当明文回放。
+    // 都是上游原生状态，不得当明文回放（GAP_ANALYSIS P0-2/P0-3）。
     expand_local_compaction_history(&mut body);
+    // fail-loud 闸门：没被展开的 `compaction` 项就是原生 opaque 状态，
+    // 明确报错而不是静默抽空任务内容后继续发请求。
+    if input_has_native_compaction(&body) {
+        return Err(NativeCompactionUnsupported::history().into());
+    }
     let mut result = json!({});
 
     if let Some(model) = body.get("model") {
@@ -1042,9 +1121,9 @@ fn expand_legacy_compaction_item(item: &Value) -> Option<Value> {
         return None;
     }
     let content = item.get("encrypted_content")?.as_str()?;
-    // 带本项目命名空间但解码失败的项属「新格式损坏」，不能当成旧格式
-    // 摘要回放，交给调用方报错。
-    if content.starts_with(LOCAL_COMPACTION_PREFIX) {
+    // 带本项目命名空间（任意版本号）但解码不出摘要的项，属「新格式损坏」或
+    // 「本层读不懂的未来版本」，都不能当成旧格式摘要回放，交给闸门报错。
+    if content.starts_with(LOCAL_COMPACTION_NAMESPACE) {
         return None;
     }
     let summary = content.trim();
@@ -1068,13 +1147,18 @@ fn compaction_replay_message(summary: &str) -> Value {
 /// 把 input 里的本地压缩摘要项就地展开成 user 消息项。
 /// input 既可以是 item 数组，也可以是单个 item（codex 单 item 回放形态）。
 fn expand_local_compaction_history(body: &mut Value) {
-    let has_local_item = |items: &[Value]| {
+    // 「新格式出现」的判据取整个命名空间族（不含版本号）：只要 input 里出现
+    // 任意版本的 `codexlayer:summary:` 项（哪怕本层读不懂 v2），就判定该会话
+    // 已进入命名空间时代，未标记项一律不再回退回放。判据若只认 v1，
+    // 新构建写入的 v2 项无法关闭回退，同段里的原生 opaque 状态会被
+    // 当旧摘要播放。
+    let has_namespaced_item = |items: &[Value]| {
         items.iter().any(|item| {
             item.get("type").and_then(Value::as_str) == Some(COMPACTION_OUTPUT_TYPE)
                 && item
                     .get("encrypted_content")
                     .and_then(Value::as_str)
-                    .is_some_and(|content| content.starts_with(LOCAL_COMPACTION_PREFIX))
+                    .is_some_and(|content| content.starts_with(LOCAL_COMPACTION_NAMESPACE))
         })
     };
     let expand_item = |item: &Value, legacy_mode: bool| {
@@ -1084,7 +1168,7 @@ fn expand_local_compaction_history(body: &mut Value) {
     };
     match body.get_mut("input") {
         Some(Value::Array(items)) => {
-            let legacy_mode = !has_local_item(items);
+            let legacy_mode = !has_namespaced_item(items);
             for item in items.iter_mut() {
                 if let Some(message) = expand_item(item, legacy_mode) {
                     *item = message;
@@ -1093,11 +1177,23 @@ fn expand_local_compaction_history(body: &mut Value) {
         }
         Some(input @ Value::Object(_)) => {
             let single = vec![input.clone()];
-            if let Some(message) = expand_item(&single[0], !has_local_item(&single)) {
+            if let Some(message) = expand_item(&single[0], !has_namespaced_item(&single)) {
                 *input = json!([message]);
             }
         }
         _ => {},
+    }
+}
+
+/// 闸门判定：展开后仍存在的 `compaction` 项一律视为上游原生压缩状态。
+/// input 既可能是 item 数组，也可能是单个 item。
+fn input_has_native_compaction(body: &Value) -> bool {
+    let is_native =
+        |item: &Value| item.get("type").and_then(Value::as_str) == Some(COMPACTION_OUTPUT_TYPE);
+    match body.get("input") {
+        Some(Value::Array(items)) => items.iter().any(is_native),
+        Some(Value::Object(_)) => is_native(&body["input"]),
+        _ => false,
     }
 }
 
@@ -3583,7 +3679,12 @@ fn append_responses_item(
         }
         Some(COMPACTION_OUTPUT_TYPE) => {
             // 本地摘要已在入口处展开；能走到这里的都是上游原生状态，
-            // 不得伪造成明文（GAP_ANALYSIS P0-2）。
+            // 不得伪造成明文；入口闸门已经拦住（GAP_ANALYSIS P0-2/P0-3）。
+        }
+        Some("encrypted_content") => {
+            // 顶层独立 encrypted_content item：content 为 null 时旧实现会落到兜底
+            // 分支被静默丢弃，等于静默发出一个被抽空任务内容的请求（P0-3）。
+            return Err(UnsupportedEncryptedAgentContent.into());
         }
         Some(COMPACTION_TRIGGER_TYPE) => {
             // 控制项不进上游历史；正常请求不该出现，出现即忽略。
@@ -4964,15 +5065,11 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> anyhow::Re
                     .or_else(|| part.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if !value.is_empty() {
-                    if encrypted_content_value_is_opaque(value) {
-                        anyhow::bail!(
-                            "encrypted_content 片段是无法在当前 Chat 转换中表达的不透明（opaque）内容，\
-                             已中止本次转换，而不是静默删除或当作文本转发"
-                        );
-                    }
-                    chat_parts.push(json!({ "type": "text", "text": value }));
+                // 空片段同样不得静默跳过（#2474 语义）；错误文本不回显原文。
+                if value.is_empty() || encrypted_content_value_is_opaque(value) {
+                    return Err(UnsupportedEncryptedAgentContent.into());
                 }
+                chat_parts.push(json!({ "type": "text", "text": value }));
             }
             _ => {}
         }
