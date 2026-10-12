@@ -4545,13 +4545,17 @@ fn mark_current_user_turn(messages: &mut Vec<Value>) {
             unwrap_current_turn_mark(message);
         }
     }
-    let Some(index) = messages
-        .iter()
-        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-    else {
-        return;
-    };
-    wrap_current_turn_mark(&mut messages[index]);
+    // 只在请求确实以 user 输入收尾时才钉标记（GAP_ANALYSIS P0-1，维护者 P1）：
+    // 等待工具结果后的继续请求末尾是 tool/assistant 角色，此时最后一条 user
+    // 是历史旧问题，钉上会把历史问题误导成「当前问题」。
+    // 非 user 收尾：解包已完成，直接返回。
+    match messages
+        .last()
+        .and_then(|message| message.get("role").and_then(Value::as_str))
+    {
+        Some("user") => wrap_current_turn_mark(messages.last_mut().unwrap()),
+        _ => return,
+    }
 }
 
 /// 从 user 消息文本里剥离轮次标记。只作用于首轮文本段：包装只会碰首轮文本段，

@@ -6169,3 +6169,33 @@ fn current_turn_mark_absent_when_stabilizer_off() {
     let last = messages.iter().rev().find(|m| m["role"] == "user").unwrap();
     assert_eq!(last["content"].as_str().unwrap(), "answer this now");
 }
+
+#[test]
+fn current_turn_mark_skipped_when_request_ends_with_tool_result() {
+    // GAP_ANALYSIS P0-1（维护者 P1）：等待工具结果后的继续请求里，
+    // 最后一条 user 是历史旧问题；无条件回钉会把旧问题误导成「当前问题」。
+    // 此类请求只解包、不钉定。
+    let body = json!({
+        "model": "test-model",
+        "instructions": "core",
+        "input": [
+            { "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": "the historical question" } ] },
+            { "type": "function_call", "name": "shell", "call_id": "call_p1" },
+            { "type": "function_call_output", "call_id": "call_p1", "output": "tool says ok" }
+        ]
+    });
+    let out = responses_to_chat_completions_with_options(body, false, true).unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    let users: Vec<&Value> = messages.iter().filter(|m| m["role"] == "user").collect();
+    assert_eq!(users.len(), 1);
+    assert_eq!(
+        users[0]["content"].as_str().unwrap(),
+        "the historical question",
+        "非 user 收尾时最后一条 user 必须原文透传，不得回钉轮次标记"
+    );
+    assert!(
+        !out.to_string().contains("<current_user_turn>"),
+        "非 user 收尾的请求不得出现轮次标记"
+    );
+}
