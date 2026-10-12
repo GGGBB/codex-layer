@@ -216,7 +216,8 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
         "input": [
             { "type": "message", "role": "user",
               "content": [{ "type": "input_text", "text": "latest question" }] },
-            { "type": "compaction", "encrypted_content": "PRIOR_SUMMARY" }
+            // GAP_ANALYSIS P0-2：本层自己生成的摘要带命名空间，回放只认这种形态。
+            local_compaction_item("PRIOR_SUMMARY")
         ]
     }))
     .unwrap();
@@ -231,6 +232,91 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
         })
         .expect("compaction item 应展开为摘要 user 消息");
     assert_eq!(replayed["role"], "user");
+}
+
+#[test]
+fn legacy_unmarked_plaintext_summary_still_expands_once() {
+    // GAP_ANALYSIS P0-2 切换点兼容：引入命名空间之前持久化的旧会话把摘要
+    // 裸放在 `encrypted_content` 里。整段 input 不含新格式项时仍回退展开，
+    // 旧会话不致直接不可用；下一轮压缩会写入带标记的新格式。
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "type": "message", "role": "user",
+              "content": [{ "type": "input_text", "text": "current task" }] },
+            { "type": "compaction", "encrypted_content": "LEGACY_PLAINTEXT_SUMMARY" }
+        ]
+    }))
+    .unwrap();
+    let replayed = converted["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .last()
+        .unwrap();
+    assert!(
+        replayed["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("LEGACY_PLAINTEXT_SUMMARY"),
+        "旧会话摘要必须仍可回放：{replayed}"
+    );
+}
+
+#[test]
+fn legacy_session_replays_bare_summary_regardless_of_content_shape() {
+    // 切换点兼容的判据是位置条件（整段 input 不含新格式项），不是内容形态。
+    // 样本是一串「无空格、可解码、可打印占比偏低」的 base64——真实旧摘要里
+    // 就会出现这种工具结果/配置块。若拿内容熵当「是不是原生状态」的判据，
+    // 旧会话会被误判成新会话，新产出的摘要又被拒，会话就死锁在
+    // 「压缩失败 → 重新压缩 → 同样被拒」的循环里。
+    let base64_shaped = "mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh";
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "type": "message", "role": "user",
+              "content": [{ "type": "input_text", "text": "current task" }] },
+            { "type": "compaction", "encrypted_content": base64_shaped }
+        ]
+    }))
+    .unwrap();
+    let replayed = converted["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .last()
+        .unwrap();
+    assert!(
+        replayed["content"]
+            .as_str()
+            .unwrap()
+            .ends_with(base64_shaped),
+        "旧会话的裸摘要必须逐字节回放，不得拿内容形态拒绝：{replayed}"
+    );
+}
+
+#[test]
+fn mixed_session_unmarked_compaction_item_is_not_replayed() {
+    // 新格式已在该会话出现之后，未标记项不能再当自家摘要回放
+    // （GAP_ANALYSIS P0-2；P0-3 会把这个位置升级为显式 400）。
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            local_compaction_item("MARKED_SUMMARY"),
+            { "type": "compaction", "encrypted_content": "UNMARKED_SENTINEL" },
+            { "type": "message", "role": "user",
+              "content": [{ "type": "input_text", "text": "current task" }] }
+        ]
+    }))
+    .unwrap();
+    let serialized = converted["messages"].to_string();
+    assert!(serialized.contains("MARKED_SUMMARY"), "带标记摘要必须回放：{serialized}");
+    assert!(
+        !serialized.contains("UNMARKED_SENTINEL"),
+        "未标记项不得被伪造成摘要文本：{serialized}"
+    );
 }
 
 #[test]
@@ -339,7 +425,7 @@ fn compaction_stream_emits_one_done_item_before_completed() {
         "compact v2 must receive one output-item event"
     );
     assert_eq!(items[0]["type"], "compaction");
-    assert_eq!(items[0]["encrypted_content"], "Preserve this summary.");
+    assert_local_compaction_summary(&items[0], "Preserve this summary.");
     assert!(
         items[0]["id"]
             .as_str()
@@ -373,6 +459,24 @@ fn compaction_sse_events(payload: &[u8]) -> Vec<Value> {
         .filter(|data| *data != "[DONE]")
         .map(|data| serde_json::from_str(data).unwrap())
         .collect()
+}
+
+/// 取本层自己生成的摘要项（带本项目命名空间），用作历史回放的输入样本。
+fn local_compaction_item(summary: &str) -> Value {
+    let mut converter = CompactionSseConverter::new("model");
+    converter.push_summary_text(summary);
+    compaction_sse_events(&converter.finish())
+        .into_iter()
+        .find(|event| event["type"] == "response.output_item.done")
+        .unwrap()["item"]
+        .clone()
+}
+
+/// 断言：该摘要项能经本项目转换层回放，且摘要原文逐字保留。
+fn assert_local_compaction_summary(item: &Value, summary: &str) {
+    let replay = responses_to_chat_completions(json!({ "input": [item] })).unwrap();
+    let text = replay["messages"][0]["content"].as_str().unwrap();
+    assert!(text.ends_with(summary), "摘要必须能回放：{text}");
 }
 
 #[test]
@@ -458,12 +562,12 @@ fn compaction_converter_accepts_data_only_responses_events() {
         b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Summary\"}\n\n",
     );
     assert_eq!(converter.summary_text(), "Summary");
-    assert!(
-        compaction_sse_events(&converter.finish())
-            .iter()
-            .any(|event| event["type"] == "response.output_item.done"
-                && event["item"]["encrypted_content"] == "Summary")
-    );
+    let events = compaction_sse_events(&converter.finish());
+    let item = &events
+        .iter()
+        .find(|event| event["type"] == "response.output_item.done")
+        .unwrap()["item"];
+    assert_local_compaction_summary(item, "Summary");
 }
 
 #[test]
@@ -480,26 +584,40 @@ fn compaction_converter_accepts_complete_text_from_done_events() {
         .iter()
         .find(|event| event["type"] == "response.output_item.done")
         .unwrap();
-    assert_eq!(
-        compaction["item"]["encrypted_content"],
-        "Summary from completed"
-    );
+    assert_local_compaction_summary(&compaction["item"], "Summary from completed");
 }
 
 #[test]
-fn compaction_converter_accepts_native_compaction_item_without_deltas() {
+fn summary_converter_does_not_relabel_native_compaction_as_local_text() {
     let upstream = concat!(
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque-summary\"}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
     );
+    // GAP_ANALYSIS P0-2：上游的 `compaction` 项携带的是原生 opaque 状态，
+    // 不得被本层揭重命名为本地明文摘送。
     let mut converter = CompactionSseConverter::new("custom-model");
     converter.push_upstream_bytes(upstream.as_bytes());
     let events = compaction_sse_events(&converter.finish());
-    let compaction = events
-        .iter()
-        .find(|event| event["type"] == "response.output_item.done")
-        .unwrap();
-    assert_eq!(compaction["item"]["encrypted_content"], "opaque-summary");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "response.failed")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "response.output_item.done")
+    );
+    let wrapped = wrap_non_stream_response_as_compaction(
+        br#"{"output":[{"type":"compaction","encrypted_content":"opaque-summary"}]}"#,
+        "model",
+    )
+    .unwrap();
+    assert!(
+        compaction_sse_events(&wrapped)
+            .iter()
+            .any(|event| event["type"] == "response.failed")
+    );
 }
 
 #[test]
@@ -512,7 +630,7 @@ fn compaction_converter_accepts_complete_chat_message_without_delta() {
         .iter()
         .find(|event| event["type"] == "response.output_item.done")
         .unwrap();
-    assert_eq!(compaction["item"]["encrypted_content"], "Chat summary");
+    assert_local_compaction_summary(&compaction["item"], "Chat summary");
 }
 
 #[test]
