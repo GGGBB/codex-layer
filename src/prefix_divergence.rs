@@ -24,7 +24,7 @@ const KNOWN_FINGERPRINTS_PER_KEY: usize = 6;
 const SNIP_RADIUS: usize = 240;
 
 pub enum DivergenceKind {
-    /// 首次见到该会话：基线已登记（全文另存 /tmp）。
+    /// 首次见到该会话：基线已登记（全文另存诊断日志私有目录）。
     Baseline,
     /// system+tools 前缀字节与上一轮不同。
     Diverged,
@@ -172,8 +172,33 @@ pub fn observe(prompt_cache_key: Option<&str>, body: &Value) -> Option<Divergenc
 /// 基线全文落盘（本机诊断文件；分叉 dump 会引用它做全文对照）。
 fn dump_baseline_file(key: &str, fingerprint: &str) {
     let digest = format!("{:016x}", fnv1a64(key.as_bytes()));
-    let path = format!("/tmp/prefix_baseline_{digest}.txt");
-    let _ = std::fs::write(path, fingerprint);
+    // 基线含用户提示词、工具定义与工作区信息，必须落在诊断日志的私有目录
+    // 且权限 0600，不得写 world-writable 的 /tmp（GAP_ANALYSIS P0-4）；
+    // 已存在的同名文件在覆写前同样收紧权限。
+    let dir = match crate::diagnostic_log::diagnostic_log_path().parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => std::env::temp_dir(),
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("prefix_baseline_{digest}.txt"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(&path) {
+        use std::io::Write;
+        let _ = file.write_all(fingerprint.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -215,8 +240,19 @@ mod tests {
         assert!(matches!(report.kind, DivergenceKind::Baseline));
         assert!(report.new_len > 0);
         let digest = format!("{:016x}", fnv1a64(key.as_bytes()));
-        let path = format!("/tmp/prefix_baseline_{digest}.txt");
-        assert!(std::path::Path::new(&path).exists(), "基线全文必须落盘供取证");
+        // 基线必须落在诊断日志的私有目录（非 world-writable /tmp），供取证对照。
+        let dir = crate::diagnostic_log::diagnostic_log_path()
+            .parent()
+            .expect("诊断日志目录必须存在")
+            .to_path_buf();
+        let path = dir.join(format!("prefix_baseline_{digest}.txt"));
+        assert!(path.exists(), "基线全文必须落盘供取证");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "基线含用户提示词，权限必须 0600");
+        }
         let _ = std::fs::remove_file(&path);
     }
 
