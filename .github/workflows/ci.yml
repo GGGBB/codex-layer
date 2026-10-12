@@ -1,0 +1,49 @@
+# 最小 CI：cargo test + 冒烟脚本（对应 docs/GAP_ANALYSIS.md P2-1 / P2-3）。
+#
+# 不跑 `cargo fmt --check`：AGENTS.md 明确禁止全仓格式化（移植代码须与来源
+# PR 保持逐行 diff 可比性），本地实测 `cargo fmt --check` 有 115 处差异，
+# 放进 CI 会红。新写文件按默认风格即可。
+# 不跑 `cargo clippy -- -D warnings`：同理无法保证现状通过，保持 CI 全绿起步。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo 缓存
+        uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test
+
+  smoke:
+    name: smoke (pinning / streaming)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo 缓存
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build --release
+        run: cargo build --release
+      # P2-3 的版本自检：二进制存在且能报告版本，再跑冒烟
+      - name: 版本自检
+        run: ./target/release/codex-layer --version
+      - name: 冒烟：前缀钉定
+        run: python3 scripts/smoke/pinning.py
+      - name: 冒烟：流式转发
+        run: python3 scripts/smoke/streaming.py
