@@ -1,0 +1,58 @@
+# codex-layer 配置示例：把示例里的占位符换成你自己的值。
+# 默认查找顺序：$CODEX_LAYER_CONFIG -> ./codex-layer.toml -> ~/.codex-layer/codex-layer.toml
+
+[server]
+# 默认只监听回环：本进程会持有上游密钥，不要默认暴露到局域网。
+host = "127.0.0.1"
+port = 57321
+
+[upstream]
+# 任意 OpenAI 兼容后端：mlx-serve、llama.cpp、vLLM、或云端 API。
+# base_url 写到版本前缀即可（/v1），协议路径由本层拼接。
+base_url = "http://127.0.0.1:11234/v1"
+api_key = "YOUR_UPSTREAM_KEY"
+# 上游方言：chat_completions 或 responses。
+# 自建推理服务器（mlx-serve / llama.cpp / vLLM）通常是 chat_completions。
+protocol = "chat_completions"
+# 上游的默认模型名，请求未带 model 时使用；一般留空。
+model = ""
+# 上游不需要认证时打开：转发时不注入任何 Authorization。
+no_auth = false
+# 固定 User-Agent；留空则透传 codex 客户端的原始 UA（有些上游按 UA 判兼容）。
+user_agent = ""
+
+  # 追加到上游的自定义头，可写多条。
+  # [[upstream.header]]
+  # key = "X-Tenant"
+  # value = "acme"
+
+[stabilizer]
+# 前缀稳定层总开关：剥离 image_resize_notice、system 块规范序、末轮 user 标记、
+# 压缩轮 tools 回填与前缀对齐、前缀分叉探针。
+# 关掉之后本层转发行为与不经本层逐字节一致，可用来对照排障。
+prompt_prefix = true
+# 严格 OpenAI 协议：剥掉各家私有的 reasoning 方言。接自建服务器一般不用开。
+standard_openai_protocol = false
+
+[images]
+# 对这些模型剥离图片块（图片替换成占位文本），用于纯文本上游。
+# strip_models = ["some-text-only-model"]
+
+[timeouts]
+connect_seconds = 5          # 建立 TCP 连接
+header_seconds = 30          # 非流式请求等待响应头
+stream_header_seconds = 120  # 流式请求等待首个响应头；长思考的上游要留足
+
+[log]
+# 诊断日志（JSONL）落点；留空用 ~/.codex-layer/codex-layer.log。
+# 稳定层的钉定、分叉、压缩轮对齐事件都在这里。
+path = ""
+
+# 按模型改上游：命中 model 的请求转到这一段自己的 base_url，可换协议与模型名。
+# 需要同时接多个上游时用它，本项目不做多渠道轮换。
+# [[model_route]]
+# model = "gpt-5"
+# base_url = "http://127.0.0.1:8080/v1"
+# api_key = "ANOTHER_KEY"
+# protocol = "responses"
+# target_model = "qwen3-vl"
