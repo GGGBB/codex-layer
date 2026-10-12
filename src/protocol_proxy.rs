@@ -1,5 +1,7 @@
 // 移植来源：CodexPlusPlus PR #2449（prompt-prefix stabilizer）的
-// `crates/codex-plus-core/src/protocol_proxy.rs`，commit f9be7cf。
+// `crates/codex-plus-core/src/protocol_proxy.rs`，commit f9be7cf。本项目只改外围装配流
+// （单上游、无多渠道轮换与渠道限流、图片策略只留 send-as-is / strip），
+// 前缀钉定与协议转换的纯函数逐行未改。
 //! Codex Responses API 与 OpenAI Chat Completions 的本地协议转换。
 //!
 //! Codex Chat 与 Responses 协议之间的转换实现。
@@ -14,8 +16,7 @@ use anyhow::Context;
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
-use crate::relay_rotation::{RotationContext, RotationEvent};
-use crate::settings::{RelayProtocol, SettingsStore};
+use crate::settings::{BackendSettings, RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 
@@ -127,11 +128,9 @@ pub fn protocol_proxy_port() -> u16 {
         .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
 }
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
-const MAX_COOLDOWN_RETRIES: usize = 3;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -151,8 +150,52 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
 ];
 const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
 
-fn should_retry_after_cooldown(retries: usize) -> bool {
-    retries < MAX_COOLDOWN_RETRIES
+/// 进程内上游配置载体。独立二进制的上游来自 TOML（见 `config.rs`），启动时注入一次；
+/// 未注入时按原路从设置文件读取——从 CodexPlusPlus 带过来的测试依赖这条路径，
+/// 它们用 `paths::set_settings_path_for_tests` 把设置文件指到临时目录。
+static RUNTIME_SETTINGS: OnceLock<Mutex<Option<BackendSettings>>> = OnceLock::new();
+
+/// 由 `main` 在启动时调用：把 TOML 配置转换出的上游注入进程内载体。
+pub fn set_runtime_settings(settings: BackendSettings) {
+    let lock = RUNTIME_SETTINGS.get_or_init(|| Mutex::new(None));
+    *lock.lock().expect("runtime settings lock poisoned") = Some(settings);
+}
+
+/// 装配流读取上游配置：注入优先，其次设置文件。读坏了退回默认值，后面的
+/// `validate_upstream` 会报「上游 Base URL 不能为空」，不会静默转发到空地址。
+fn load_request_settings() -> BackendSettings {
+    if let Some(settings) = RUNTIME_SETTINGS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|settings| settings.clone())
+    {
+        return settings;
+    }
+    SettingsStore::default().load().unwrap_or_default()
+}
+
+/// 模型列表 / 语音 / 图片这几条旁路取上游：本项目单上游，直接取激活项。
+/// （CodexPlusPlus 在这里做多渠道探活与轮换选择，独立项目没有渠道池概念。）
+fn probe_relay(settings: &BackendSettings) -> anyhow::Result<crate::settings::RelayProfile> {
+    Ok(settings.active_relay_profile())
+}
+
+/// 超时覆盖：配置层 `[timeouts]` 里的「非流式 / 流式等待响应头」时长。
+static UPSTREAM_TIMEOUT_OVERRIDES: OnceLock<Mutex<Option<(Duration, Duration)>>> = OnceLock::new();
+
+/// 由配置层在启动时调用，覆盖两个响应头超时上限。
+pub fn set_upstream_timeouts(header_timeout: Duration, stream_header_timeout: Duration) {
+    let lock = UPSTREAM_TIMEOUT_OVERRIDES.get_or_init(|| Mutex::new(None));
+    *lock.lock().expect("timeout override lock poisoned") = Some((header_timeout, stream_header_timeout));
+}
+
+fn timeout_overrides() -> Option<(Duration, Duration)> {
+    UPSTREAM_TIMEOUT_OVERRIDES
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|value| *value)
 }
 
 /// codex v2 远程压缩请求在 input 末尾携带的控制 item（openai/codex compact_remote_v2）。
@@ -540,7 +583,6 @@ pub struct UpstreamProxyResponse {
     /// 响应必须由代理重组为单个 `compaction` 输出项。
     pub compaction: bool,
     pub response: reqwest::Response,
-    pub(crate) _channel_permit: Option<crate::channel_protection::ChannelPermit>,
 }
 
 /// 客户端会话头白名单；不接受鉴权或任意其他客户端请求头。
@@ -579,7 +621,9 @@ impl UpstreamProxyResponse {
 }
 
 pub fn upstream_header_timeout() -> Duration {
-    UPSTREAM_HEADER_TIMEOUT
+    timeout_overrides()
+        .map(|(header, _)| header)
+        .unwrap_or(UPSTREAM_HEADER_TIMEOUT)
 }
 
 pub fn upstream_stream_header_timeout() -> Duration {
@@ -587,10 +631,7 @@ pub fn upstream_stream_header_timeout() -> Duration {
 }
 
 pub fn upstream_http_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .user_agent("CodexPlusPlus/ProtocolProxy")
-        .build()
+    crate::http_client::proxied_client(concat!("codex-layer/", env!("CARGO_PKG_VERSION")))
         .context("failed to build upstream HTTP client")
 }
 
@@ -1202,7 +1243,7 @@ pub async fn open_responses_proxy_request_for_path_with_session_headers(
     beta_features: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
+    let settings = load_request_settings();
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
@@ -1304,208 +1345,104 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     {
         request_json["model"] = Value::String(route.upstream_model.clone());
     }
-    let model = (!source_model.trim().is_empty()).then(|| source_model.clone());
-    let context = RotationContext {
-        conversation_id: conversation_id_from_responses_request(&request_json),
-        model,
+    // 单上游形态：命中模型路由就用路由目标上游，否则用激活上游。CodexPlusPlus 在这里
+    // 做多渠道轮换、故障转移与冷却重试；独立项目没有渠道池，整块属于上游专有功能。
+    let relay = match &model_route {
+        Some(route) => route.relay.clone(),
+        None => settings.active_relay_profile(),
     };
-    let (relay, relays) = if let Some(route) = &model_route {
-        (route.relay.clone(), vec![route.relay.clone()])
-    } else {
-        let relay = crate::relay_rotation::select_relay_for_request(&settings, context)?;
-        let mut relays = vec![relay.clone()];
-        relays.extend(crate::relay_rotation::fallback_relays_after(
-            &settings, &relay.id,
-        )?);
-        (relay, relays)
-    };
-    debug_assert_eq!(
-        relays.first().map(|item| item.id.as_str()),
-        Some(relay.id.as_str())
+    validate_upstream(&relay)?;
+    let (endpoint, upstream_body, wire_api, compaction) =
+        upstream_request_parts(&relay, request_json, request_path).await?;
+    let is_compaction_request = compaction;
+    let header_timeout = response_header_timeout(is_stream);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.upstream_request",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "endpoint": endpoint,
+            "wireApi": wire_api,
+            "stream": is_stream,
+            "headerTimeoutSeconds": header_timeout.as_secs(),
+            "modelRoute": model_route.as_ref().map(|route| json!({
+                "sourceRelayId": route.source_relay_id,
+                "sourceModel": route.source_model,
+                "targetRelayId": route.relay.id,
+                "upstreamModel": route.upstream_model
+            }))
+        }),
     );
-    let relay_count = relays.len();
-    let mut cooldown_retries = 0_usize;
-    'request: loop {
-        for (attempt, relay) in relays.iter().cloned().enumerate() {
-        validate_upstream(&relay)?;
-        let channel_key = crate::channel_protection::key_for_relay(&relay);
-        let channel_permit =
-            crate::channel_protection::acquire(&channel_key, &relay).await;
-        let model_override = aggregate_upstream_model_override(&settings, &relay);
-        let (endpoint, upstream_body, wire_api, compaction) = upstream_request_parts(
-            &relay,
-            request_json.clone(),
-            request_path,
-            model_override.as_deref(),
-        )
-        .await?;
-        let is_compaction_request = compaction;
-        let has_more_candidates = attempt + 1 < relay_count;
-        let header_timeout = response_header_timeout(is_stream);
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_request",
-            json!({
-                "relayId": relay.id,
-                "relayName": relay.name,
-                "endpoint": endpoint,
-                "wireApi": wire_api,
-                "stream": is_stream,
-                "attempt": attempt + 1,
-                "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs(),
-                "modelRoute": model_route.as_ref().map(|route| json!({
-                    "sourceRelayId": route.source_relay_id,
-                    "sourceModel": route.source_model,
-                    "targetRelayId": route.relay.id,
-                    "upstreamModel": route.upstream_model
-                }))
-            }),
-        );
-        let mut builder = upstream_request_builder(
-            crate::http_client::proxied_client(&effective_user_agent(
-                &relay.user_agent,
-                original_user_agent,
-            ))?,
-            &endpoint,
-            &relay,
-            is_stream,
-            &upstream_body,
-        );
-        builder = with_client_session_headers(builder, &relay, session_headers);
-        if wire_api == UpstreamWireApi::Responses {
-            if let Some(value) = beta_features.filter(|value| !value.is_empty()) {
-                builder = builder.header("x-codex-beta-features", value);
-            }
+    let mut builder = upstream_request_builder(
+        crate::http_client::proxied_client(&effective_user_agent(
+            &relay.user_agent,
+            original_user_agent,
+        ))?,
+        &endpoint,
+        &relay,
+        is_stream,
+        &upstream_body,
+    );
+    builder = with_client_session_headers(builder, &relay, session_headers);
+    if wire_api == UpstreamWireApi::Responses {
+        if let Some(value) = beta_features.filter(|value| !value.is_empty()) {
+            builder = builder.header("x-codex-beta-features", value);
         }
-        let upstream = match send_upstream_request_for_responses(builder, is_stream).await {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                drop(channel_permit);
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "protocol_proxy.upstream_request_failed",
-                    json!({
-                        "relayId": relay.id,
-                        "relayName": relay.name,
-                        "endpoint": endpoint,
-                        "wireApi": wire_api,
-                        "stream": is_stream,
-                        "attempt": attempt + 1,
-                        "candidateCount": relay_count,
-                        "headerTimeoutSeconds": header_timeout.as_secs(),
-                        "willFailover": has_more_candidates,
-                        "error": error.to_string()
-                    }),
-                );
-                crate::relay_rotation::record_relay_request_failure(&settings);
-                if has_more_candidates {
-                    continue;
-                }
-                return Err(error).with_context(|| {
-                    format!(
-                        "供应商「{}」请求上游失败，endpoint: {}",
-                        relay.name, endpoint
-                    )
-                });
-            }
-        };
-        let status_code = upstream.status().as_u16();
-        let retry_after = crate::channel_protection::retry_after_duration(upstream.headers());
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_response",
-            json!({
-                "relayId": relay.id,
-                "relayName": relay.name,
-                "endpoint": endpoint,
-                "wireApi": wire_api,
-                "stream": is_stream,
-                "statusCode": status_code,
-                "attempt": attempt + 1,
-                "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs(),
-                "willFailover": has_more_candidates && !(200..300).contains(&status_code)
-            }),
-        );
-        crate::relay_rotation::record_relay_request_event(
-            &settings,
-            if (200..300).contains(&status_code) {
-                RotationEvent::Success
-            } else {
-                RotationEvent::Failure
-            },
-        );
-        let content_type = upstream
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        if (200..300).contains(&status_code) || !has_more_candidates {
-            if !(200..300).contains(&status_code) {
-                let cooldown_started = crate::channel_protection::mark_failure(
-                    &channel_key,
-                    &relay,
-                    status_code,
-                    retry_after,
-                )
-                .await;
-                if cooldown_started && should_retry_after_cooldown(cooldown_retries) {
-                    cooldown_retries = cooldown_retries.saturating_add(1);
-                    drop(channel_permit);
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "protocol_proxy.channel_cooldown_retry",
-                        json!({
-                            "relayId": relay.id,
-                            "relayName": relay.name,
-                            "statusCode": status_code,
-                            "retryAfterSeconds": retry_after.map(|value| value.as_secs()),
-                            "retry": cooldown_retries
-                        }),
-                    );
-                    continue 'request;
-                }
-            }
-            return Ok(UpstreamProxyResponse {
-                status_code,
-                is_stream: is_stream || content_type.contains("text/event-stream"),
-                content_type,
-                wire_api,
-                compaction: is_compaction_request,
-                response: upstream,
-                _channel_permit: Some(channel_permit),
+    }
+    let upstream = match send_upstream_request_for_responses(builder, is_stream).await {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "protocol_proxy.upstream_request_failed",
+                json!({
+                    "relayId": relay.id,
+                    "relayName": relay.name,
+                    "endpoint": endpoint,
+                    "wireApi": wire_api,
+                    "stream": is_stream,
+                    "headerTimeoutSeconds": header_timeout.as_secs(),
+                    "error": error.to_string()
+                }),
+            );
+            return Err(error).with_context(|| {
+                format!("供应商「{}」请求上游失败，endpoint: {}", relay.name, endpoint)
             });
         }
-        crate::channel_protection::mark_failure(
-            &channel_key,
-            &relay,
-            status_code,
-            retry_after,
-        )
-        .await;
-        drop(channel_permit);
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_failover",
-            json!({
-                "relayId": relay.id,
-                "relayName": relay.name,
-                "endpoint": endpoint,
-                "wireApi": wire_api,
-                "stream": is_stream,
-                "statusCode": status_code,
-                "attempt": attempt + 1,
-                "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs()
-            }),
-        );
-        }
-        anyhow::bail!("未找到可用的聚合供应商成员")
-    }
+    };
+    let status_code = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.upstream_response",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "endpoint": endpoint,
+            "wireApi": wire_api,
+            "stream": is_stream,
+            "statusCode": status_code,
+            "headerTimeoutSeconds": header_timeout.as_secs()
+        }),
+    );
+    Ok(UpstreamProxyResponse {
+        status_code,
+        is_stream: is_stream || content_type.contains("text/event-stream"),
+        content_type,
+        wire_api,
+        compaction: is_compaction_request,
+        response: upstream,
+    })
 }
 
 fn select_model_route(
     settings: &crate::settings::BackendSettings,
     model: &str,
 ) -> anyhow::Result<Option<ModelRouteSelection>> {
-    if model.is_empty() || settings.active_aggregate_relay_profile().is_some() {
+    if model.is_empty() {
         return Ok(None);
     }
 
@@ -1527,9 +1464,6 @@ fn select_model_route(
         .find(|profile| profile.id == target_relay_id)
         .cloned()
         .with_context(|| format!("模型路由目标供应商不存在：{target_relay_id}"))?;
-    if target.relay_mode == crate::settings::RelayMode::Aggregate {
-        anyhow::bail!("模型路由目标不能是聚合供应商：{}", target.name);
-    }
     if target.protocol != RelayProtocol::Responses {
         anyhow::bail!("模型路由目标必须使用 Responses API：{}", target.name);
     }
@@ -1547,21 +1481,12 @@ fn select_model_route(
     }))
 }
 
-fn aggregate_upstream_model_override(
-    settings: &crate::settings::BackendSettings,
-    relay: &crate::settings::RelayProfile,
-) -> Option<String> {
-    settings.active_aggregate_relay_profile()?;
-    let model = crate::relay_config::relay_profile_model(relay);
-    let model = model.trim();
-    (!model.is_empty()).then(|| model.to_string())
-}
 
 pub async fn open_models_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let settings = load_request_settings();
+    let relay = probe_relay(&settings)?;
     validate_upstream(&relay)?;
 
     let endpoint = models_url(&relay.base_url);
@@ -1595,7 +1520,6 @@ pub async fn open_models_proxy_request(
         wire_api: UpstreamWireApi::Responses,
         compaction: false,
         response: upstream,
-        _channel_permit: None,
     })
 }
 
@@ -1604,8 +1528,8 @@ pub async fn open_audio_transcriptions_proxy_request(
     content_type: &str,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let settings = load_request_settings();
+    let relay = probe_relay(&settings)?;
     validate_upstream(&relay)?;
     let content_type = content_type.trim();
     if content_type.is_empty() {
@@ -1646,7 +1570,6 @@ pub async fn open_audio_transcriptions_proxy_request(
         wire_api: UpstreamWireApi::AudioTranscriptions,
         compaction: false,
         response: upstream,
-        _channel_permit: None,
     })
 }
 
@@ -1712,8 +1635,8 @@ async fn open_image_proxy_request(
     original_user_agent: Option<&str>,
     endpoint_kind: ImageProxyEndpoint,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let settings = load_request_settings();
+    let relay = probe_relay(&settings)?;
     let base_url = if relay.upstream_base_url.trim().is_empty() {
         crate::relay_config::relay_profile_base_url(&relay)
     } else {
@@ -1779,15 +1702,14 @@ async fn open_image_proxy_request(
         wire_api,
         compaction: false,
         response: upstream,
-        _channel_permit: None,
     })
 }
 
 fn response_header_timeout(is_stream: bool) -> Duration {
     if is_stream {
-        UPSTREAM_STREAM_HEADER_TIMEOUT
+        upstream_stream_header_timeout()
     } else {
-        UPSTREAM_HEADER_TIMEOUT
+        upstream_header_timeout()
     }
 }
 
@@ -1795,7 +1717,7 @@ pub async fn open_chat_completions_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
+    let settings = load_request_settings();
     let relay = settings.active_relay_profile();
     if relay.protocol != RelayProtocol::ChatCompletions {
         anyhow::bail!("当前中转未启用 Chat Completions 协议代理");
@@ -1812,68 +1734,33 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let channel_key = crate::channel_protection::key_for_relay(&relay);
-    let mut cooldown_retries = 0_usize;
-    loop {
-        let channel_permit =
-            crate::channel_protection::acquire(&channel_key, &relay).await;
-        let request = crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?
-        .post(chat_completions_url(&relay.base_url))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&request_json);
-        let upstream = match with_relay_auth(request, &relay).send().await {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                drop(channel_permit);
-                return Err(error.into());
-            }
-        };
-        let status_code = upstream.status().as_u16();
-        let retry_after = crate::channel_protection::retry_after_duration(upstream.headers());
-        if !(200..300).contains(&status_code) {
-            let cooldown_started = crate::channel_protection::mark_failure(
-                &channel_key,
-                &relay,
-                status_code,
-                retry_after,
-            )
-            .await;
-            if cooldown_started && should_retry_after_cooldown(cooldown_retries) {
-                cooldown_retries = cooldown_retries.saturating_add(1);
-                drop(channel_permit);
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "protocol_proxy.channel_cooldown_retry",
-                    json!({
-                        "relayId": relay.id,
-                        "relayName": relay.name,
-                        "statusCode": status_code,
-                        "retryAfterSeconds": retry_after.map(|value| value.as_secs()),
-                        "retry": cooldown_retries
-                    }),
-                );
-                continue;
-            }
-        }
-        let content_type = upstream
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+    let request = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?
+    .post(chat_completions_url(&relay.base_url))
+    .header(reqwest::header::CONTENT_TYPE, "application/json")
+    .json(&request_json);
+    let upstream = with_relay_auth(request, &relay)
+        .send()
+        .await
+        .context("Chat Completions 上游请求失败")?;
+    let status_code = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
 
-        return Ok(UpstreamProxyResponse {
-            status_code,
-            is_stream: is_stream || content_type.contains("text/event-stream"),
-            content_type,
-            wire_api: UpstreamWireApi::ChatCompletions,
-            compaction: false,
-            response: upstream,
-            _channel_permit: Some(channel_permit),
-        });
-    }
+    Ok(UpstreamProxyResponse {
+        status_code,
+        is_stream: is_stream || content_type.contains("text/event-stream"),
+        content_type,
+        wire_api: UpstreamWireApi::ChatCompletions,
+        compaction: false,
+        response: upstream,
+    })
 }
 
 /// 前缀对齐诊断事件（命名沿用 prefix_stabilizer_* 风格）。
@@ -1894,7 +1781,6 @@ async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
     mut request_json: Value,
     request_path: &str,
-    model_override: Option<&str>,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi, bool)> {
     let compact = is_responses_compact_proxy_path(request_path)
         || request_has_compaction_trigger(&request_json);
@@ -1939,12 +1825,6 @@ async fn upstream_request_parts(
             }
             None => crate::compaction_tools::remember_tools(&request_json),
         }
-    }
-    if let Some(model) = model_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        request_json["model"] = json!(model);
     }
     // 探针用 key 需在 request_json 被转换层 move 之前取出。
     let probe_key = if relay.protocol == RelayProtocol::ChatCompletions
@@ -1998,42 +1878,14 @@ async fn upstream_request_parts(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if !model.is_empty() {
-        use crate::vision::ImageHandling;
-        match crate::vision::image_handling_mode(&model, &relay.model_vlm) {
-            ImageHandling::SendAsIs => { /* 不做任何处理 */ }
-            ImageHandling::Strip => {
-                for key in &["messages", "input"] {
-                    if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
-                        crate::vision::strip_images_only(arr);
-                    }
-                }
-            }
-            ImageHandling::Vlm => {
-                if !relay.vlm_api_key.is_empty()
-                    && !relay.vlm_model.is_empty()
-                    && !relay.vlm_base_url.is_empty()
-                {
-                    let vlm_config = crate::vision::VlmConfig {
-                        api_key: relay.vlm_api_key.clone(),
-                        model: relay.vlm_model.clone(),
-                        base_url: relay.vlm_base_url.clone(),
-                    };
-
-                    for key in &["messages", "input"] {
-                        if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
-                            crate::vision::strip_image_blocks(
-                                arr,
-                                &vlm_config,
-                                &relay.model_windows,
-                                &relay.context_window,
-                                &model,
-                                relay.protocol == crate::settings::RelayProtocol::Responses,
-                            )
-                            .await;
-                        }
-                    }
-                }
+    // 图片策略（逐模型）：原样发送 / 剥离。上游的第三档 VLM 描述管线依赖它自己的
+    // 缓存与配置，属 CodexPlusPlus 增值功能，独立项目不携带。
+    if !model.is_empty()
+        && crate::vision::image_handling_mode(&model, &relay.model_vlm) == crate::vision::ImageHandling::Strip
+    {
+        for key in &["messages", "input"] {
+            if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
+                crate::vision::strip_images_only(arr);
             }
         }
     }
@@ -2131,17 +1983,6 @@ fn with_client_session_headers(
     builder
 }
 
-fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
-    for key in ["conversation", "conversation_id", "previous_response_id"] {
-        if let Some(value) = body.get(key).and_then(Value::as_str) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
 
 fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option<&str>) -> String {
     let configured_user_agent = configured_user_agent.trim();
@@ -7681,20 +7522,6 @@ mod relay_custom_header_tests {
             request.headers().get("authorization").unwrap(),
             "Bearer explicit"
         );
-    }
-}
-
-#[cfg(test)]
-mod channel_cooldown_retry_tests {
-    use super::*;
-
-    #[test]
-    fn cooldown_allows_three_automatic_retries_only() {
-        assert!(should_retry_after_cooldown(0));
-        assert!(should_retry_after_cooldown(1));
-        assert!(should_retry_after_cooldown(2));
-        assert!(!should_retry_after_cooldown(3));
-        assert!(!should_retry_after_cooldown(usize::MAX));
     }
 }
 

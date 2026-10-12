@@ -12,7 +12,7 @@
 // 历史折叠形态不变，token 前缀纯追加；摘要阶段禁工具调用交给 tool_choice=none
 // （rewrite_request_for_compaction 已设置，不入 prompt 文本，不影响前缀）。
 // 无缓存（如 relay 重启后首次即压缩）时保持旧行为（tools 置空）。
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -60,6 +60,7 @@ pub fn preserved_tools(request: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn remember_then_preserved_round_trips_exact_bytes() {

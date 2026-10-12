@@ -1,10 +1,11 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/examples/prefix_replay.rs`，commit f9be7cf。
+// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/examples/prefix_replay.rs`，
+// commit f9be7cf。从日志回放取证的前缀覆盖率工具，本项目原样带走。
 // 离线回放：把取证抓到的客户端原始 /v1/responses 体逐轮喂给稳定层，
 // 度量相邻轮「归一化后前一请求 messages 是否被完整覆盖（纯追加）」。
 // 判据：coverage = common(上一轮messages, 本轮messages) / len(上一轮messages)。
 // coverage < 1 = 前一请求历史被改写（早分叉，缓存前缀作废）；= 1 = 纯追加。
 // 只输出数值与极短截断上下文，不落盘任何正文。
-// 用法：cargo run -p codex-plus-core --example prefix_replay -- /tmp/prefix_forensics
+// 用法：cargo run --example prefix_replay -- /tmp/prefix_forensics
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -112,7 +113,7 @@ fn main() {
             .unwrap_or("")
             .to_string();
         let on = serde_json::to_vec(
-            &codex_plus_core::protocol_proxy::responses_to_chat_completions_with_options(
+            &codex_layer::protocol_proxy::responses_to_chat_completions_with_options(
                 body.clone(),
                 false,
                 true,
@@ -121,7 +122,7 @@ fn main() {
         )
         .expect("序列化失败");
         let off = serde_json::to_vec(
-            &codex_plus_core::protocol_proxy::responses_to_chat_completions_with_options(
+            &codex_layer::protocol_proxy::responses_to_chat_completions_with_options(
                 body,
                 false,
                 false,

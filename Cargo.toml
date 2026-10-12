@@ -1,0 +1,32 @@
+[package]
+name = "codex-layer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = "https://github.com/GGGBB/codex-layer"
+description = "codex relay 的稳定层：prompt 前缀钉定 + Responses ⇄ Chat Completions 协议转换"
+readme = "README.md"
+
+[[bin]]
+name = "codex-layer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+flate2 = "1"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

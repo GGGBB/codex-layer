@@ -1,4 +1,6 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/src/diagnostic_log.rs`，commit f9be7cf。
+// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/src/diagnostic_log.rs`，
+// commit f9be7cf。稳定层的全部事件都走这里（JSONL 追加 + 超限裁剪）。本项目只把
+// 默认落点从 `~/.codex-session-delete/codex-plus.log` 挪到 `~/.codex-layer/codex-layer.log`。
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -82,8 +84,9 @@ pub fn diagnostic_log_path() -> PathBuf {
     crate::paths::default_diagnostic_log_path()
 }
 
-#[doc(hidden)]
-pub fn set_diagnostic_log_path_for_tests(path: Option<PathBuf>) {
+/// 覆盖诊断日志落点：`main` 按配置 `[log] path` 调一次；测试也用它把日志写进临时目录。
+/// 传 `None` 恢复默认落点。
+pub fn set_diagnostic_log_path(path: Option<PathBuf>) {
     let lock = TEST_LOG_PATH.get_or_init(|| Mutex::new(None));
     *lock.lock().expect("test log path lock poisoned") = path;
 }

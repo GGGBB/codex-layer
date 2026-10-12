@@ -1,6 +1,4 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/tests/protocol_proxy.rs`，commit f9be7cf。
-// 上游测试资产整体保留，断言未改。
-use codex_plus_core::protocol_proxy::{
+use codex_layer::protocol_proxy::{
     ChatSseToResponsesConverter, CompactionSseConverter, ProxySessionHeaders,
     audio_transcriptions_url, chat_completion_to_response,
     chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
@@ -18,10 +16,9 @@ use codex_plus_core::protocol_proxy::{
     send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
     upstream_stream_header_timeout, wrap_non_stream_response_as_compaction,
 };
-use codex_plus_core::relay_config::test_relay_profile;
-use codex_plus_core::settings::{
-    AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    RelayMode, RelayModelRoute, RelayProfile, RelayProtocol, RelaySessionProvider,
+use codex_layer::relay_config::test_relay_profile;
+use codex_layer::settings::{
+    BackendSettings, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
 };
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -536,8 +533,6 @@ async fn chat_compaction_v2_request_routes_to_summary_endpoint_and_flags_respons
             base_url: format!("http://{addr}/v1"),
             api_key: "sk-compact".to_string(),
             relay_mode: RelayMode::Official,
-            official_mix_api_key: true,
-            hide_official_usage_alert: false,
             ..RelayProfile::default()
         }],
         ..BackendSettings::default()
@@ -827,8 +822,6 @@ async fn responses_compact_request_keeps_compact_path_upstream() {
             base_url: format!("http://{addr}/v1"),
             api_key: "sk-compact".to_string(),
             relay_mode: RelayMode::Official,
-            official_mix_api_key: true,
-            hide_official_usage_alert: false,
             ..RelayProfile::default()
         }],
         ..BackendSettings::default()
@@ -3545,60 +3538,6 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
 }
 
 #[tokio::test]
-async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let first_addr = first.local_addr().unwrap();
-    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let second_addr = second.local_addr().unwrap();
-    let first_server = tokio::spawn(capture_request_and_respond_once(
-        first,
-        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 11\r\ncontent-type: application/json\r\n\r\n{\"error\":1}",
-    ));
-    let second_server = tokio::spawn(capture_request_and_respond_once(
-        second,
-        "HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
-    ));
-    let mut settings = aggregate_proxy_settings(
-        "failover",
-        format!("http://{first_addr}/v1"),
-        format!("http://{second_addr}/v1"),
-    );
-    for relay in settings.relay_profiles.iter_mut().take(2) {
-        relay.relay_mode = RelayMode::PureApi;
-        relay.no_auth = true;
-        relay.api_key.clear();
-    }
-
-    let result = open_responses_proxy_request_with_settings(
-        r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
-        settings,
-    )
-    .await
-    .unwrap();
-    let body = result.response.bytes().await.unwrap();
-
-    assert_eq!(result.status_code, 200);
-    assert_eq!(body.as_ref(), br#"{"id":"resp_1","object":"response"}"#);
-    let first_request = first_server.await.unwrap();
-    let second_request = second_server.await.unwrap();
-    assert!(
-        !first_request
-            .to_ascii_lowercase()
-            .contains("authorization:")
-    );
-    assert!(
-        !second_request
-            .to_ascii_lowercase()
-            .contains("authorization:")
-    );
-}
-
-#[tokio::test]
 async fn model_route_uses_target_responses_provider_without_mutating_request() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -3825,132 +3764,6 @@ async fn model_route_rejects_missing_or_non_responses_targets() {
     assert!(error.to_string().contains("必须使用 Responses API"));
 }
 
-#[tokio::test]
-async fn aggregate_stream_request_sends_sse_accept_header() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    let fallback = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let fallback_addr = fallback.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut buffer = [0; 4096];
-        let read = stream.read(&mut buffer).await.unwrap();
-        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 14\r\ncontent-type: text/event-stream\r\n\r\ndata: [DONE]\n\n",
-            )
-            .await
-            .unwrap();
-        request
-    });
-    let fallback_server = tokio::spawn(respond_once(
-        fallback,
-        "HTTP/1.1 200 OK\r\ncontent-length: 14\r\ncontent-type: text/event-stream\r\n\r\ndata: [DONE]\n\n",
-    ));
-    let settings = aggregate_proxy_settings(
-        "stream",
-        format!("http://{addr}/v1"),
-        format!("http://{fallback_addr}/v1"),
-    );
-
-    let result = open_responses_proxy_request_with_settings(
-        r#"{"model":"gpt-5-mini","input":"hi","stream":true}"#,
-        settings,
-    )
-    .await
-    .unwrap();
-    let request = server.await.unwrap();
-
-    assert_eq!(result.status_code, 200);
-    assert!(result.is_stream);
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("accept: text/event-stream")
-    );
-    fallback_server.abort();
-}
-
-#[tokio::test]
-async fn aggregate_proxy_rewrites_requested_model_to_selected_member_default_model() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    let fallback = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let fallback_addr = fallback.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut buffer = Vec::new();
-        let mut chunk = [0; 4096];
-        loop {
-            let read = stream.read(&mut chunk).await.unwrap();
-            if read == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-            let request = String::from_utf8_lossy(&buffer);
-            let Some((headers, body)) = request.split_once("\r\n\r\n") else {
-                continue;
-            };
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.split_once(':').and_then(|(name, value)| {
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())
-                            .flatten()
-                    })
-                })
-                .unwrap_or(0);
-            if body.as_bytes().len() >= content_length {
-                break;
-            }
-        }
-        let request = String::from_utf8_lossy(&buffer).to_string();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
-            )
-            .await
-            .unwrap();
-        request
-    });
-    let fallback_server = tokio::spawn(respond_once(
-        fallback,
-        "HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_2\",\"object\":\"response\"}",
-    ));
-    let mut settings = aggregate_proxy_settings(
-        "rewrite-model",
-        format!("http://{addr}/v1"),
-        format!("http://{fallback_addr}/v1"),
-    );
-    settings.relay_profiles[0].model = "deepseek-v4-pro".to_string();
-
-    let result = open_responses_proxy_request_with_settings(
-        r#"{"model":"gpt-5.4","input":"hi","stream":false}"#,
-        settings,
-    )
-    .await
-    .unwrap();
-    let request = server.await.unwrap();
-    let (_, body) = request.split_once("\r\n\r\n").unwrap();
-    let body: serde_json::Value = serde_json::from_str(body).unwrap();
-
-    assert_eq!(result.status_code, 200);
-    assert_eq!(body["model"], "deepseek-v4-pro");
-    fallback_server.abort();
-}
-
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut buffer = [0; 1024];
@@ -4058,59 +3871,6 @@ fn model_route_settings(
     }
 }
 
-fn aggregate_proxy_settings(
-    id_suffix: &str,
-    first_base_url: String,
-    second_base_url: String,
-) -> BackendSettings {
-    let first_id = format!("proxy-{id_suffix}-a");
-    let second_id = format!("proxy-{id_suffix}-b");
-    let aggregate_id = format!("proxy-{id_suffix}-agg");
-    BackendSettings {
-        relay_profiles: vec![
-            RelayProfile {
-                id: first_id.clone(),
-                name: "first".to_string(),
-                base_url: first_base_url,
-                api_key: "sk-first".to_string(),
-                ..RelayProfile::default()
-            },
-            RelayProfile {
-                id: second_id.clone(),
-                name: "second".to_string(),
-                base_url: second_base_url,
-                api_key: "sk-second".to_string(),
-                ..RelayProfile::default()
-            },
-            RelayProfile {
-                id: aggregate_id.clone(),
-                name: "aggregate".to_string(),
-                relay_mode: RelayMode::Aggregate,
-                ..RelayProfile::default()
-            },
-        ],
-        active_relay_id: aggregate_id.clone(),
-        active_aggregate_relay_id: aggregate_id.clone(),
-        aggregate_relay_profiles: vec![AggregateRelayProfile {
-            id: aggregate_id,
-            name: "aggregate".to_string(),
-            session_provider: RelaySessionProvider::Custom,
-            strategy: AggregateRelayStrategy::RequestRoundRobin,
-            members: vec![
-                AggregateRelayMember {
-                    relay_id: first_id,
-                    weight: 1,
-                },
-                AggregateRelayMember {
-                    relay_id: second_id,
-                    weight: 1,
-                },
-            ],
-            routes: Vec::new(),
-        }],
-        ..BackendSettings::default()
-    }
-}
 #[tokio::test]
 async fn audio_transcriptions_proxy_forwards_multipart_body() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -4446,15 +4206,15 @@ async fn responses_proxy_session_headers_keep_custom_headers_authoritative() {
         let mut settings = session_header_settings(protocol, format!("http://{address}/v1"));
         let relay = &mut settings.relay_profiles[0];
         relay.custom_headers = vec![
-            codex_plus_core::settings::RelayHeaderKeyValue {
+            codex_layer::settings::RelayHeaderKeyValue {
                 key: "Session-ID".to_string(),
                 value: "configured-session".to_string(),
             },
-            codex_plus_core::settings::RelayHeaderKeyValue {
+            codex_layer::settings::RelayHeaderKeyValue {
                 key: "THREAD-id".to_string(),
                 value: "configured-thread".to_string(),
             },
-            codex_plus_core::settings::RelayHeaderKeyValue {
+            codex_layer::settings::RelayHeaderKeyValue {
                 key: "X-OpenCode-Session".to_string(),
                 value: String::new(),
             },
@@ -4690,14 +4450,14 @@ fn settings_path_test_lock() -> &'static Mutex<()> {
 
 impl SettingsPathGuard {
     fn set(path: PathBuf) -> Self {
-        let previous = codex_plus_core::paths::set_settings_path_for_tests(Some(path));
+        let previous = codex_layer::paths::set_settings_path_for_tests(Some(path));
         Self { previous }
     }
 }
 
 impl Drop for SettingsPathGuard {
     fn drop(&mut self) {
-        codex_plus_core::paths::set_settings_path_for_tests(self.previous.take());
+        codex_layer::paths::set_settings_path_for_tests(self.previous.take());
     }
 }
 
@@ -5119,7 +4879,7 @@ fn responses_request_item_ids_always_match_their_type_prefix() {
 /// 因为 `upstream_request_parts` 需要真实网络。
 #[test]
 fn responses_item_id_normalization_repairs_legacy_prefixes() {
-    use codex_plus_core::protocol_proxy::normalize_responses_item_ids_for_test;
+    use codex_layer::protocol_proxy::normalize_responses_item_ids_for_test;
 
     let mut body = json!({
         "model": "gpt-5.6-sol",
@@ -5168,7 +4928,7 @@ fn responses_item_id_normalization_repairs_legacy_prefixes() {
 /// id 恰好等于某个前缀时，剥完是空串，应退回 call_id 而不是产出裸前缀。
 #[test]
 fn responses_item_id_normalization_falls_back_to_call_id() {
-    use codex_plus_core::protocol_proxy::normalize_responses_item_ids_for_test;
+    use codex_layer::protocol_proxy::normalize_responses_item_ids_for_test;
 
     let mut body = json!({
         "model": "gpt-5.6-sol",
@@ -5423,35 +5183,6 @@ fn responses_input_maps_tool_search_history_items() {
     assert!(content.contains("mcp__calendar__create_event"));
 }
 
-/// #2263 附带问题：重写 config.toml 时必须保留 live 配置里的 mcp_servers 段。
-#[test]
-fn preserve_live_app_settings_keeps_mcp_servers() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    std::fs::write(
-        home.join("config.toml"),
-        r#"[mcp_servers.context7]
-url = "https://mcp.context7.com/mcp"
-
-[mcp_signals.marker]
-key = "value"
-"#,
-    )
-    .unwrap();
-
-    let preserved = codex_plus_core::relay_config::preserve_live_app_settings_for_test(
-        home,
-        "[profile]\nname = \"x\"\n",
-    )
-    .unwrap();
-
-    assert!(
-        preserved.contains("[mcp_servers.context7]"),
-        "mcp_servers 段必须保留，实际：{preserved}"
-    );
-    assert!(preserved.contains("https://mcp.context7.com/mcp"));
-}
-
 /// #2263：tool_search_output 先于对应 call 出现（压缩/截断后的回放常见）
 /// 时走孤儿输出路径，不能 panic 也不能丢内容。
 #[test]
@@ -5624,29 +5355,9 @@ fn chat_response_keeps_undeclared_tool_search_as_plain_function_call() {
     assert_eq!(item["call_id"], "call_undeclared");
 }
 
-/// #2263 附带问题负例：live 配置里本来就没有 mcp_servers 时，重写
-/// 不能凭空注入空段。
-#[test]
-fn preserve_live_app_settings_does_not_invent_mcp_servers() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    std::fs::write(home.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
-
-    let preserved = codex_plus_core::relay_config::preserve_live_app_settings_for_test(
-        home,
-        "[profile]\nname = \"x\"\n",
-    )
-    .unwrap();
-
-    assert!(
-        !preserved.contains("mcp_servers"),
-        "live 无 mcp_servers 时不得注入该段，实际：{preserved}"
-    );
-}
-
 #[tokio::test]
 async fn native_compaction_preserves_protocol_and_opaque_state() {
-    use codex_plus_core::protocol_proxy::open_responses_proxy_request_with_settings_for_path_and_beta;
+    use codex_layer::protocol_proxy::open_responses_proxy_request_with_settings_for_path_and_beta;
     let item = json!({"id":"cmp_native", "type":"compaction", "encrypted_content":"opaque-native-state", "future":{"kept":true}});
     for streaming in [false, true] {
         for replay in [false, true] {

@@ -1,12 +1,13 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/examples/compact_align_replay.rs`，commit f9be7cf。
+// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/examples/compact_align_replay.rs`，
+// commit f9be7cf。压缩轮对齐的回放取证工具，本项目原样带走。
 // 离线回放（compact_prefix_align）：把 /tmp/compact_forensics 的真实语料逐对喂给
 // 「前缀对齐 + ChatCompletions 转换层」，验证压缩轮对齐后：
 //   1) tools 序列化与主会话轮逐字节一致；
 //   2) 压缩轮 chat messages 数组是主会话轮 messages 的纯前缀追加（common == len(prev)）；
 //   3) 未对齐（旧行为）时前缀断裂，作为对照。
 // 只输出数值统计，不落盘任何正文。语料含用户数据，绝不进仓库。
-// 用法：cargo run -p codex-plus-core --example compact_align_replay -- /tmp/compact_forensics
-use codex_plus_core::protocol_proxy::responses_to_chat_completions_with_options;
+// 用法：cargo run --example compact_align_replay -- /tmp/compact_forensics
+use codex_layer::protocol_proxy::responses_to_chat_completions_with_options;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -49,14 +50,14 @@ fn main() {
         let prev = load(&dir, prev_name);
         let now = load(&dir, now_name);
         // 主会话轮先过 relay 接线（remember_tools 的等价物：直接灌缓存）。
-        codex_plus_core::compaction_tools::remember_tools(&prev);
+        codex_layer::compaction_tools::remember_tools(&prev);
         let chat_prev =
             responses_to_chat_completions_with_options(prev.clone(), false, true).unwrap();
         // 旧行为对照：不对齐直接转换。
         let chat_now_old =
             responses_to_chat_completions_with_options(now.clone(), false, true).unwrap();
         // 新行为：前缀对齐后转换。
-        let (aligned, report) = codex_plus_core::compaction_align::align_compaction_request(&now)
+        let (aligned, report) = codex_layer::compaction_align::align_compaction_request(&now)
             .expect("压缩轮必须检出");
         let chat_now =
             responses_to_chat_completions_with_options(aligned.clone(), false, true).unwrap();
@@ -69,7 +70,7 @@ fn main() {
         let tools_same_new = tools_bytes(&chat_now) == tools_bytes(&chat_prev);
         let tools_same_old = tools_bytes(&chat_now_old) == tools_bytes(&chat_prev);
         // 对齐后的压缩轮必须与直接再转换一次逐字节一致（幂等，稳定层无抖动）。
-        let (aligned2, _) = codex_plus_core::compaction_align::align_compaction_request(&aligned)
+        let (aligned2, _) = codex_layer::compaction_align::align_compaction_request(&aligned)
             .expect("对齐后仍是压缩轮形态");
         let chat_again =
             responses_to_chat_completions_with_options(aligned2, false, true).unwrap();
