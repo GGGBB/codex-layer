@@ -4605,6 +4605,9 @@ fn order_system_chunks_stably(chunks: &[String]) -> String {
     }
     // 常量块同名去重：只保留第一个，消除重复注入造成的块区平移。
     let mut constant_seen: Vec<&str> = Vec::new();
+    // 切分结果是否含具名块：决定文本段空白是「块间分隔」（可归一）还是
+    // 「块体本身」（透传），见下方 push 循语义。
+    let has_named_blocks = parts.iter().any(|((kind, _), _)| *kind == 1);
     let mut out: Vec<&str> = Vec::with_capacity(parts.len());
     for ((kind, name_part), text) in parts.iter() {
         if *kind == 1
@@ -4627,8 +4630,14 @@ fn order_system_chunks_stably(chunks: &[String]) -> String {
                 }
             }
         }
-        let text = text.trim();
-        if text.is_empty() {
+        // 块体原文透传（维护者 P2：裁剪块体首尾空白违背「非易变内容逐字节
+        // 不变」的 opt-in 契约）；纯空白块仍跳过，本块只消分隔噪声。
+        // 语义分桶（维护者 P2）：切分结果含具名块时，文本段首尾空白属
+        // 「块间分隔」，归一不伤内容且保幂等；整段只有纯文本时，空白就是
+        // 块体本身，逐字节透传。具名块的尖括号标签同理属结构，两端参与
+        // 分隔归一、标签内内容零改写。
+        let text = if has_named_blocks { text.trim() } else { text };
+        if text.trim().is_empty() {
             continue;
         }
         out.push(text);
@@ -7772,11 +7781,19 @@ mod prefix_stabilizer_tests {
             "tail".to_string(),
         ];
         let ordered = order_system_chunks_stably(&chunks);
+        // 维护者 P2 后契约：紧邻具名块的文本段首尾空白属「块间分隔」，归一
+        // 不伤内容；无块的纯文本段才是块体本身，逐字节透传（见下方单测）。
         assert_eq!(ordered, "core\n\ntail\n\n<a_block>\na\n</a_block>\n\n<b_block>\nb\n</b_block>");
         assert_eq!(
             order_system_chunks_stably(&[ordered.clone()]),
             ordered,
             "规范序必须幂等"
+        );
+        // 无具名块的纯文本段：空白就是块体本身，必须逐字节透传（维护者 P2）。
+        assert_eq!(
+            order_system_chunks_stably(&["  padded  ".to_string()]),
+            "  padded  ",
+            "纯文本段首尾空白不得被裁剪"
         );
     }
 

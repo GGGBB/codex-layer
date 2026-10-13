@@ -6560,3 +6560,28 @@ fn current_turn_mark_skipped_when_request_ends_with_tool_result() {
         "非 user 收尾的请求不得出现轮次标记"
     );
 }
+
+#[test]
+fn stabilizer_keeps_chunk_body_whitespace_verbatim() {
+    // 维护者 P2（GAP_ANALYSIS P1-4）：规范序只规范块间分隔，不得裁剪块体
+    // 自身首尾空白（「非易变内容逐字节不变」的 opt-in 契约）。
+    let body = json!({
+        "instructions": "  padded root system  ",
+        "input": [
+            { "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": "hi" } ] }
+        ]
+    });
+    let out = responses_to_chat_completions_with_options(body, false, true).unwrap();
+    let system = out["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "system")
+        .unwrap();
+    let content = system["content"].as_str().unwrap();
+    assert!(
+        content.starts_with("  padded") && content.ends_with("system  "),
+        "块体首尾空白必须原样透传: {content:?}"
+    );
+}
