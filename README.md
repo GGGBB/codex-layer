@@ -190,4 +190,4 @@ python3 scripts/smoke/streaming.py
 
 ## License
 
-AGPLv3，与来源项目一致。见 [LICENSE](LICENSE)。
+AGPLv3，见 [LICENSE](https://github.com/GGGBB/codex-layer/blob/main/LICENSE)。
