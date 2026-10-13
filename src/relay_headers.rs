@@ -1,9 +1,6 @@
-// 上游自定义请求头与认证注入。
-//
-// 移植自 CodexPlusPlus PR #2449 的
-// `crates/codex-plus-core/src/relay_headers.rs`（commit f9be7cf），逐行未改行为：
-// 显式 Authorization 优先于 API Key、传输头一律拒绝、敏感值脱敏、报错不回显值。
-//! 供应商自定义上游请求头（issue #1685）。
+// 行为约束：显式 Authorization 优先于 API Key、传输头一律拒绝、敏感值脱敏、
+// 报错不回显值。
+//! 供应商自定义上游请求头。
 //!
 //! 三处发往上游的请求——供应商测试连接、模型列表拉取、协议代理转发——共用本模块的
 //! `apply_*`，保证用户配置的 header 在三处行为一致。

@@ -1,8 +1,6 @@
 //! 上游地址/密钥解析与连通性测试。
 //!
-//! 移植自 CodexPlusPlus PR #2449 的
-//! `crates/codex-plus-core/src/relay_config.rs`（commit f9be7cf），只留下协议层
-//! 需要的三个函数。删掉的上游专有逻辑：从 `configContents`（codex 的
+//! 只留下协议层需要的三个函数。删掉的聚合形态逻辑：从 `configContents`（codex 的
 //! config.toml 快照）里挖 base_url / experimental_bearer_token、官方登录态
 //! 上游、聚合模式回指本地代理等——本项目没有这些概念，地址与密钥一律显式配置。
 
@@ -16,7 +14,7 @@ use crate::settings::{RelayProfile, RelayProtocol};
 
 /// 上游 Base URL：`upstreamBaseUrl` 优先，其次 `baseUrl`。
 ///
-/// 保留这个优先级是为了让从 CodexPlusPlus 迁移过来的设置不用改字段：那边
+/// 保留这个优先级是为了让旧部署的设置不用改字段：那边
 /// `baseUrl` 可能被回指到本地代理，真上游写在 `upstreamBaseUrl`。
 pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     let upstream = profile.upstream_base_url.trim();
