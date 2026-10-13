@@ -32,6 +32,7 @@ user_agent = ""
 # 关掉之后本层转发行为与不经本层逐字节一致，可用来对照排障。
 prompt_prefix = true
 # 严格 OpenAI 协议：剥掉各家私有的 reasoning 方言。接自建服务器一般不用开。
+# 开启后 Gemini 系模型（含非白名单 ID）会开始收到标准 reasoning_effort 字段（issue #4）。
 standard_openai_protocol = false
 
 [images]
