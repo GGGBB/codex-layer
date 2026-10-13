@@ -56,9 +56,8 @@ git -c user.name="codex-layer-<角色>" \
 2. **分支**：从 main 切出，命名 `agent/<issue号>-<slug>`，
    例如 `agent/3-web-search-guard`；在自己的 worktree 内创建
    （见「worktree 隔离」）。
-3. **commit 纪律**：移植 commit 与改行为 commit 严格分开。移植 commit 保留来源
-   逐字节内容与文件头来源注释（来源仓库/PR/文件/commit），不改行为；
-   行为改动 commit 正文说明动机、行为影响面与测试证据。
+3. **commit 纪律**：机械移植改动与行为改动严格分开。机械改动保留逐字节
+   内容、不改行为；行为改动 commit 正文说明动机、行为影响面与测试证据。
 4. **PR**：push 分支后开 PR，标题中文，正文按
    [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) 填写，
    用 `Closes #<issue号>` 关联 issue，打上 `type/*` 与 `P1`/`P2` 标签。
