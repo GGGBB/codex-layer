@@ -7959,7 +7959,7 @@ fn is_openai_o_series(model: &str) -> bool {
 
 /// 与各家 Chat 网关的兼容性对拍（含 Gemini 系 `reasoning_effort` 转发闸门，issue #4）。
 ///
-/// web_search 谎报对拍不在本模块重复：它已落在 `native_search_guard_tests`。
+/// web_search 谎报对拍不在本模块重复：它随 issue #3 落在 `native_search_guard_tests`。
 #[cfg(test)]
 mod response_compatibility_tests {
     use super::*;
