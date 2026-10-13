@@ -1,7 +1,7 @@
 //! TOML 配置层。
 //!
-//! 本项目自有的配置入口，替代 CodexPlusPlus 的 `SettingsStore` + `RelayProfile`
-//! 组合（那份 JSON 模型仍保留在 `settings.rs`，作为内部载体与迁移兼容路径）。
+//! 本项目自有的配置入口；内部数据模型仍留在 `settings.rs`，
+//! 作为内部载体与迁移兼容路径。
 //!
 //! 设计原则：字段名直白、未知字段直接报错（写错配置要立刻炸，不要静默按默认跑）。
 //! 一份最小配置只需要 `[upstream]` 的 `base_url` / `api_key` / `protocol`。
@@ -30,7 +30,7 @@ use crate::settings::{
     BackendSettings, RelayHeaderKeyValue, RelayModelRoute, RelayMode, RelayProfile, RelayProtocol,
 };
 
-/// 默认监听端口，沿用 CodexPlusPlus 的协议代理端口，便于老用户平滑迁移。
+/// 默认监听端口，可被 `[server] port` 覆盖。
 pub const DEFAULT_LISTEN_PORT: u16 = 57321;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -115,7 +115,7 @@ pub struct HeaderConfig {
 }
 
 /// 上游方言的配置文件写法。同时接受 `chat_completions` / `chatCompletions` /
-/// `chat-completions` 三种常见拼法，避免用户按 CodexPlusPlus 的驼峰写法踩空。
+/// `chat-completions` 三种常见拼法，避免用户按驼峰或连字符写法踩空。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolFormat {
@@ -387,7 +387,7 @@ impl Config {
 }
 
 /// 把 `[images] strip_models = ["a","b"]` 编成转换层认识的策略表。
-/// 表名沿用 `model_vlm`（与 CodexPlusPlus 的设置字段同名），值只有 `strip` 一档。
+/// 表名沿用 `model_vlm`（与内部 JSON 设置字段同名），值只有 `strip` 一档。
 fn strip_models_json(models: &[String]) -> anyhow::Result<String> {
     let mut map = serde_json::Map::new();
     for model in models {

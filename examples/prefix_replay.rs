@@ -1,5 +1,4 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/examples/prefix_replay.rs`，
-// commit f9be7cf。从日志回放取证的前缀覆盖率工具，本项目原样带走。
+// 从日志回放取证的前缀覆盖率工具。
 // 离线回放：把取证抓到的客户端原始 /v1/responses 体逐轮喂给稳定层，
 // 度量相邻轮「归一化后前一请求 messages 是否被完整覆盖（纯追加）」。
 // 判据：coverage = common(上一轮messages, 本轮messages) / len(上一轮messages)。

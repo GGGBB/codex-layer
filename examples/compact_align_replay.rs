@@ -1,5 +1,4 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/examples/compact_align_replay.rs`，
-// commit f9be7cf。压缩轮对齐的回放取证工具，本项目原样带走。
+// 压缩轮对齐的回放取证工具。
 // 离线回放（compact_prefix_align）：把 /tmp/compact_forensics 的真实语料逐对喂给
 // 「前缀对齐 + ChatCompletions 转换层」，验证压缩轮对齐后：
 //   1) tools 序列化与主会话轮逐字节一致；
