@@ -22,6 +22,11 @@ codex 客户端每一轮都重放整段历史。重放出来的 prompt 带有**�
   就不钉，避免把该变的东西钉死。
 - **协议互转。** `/v1/responses` ⇄ `/v1/chat/completions`，含 SSE 流式回流与压缩轮
   （`/responses/compact`）的 `compaction` 输出项重组，因此上游说哪种方言都能接。
+- **原生搜索谎报守卫。** Chat 路由不执行服务端原生搜索：请求里顶层 `web_search`
+  声明一律剥除（客户端执行的同名工具保留），`tool_choice` 强制原生搜索时给结构化 400
+  `unsupported_native_web_search`；上游伪造的搜索调用只产 `status:"failed"` 的
+  `web_search_call`，并使整响应 `response.failed` + `invalid_upstream_tool_call`，
+  流式与非流式同口径：本层不把模型幻觉包装成「已搜索完成」。
 - **媒体归一。** `input_image` 部件归一成 `image_url`，图片输入对任意 OpenAI 兼容的视觉
   后端都可用。
 - **前缀分叉探针。** 按 `prompt_cache_key` 逐轮记录「转换后 system 块序列 + tools」的指纹，
