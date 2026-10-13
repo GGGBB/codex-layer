@@ -117,3 +117,44 @@ git -c user.name="codex-layer-<角色>" \
 - 既有测试整体保留，不删不改断言；因接口适配的机械改动须在 commit 正文说明。
 - 转换 / 钉定核心的新逻辑必须有直接调用纯函数的单元测试，不允许只靠 HTTP 层
   集成测试兜底。
+
+## warning 基线（按构建目标分别记录）
+
+**「零新增」是相对同一条命令的基线，不是绝对数字为零。** main 上本来就带着一批
+dead-code warning，而不同命令编译的目标不同，看到的条数天然不一样：拿 `cargo test`
+看到的条数去对 `cargo build` 的基线，一定会误判成「自己引入了 warning」，
+继而返工去改与本任务无关的死代码。
+
+| 命令 | 编译哪些目标 | 基线条数 |
+| --- | --- | --- |
+| `cargo build` | 仅 lib（不含 `#[cfg(test)]`、不含 example 与集成测试） | **3** |
+| `cargo test`、`cargo check --all-targets` | lib 及其 test cfg + bin + example + 集成测试 | **7** |
+
+基线明细（在 `982f660` 上 `cargo clean -p codex-layer` 后实测；行号会随改动漂移，
+按符号名定位更可靠）。两个命令都有的 3 条（lib 本体）：
+
+- `content_starts_signature` never used —— `src/compaction_align.rs:176`
+- `first_text_of` never used —— `src/compaction_align.rs:207`
+- `message_has_image` never used —— `src/protocol_proxy.rs:5048`
+
+只有带测试 / example 编译才多出的 4 条：
+
+- `OPEN_PAGE_BLOCK` never used —— `src/protocol_proxy.rs:8610`（属于 lib 的
+  `#[cfg(test)]` 测试模块，所以 `cargo build` 看不到它）
+- `fnv` never used —— `examples/prefix_replay.rs:12`
+- `fam_off` unused variable —— `examples/prefix_replay.rs:137`
+- `respond_once` never used —— `tests/protocol_proxy.rs:4130`（集成测试）
+
+自查姿势：先固定一条命令（建议 `cargo test`，与 CI 一致），再与本次改动**之前**
+同一条命令的输出对比。**不要把上面两个数字当永久常量照抄**：它们会随 main 演进
+而变化，当门禁用之前必须在当前 main 上重测一遍。
+
+红线：
+
+- **禁止**为了「消数字」给这些符号加 `#[allow(dead_code)]`。那只是把问题藏起来，
+  还会让下一次真正新增的 warning 混在里面看不见。
+- 要清理就另开 issue 逐个论证：先 `git grep` 确认确实无人引用（有过先例：某常量
+  被断言「上线可见、删了会破坏鉴权」，实测全仓零引用，其实是死代码），再单独
+  一笔删除，与行为改动分开提交。
+- CI 不跑 `clippy -D warnings`（理由见「安全红线」），所以 warning 只能靠自查，
+  基线就得按构建目标写得能对上号。
