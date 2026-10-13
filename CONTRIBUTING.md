@@ -77,6 +77,12 @@ git -c user.name="codex-layer-<角色>" \
 
 ## 自测纪律（必读）
 
+- 认领 issue 后**尽早、频繁 commit**：本地每跑绿一轮就 commit，具备条件即
+  push 分支（WIP 也可），不要等全部做完才第一次提交。本仓库的贡献者是
+  agent 会话，已有两次在长任务尾声交出空回报、工作全部留在未提交工作区
+  的事故（一次 CLI 修复、一次可观测性数据面），维护者只能靠读 diff 反推
+  状态——落盘即安全。回报里若包含「未完成」，也必须写清当前 commit 与
+  卡点，**禁止交空回报**。
 - 所有 git 与 cargo 命令只在自己的专属 worktree 内执行（主 checkout 由维护者
   独占）；开工先 `git rev-parse --abbrev-ref HEAD` 自检 HEAD 是自己的分支名，
   不等即停手回报；构建产物用独立 `target/` 或按角色命名的
