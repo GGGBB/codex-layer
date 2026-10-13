@@ -167,6 +167,7 @@ fn default_true() -> bool {
 pub struct StabilityConfig {
     /// 是否注册 `GET /stability` 端点。默认关：不注册时该路径落进
     /// fallback，行为与其它非 `/v1` 陌生路径一致（404）。
+    /// 端点路由始终注册，未启用时由 handler 显式返回 404「未启用」。
     #[serde(default)]
     pub enabled: bool,
     /// 读诊断日志的尾部字节窗口上限：日志可达上百 MB，只读尾部窗口。
