@@ -8,6 +8,7 @@
 //! `show_prompt_snippets` 开启时才输出截断到 120 字符的片段，并带明确警示字段。
 
 use serde_json::{Value, json};
+use crate::diagnostic_log::events;
 use std::collections::HashMap;
 
 /// 快照保留的最近 divergence 条数默认上限。
@@ -126,10 +127,10 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
         last_ts = Some(last_ts.map_or(record.timestamp_ms, |t| t.max(record.timestamp_ms)));
 
         match record.event.as_str() {
-            "codex_layer.started" => {
+            events::layer::STARTED => {
                 started = Some((record.timestamp_ms, record.pid, record.detail.clone()));
             }
-            "codex_layer.stream_open" => {
+            events::layer::STREAM_OPEN => {
                 opens_total += 1;
                 let compaction =
                     record.detail.get("compaction").and_then(Value::as_bool) == Some(true);
@@ -161,7 +162,7 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
                     None => open_missing_request_id += 1,
                 }
             }
-            "codex_layer.stream_completed" => {
+            events::layer::STREAM_COMPLETED => {
                 completed += 1;
                 pair_terminal(
                     record,
@@ -172,7 +173,7 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
                     &mut terminal_without_open,
                 );
             }
-            "codex_layer.stream_failed" => {
+            events::layer::STREAM_FAILED => {
                 failed += 1;
                 pair_terminal(
                     record,
@@ -183,22 +184,22 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
                     &mut terminal_without_open,
                 );
             }
-            "codex_layer.conversion_rejected" => {
+            events::layer::CONVERSION_REJECTED => {
                 conversion_rejected += 1;
                 push_event_row(record, "rejected", &mut turn_rows);
             }
-            "codex_layer.upstream_error" => {
+            events::layer::UPSTREAM_ERROR => {
                 upstream_error += 1;
                 push_event_row(record, "upstream_error", &mut turn_rows);
             }
-            "protocol_proxy.prefix_stabilizer_prefix_baseline" => baseline += 1,
-            "protocol_proxy.prefix_stabilizer_prefix_divergence" => {
+            events::proxy::STABILIZER_PREFIX_BASELINE => baseline += 1,
+            events::proxy::STABILIZER_PREFIX_DIVERGENCE => {
                 divergence += 1;
                 divergence_details.push((record.timestamp_ms, &record.detail));
             }
-            "protocol_proxy.prefix_stabilizer_compaction_appended" => compaction_appended += 1,
-            "protocol_proxy.prefix_stabilizer_dedup_last_folded" => dedup_last_folded += 1,
-            "protocol_proxy.prefix_stabilizer_unpaired_notice_stripped" => {
+            events::proxy::STABILIZER_COMPACTION_APPENDED => compaction_appended += 1,
+            events::proxy::STABILIZER_DEDUP_LAST_FOLDED => dedup_last_folded += 1,
+            events::proxy::STABILIZER_UNPAIRED_NOTICE_STRIPPED => {
                 unpaired_notice_stripped += 1
             }
             _ => {}
@@ -403,7 +404,7 @@ mod tests {
             Some(id) => json!({ "path": "/v1/responses", "requestId": id }),
             None => json!({ "path": "/v1/responses" }),
         };
-        line(timestamp_ms, pid, "codex_layer.stream_open", detail)
+        line(timestamp_ms, pid, events::layer::STREAM_OPEN, detail)
     }
 
     fn terminal(timestamp_ms: u64, pid: u64, event: &str, request_id: Option<&str>) -> String {
@@ -420,14 +421,14 @@ mod tests {
         let lines = [
             open(1000, 7, Some("A")),
             open(1100, 7, Some("B")),
-            terminal(1600, 7, "codex_layer.stream_completed", Some("B")),
-            terminal(2600, 7, "codex_layer.stream_completed", Some("A")),
+            terminal(1600, 7, events::layer::STREAM_COMPLETED, Some("B")),
+            terminal(2600, 7, events::layer::STREAM_COMPLETED, Some("A")),
             // 开流了没等到收口；开流缺 requestId 同样配不上。
             open(2700, 7, Some("C")),
             open(2750, 7, None),
             // 收口找不到开流；收口缺 requestId 同样配不上。
-            terminal(3000, 7, "codex_layer.stream_completed", Some("D")),
-            terminal(3100, 7, "codex_layer.stream_failed", None),
+            terminal(3000, 7, events::layer::STREAM_COMPLETED, Some("D")),
+            terminal(3100, 7, events::layer::STREAM_FAILED, None),
         ];
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         let snapshot = aggregate_stability_snapshot(&lines, &StabilityAggregateOptions::default());
@@ -467,7 +468,7 @@ mod tests {
     fn identical_request_ids_across_pids_do_not_cross_pair() {
         let lines = [
             open(1000, 1, Some("same")),
-            terminal(5000, 2, "codex_layer.stream_completed", Some("same")),
+            terminal(5000, 2, events::layer::STREAM_COMPLETED, Some("same")),
         ];
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
         let snapshot = aggregate_stability_snapshot(&lines, &StabilityAggregateOptions::default());
@@ -485,19 +486,19 @@ mod tests {
         lines.push(line(
             2000,
             9,
-            "protocol_proxy.prefix_stabilizer_prefix_baseline",
+            events::proxy::STABILIZER_PREFIX_BASELINE,
             json!({ "oldLen": 0, "newLen": 500, "firstDiff": null, "oldSnip": "", "newSnip": "abc" }),
         ));
         lines.push(line(
             3000,
             9,
-            "protocol_proxy.prefix_stabilizer_prefix_divergence",
+            events::proxy::STABILIZER_PREFIX_DIVERGENCE,
             json!({ "oldLen": 1000, "newLen": 1100, "firstDiff": 42, "oldSnip": long_snip, "newSnip": "x" }),
         ));
         lines.push(line(
             4000,
             9,
-            "protocol_proxy.prefix_stabilizer_prefix_divergence",
+            events::proxy::STABILIZER_PREFIX_DIVERGENCE,
             json!({ "oldLen": 2000, "newLen": 2050, "firstDiff": 7, "oldSnip": "y", "newSnip": "z" }),
         ));
         let owned: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -551,13 +552,13 @@ mod tests {
             line(
                 1500,
                 7,
-                "codex_layer.conversion_rejected",
+                events::layer::CONVERSION_REJECTED,
                 json!({ "path": "/v1/responses", "requestId": "rj-1" }),
             ),
             line(
                 1600,
                 7,
-                "codex_layer.upstream_error",
+                events::layer::UPSTREAM_ERROR,
                 json!({ "path": "/v1/responses", "requestId": "ue-1" }),
             ),
         ];
@@ -576,7 +577,7 @@ mod tests {
         let lines = vec![line(
             1000,
             9,
-            "protocol_proxy.prefix_stabilizer_prefix_divergence",
+            events::proxy::STABILIZER_PREFIX_DIVERGENCE,
             json!({ "oldLen": 1, "newLen": 2, "firstDiff": 0 }),
         )];
         let owned: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -590,21 +591,21 @@ mod tests {
     #[test]
     fn stabilizer_actions_and_compaction_turns_are_counted() {
         let mut lines: Vec<String> = vec![
-            line(10, 3, "protocol_proxy.prefix_stabilizer_compaction_appended", json!({})),
-            line(11, 3, "protocol_proxy.prefix_stabilizer_compaction_appended", json!({})),
-            line(12, 3, "protocol_proxy.prefix_stabilizer_dedup_last_folded", json!({})),
-            line(13, 3, "protocol_proxy.prefix_stabilizer_unpaired_notice_stripped", json!({})),
-            line(14, 3, "protocol_proxy.prefix_stabilizer_unpaired_notice_stripped", json!({})),
-            line(15, 3, "protocol_proxy.prefix_stabilizer_unpaired_notice_stripped", json!({})),
+            line(10, 3, events::proxy::STABILIZER_COMPACTION_APPENDED, json!({})),
+            line(11, 3, events::proxy::STABILIZER_COMPACTION_APPENDED, json!({})),
+            line(12, 3, events::proxy::STABILIZER_DEDUP_LAST_FOLDED, json!({})),
+            line(13, 3, events::proxy::STABILIZER_UNPAIRED_NOTICE_STRIPPED, json!({})),
+            line(14, 3, events::proxy::STABILIZER_UNPAIRED_NOTICE_STRIPPED, json!({})),
+            line(15, 3, events::proxy::STABILIZER_UNPAIRED_NOTICE_STRIPPED, json!({})),
         ];
         lines.push(open(20, 3, Some("c1")));
         // 压缩轮开流带 compaction=true。
         lines.push(json!({
-            "timestamp_ms": 21, "pid": 3, "event": "codex_layer.stream_open",
+            "timestamp_ms": 21, "pid": 3, "event": events::layer::STREAM_OPEN,
             "detail": { "path": "/v1/responses", "requestId": "c2", "compaction": true }
         }).to_string());
         lines.push(json!({
-            "timestamp_ms": 22, "pid": 3, "event": "codex_layer.stream_open",
+            "timestamp_ms": 22, "pid": 3, "event": events::layer::STREAM_OPEN,
             "detail": { "path": "/v1/responses", "requestId": "c3", "compaction": false }
         }).to_string());
         let owned: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -646,13 +647,13 @@ mod tests {
             line(
                 100,
                 1,
-                "codex_layer.started",
+                events::layer::STARTED,
                 json!({ "listen": "127.0.0.1:57321" }),
             ),
             line(
                 500,
                 2,
-                "codex_layer.started",
+                events::layer::STARTED,
                 json!({ "listen": "127.0.0.1:57331", "upstream": "http://127.0.0.1:11234/v1" }),
             ),
             open(700, 2, Some("r1")),
@@ -686,7 +687,7 @@ mod tests {
                 line(
                     1000 + i,
                     1,
-                    "protocol_proxy.prefix_stabilizer_prefix_divergence",
+                    events::proxy::STABILIZER_PREFIX_DIVERGENCE,
                     json!({ "oldLen": i, "newLen": i, "firstDiff": i }),
                 )
             })
@@ -694,7 +695,7 @@ mod tests {
         lines.push(line(
             999,
             1,
-            "protocol_proxy.prefix_stabilizer_prefix_baseline",
+            events::proxy::STABILIZER_PREFIX_BASELINE,
             json!({ "oldLen": 0, "newLen": 0, "firstDiff": null }),
         ));
         let owned: Vec<&str> = lines.iter().map(String::as_str).collect();
