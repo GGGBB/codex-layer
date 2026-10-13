@@ -6495,6 +6495,102 @@ fn chat_request_strips_native_search_and_rejects_forced_native_search() {
     assert_eq!(body["error"]["code"], "unsupported_native_web_search");
 }
 
+#[tokio::test]
+async fn chat_request_strips_native_search_inside_namespaces_on_the_wire() {
+    // issue #13 残余 1：命名空间子项里的原生声明也不能上行。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream_body = r#"{"id":"chatcmpl_ns","object":"chat.completion","model":"fake-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        upstream_body.to_string(),
+    ));
+    let settings =
+        session_header_settings(RelayProtocol::ChatCompletions, format!("http://{address}/v1"));
+    let request = r#"{"model":"fake-model","input":"查一下","stream":false,"tools":[{"type":"web_search"},{"type":"namespace","name":"srv","tools":[{"type":"web_search_preview"},{"type":"function","name":"open_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]}]}"#;
+    let result =
+        open_responses_proxy_request_with_settings_for_path(request, settings, "/v1/responses")
+            .await
+            .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_headers, sent) = server.await.unwrap();
+    let serialized = serde_json::to_string(&sent).unwrap();
+    assert!(
+        !serialized.contains("web_search"),
+        "顶层与命名空间子项的原生声明都必须被剥掉：{serialized}"
+    );
+    assert!(
+        serialized.contains("open_file"),
+        "客户端执行的命名空间子项必须保留：{serialized}"
+    );
+}
+
+#[test]
+fn chat_response_client_function_named_web_search_wins_and_stays_completed() {
+    // issue #13 残余 2：客户端同名 function 声明优先，回程归 function_call，
+    // 不得被当成原生搜索谎报源而把整响应带 failed。
+    let response = chat_completion_to_response_with_request(
+        json!({"id": "chatcmpl_client_search", "model": "gpt-5.4", "choices": [{
+            "message": {"tool_calls": [{"id": "call_client", "type": "function",
+                "function": {"name": "web_search", "arguments": "{\"input\":\"Codex\"}"}}]},
+            "finish_reason": "tool_calls"
+        }]}),
+        &json!({"model": "gpt-5.4", "tools": [
+            {"type": "web_search"},
+            {"type": "function", "name": "web_search", "parameters": {"type": "object"}}
+        ]}),
+    )
+    .unwrap();
+
+    assert_eq!(
+        response["status"],
+        "completed",
+        "客户端执行的调用不能被整响应 failed"
+    );
+    assert_eq!(response["output"][0]["type"], "function_call");
+    assert_eq!(response["output"][0]["status"], "completed");
+    assert!(response.get("error").is_none(), "不该出现上游错误体");
+}
+
+#[test]
+fn chat_sse_failed_terminal_never_emits_done() {
+    // issue #13 残余 3 定档：终态由 response.failed 事件本身表达，不补 data: [DONE]；
+    // 同时 pump 必须把这轮认成 failed 终态（不能误记 stream_completed、
+    // 也不能在 EOF 后再补一个完成事件）。
+    let mut converter = ChatSseToResponsesConverter::with_request(&json!({
+        "model": "gpt-5.4",
+        "tools": [{ "type": "web_search" }],
+        "stream": true
+    }));
+    let upstream = r#"data: {"id":"chatcmpl_done_probe","model":"gpt-5.4","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_fake","type":"function","function":{"name":"web_search","arguments":"{\"input\":\"Codex\"}"}}]}}]}
+
+data: {"id":"chatcmpl_done_probe","model":"gpt-5.4","choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+    let mut converted = String::from_utf8(converter.push_bytes(upstream.as_bytes())).unwrap();
+    converted.push_str(&String::from_utf8(converter.finish()).unwrap());
+
+    assert!(
+        converted.contains("event: response.failed"),
+        "必须以 failed 收口：{converted}"
+    );
+    assert!(
+        !converted.contains("event: response.completed"),
+        "不得谎报 completed：{converted}"
+    );
+    assert!(
+        !converted.contains("data: [DONE]"),
+        "failed 终态后不补 [DONE]（口径见 failed_into 注释）：{converted}"
+    );
+    assert!(converter.terminal_failed(), "pump 必须把这轮认成 failed 终态");
+    assert!(converter.has_terminal_event(), "不能让 pump 以为还缺完成事件");
+}
+
 // —— 轮次标记（串线根治：上下文重建时旧问题被回放成最新指令）——
 
 fn current_turn_body(last_text: &str) -> Value {

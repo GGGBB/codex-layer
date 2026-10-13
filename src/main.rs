@@ -717,10 +717,20 @@ fn stream_from_upstream(
             return;
         }
         let tail = converter.finish();
+        let terminal_failed = converter.terminal_failed();
         if !tail.is_empty() {
             let _ = tx.send(Ok(Bytes::from(tail)));
         }
-        let _ = log_event("codex_layer.stream_completed", json!({ "model": model }));
+        // failed 收口的一轮绝不能记成「正常完成」（issue #13 残余 3）：终态事件是
+        // response.failed 时，诊断记 stream_failed。
+        if terminal_failed {
+            let _ = log_event(
+                "codex_layer.stream_failed",
+                json!({ "reason": "转换层以 response.failed 终态收口" }),
+            );
+        } else {
+            let _ = log_event("codex_layer.stream_completed", json!({ "model": model }));
+        }
     });
     futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
