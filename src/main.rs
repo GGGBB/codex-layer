@@ -121,6 +121,11 @@ fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> 
         let listener = tokio::net::TcpListener::bind((host.as_str(), port))
             .await
             .with_context(|| format!("无法监听 {host}:{port}"))?;
+        // 前台启动必须让操作者一眼看到「实际绑定了哪个地址」：这行不走 tracing。
+        // 下面的 info! 会被日志等级过滤掉（常驻环境里 RUST_LOG=warn 时前台就完全静默），
+        // 但「代理到底监听着哪里」不该跟着一起静默。诊断日志里的 codex_layer.started
+        // 与本行信息重叠，那是事后机器可读的记录，取代不了终端上的一行。
+        println!("codex-layer 已启动：监听 {host}:{port}；把 codex 的 base_url 指到这里");
         tracing::info!(
             target: "codex-layer",
             listen = %format!("{host}:{port}"),
