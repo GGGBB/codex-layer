@@ -213,7 +213,7 @@ pub fn protocol_proxy_port() -> u16 {
     );
     if let Some(detail) = deprecated_env_detail(&resolution) {
         if !deprecated_env_already_reported() {
-            let _ = crate::diagnostic_log::log_event(DEPRECATED_ENV_EVENT, detail);
+            crate::diagnostic_log::log_event(DEPRECATED_ENV_EVENT, detail);
         }
     }
     resolution.port
@@ -1821,7 +1821,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         upstream_request_parts(&relay, request_json, request_path).await?;
     let is_compaction_request = compaction;
     let header_timeout = response_header_timeout(is_stream);
-    let _ = crate::diagnostic_log::log_event(
+    crate::diagnostic_log::log_event(
         events::proxy::UPSTREAM_REQUEST,
         json!({
             "relayId": relay.id,
@@ -1857,7 +1857,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let upstream = match send_upstream_request_for_responses(builder, is_stream).await {
         Ok(upstream) => upstream,
         Err(error) => {
-            let _ = crate::diagnostic_log::log_event(
+            crate::diagnostic_log::log_event(
                 events::proxy::UPSTREAM_REQUEST_FAILED,
                 json!({
                     "relayId": relay.id,
@@ -1881,7 +1881,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let _ = crate::diagnostic_log::log_event(
+    crate::diagnostic_log::log_event(
         events::proxy::UPSTREAM_RESPONSE,
         json!({
             "relayId": relay.id,
@@ -1966,7 +1966,7 @@ pub async fn open_models_proxy_request(
     validate_upstream(&relay)?;
 
     let endpoint = models_url(&relay.base_url);
-    let _ = crate::diagnostic_log::log_event(
+    crate::diagnostic_log::log_event(
         events::proxy::MODELS_REQUEST,
         json!({
             "relayId": relay.id,
@@ -2013,7 +2013,7 @@ pub async fn open_audio_transcriptions_proxy_request(
     }
 
     let endpoint = audio_transcriptions_url(&relay.base_url);
-    let _ = crate::diagnostic_log::log_event(
+    crate::diagnostic_log::log_event(
         events::proxy::AUDIO_TRANSCRIPTIONS_REQUEST,
         json!({
             "relayId": relay.id,
@@ -2140,7 +2140,7 @@ async fn open_image_proxy_request(
     };
     let endpoint = endpoint_kind.url(&base_url);
     let wire_api = endpoint_kind.wire_api();
-    let _ = crate::diagnostic_log::log_event(
+    crate::diagnostic_log::log_event(
         events::proxy::IMAGE_REQUEST,
         json!({
             "relayId": relay.id,
@@ -2241,7 +2241,7 @@ pub async fn open_chat_completions_proxy_request(
 
 /// 前缀对齐诊断事件（命名沿用 prefix_stabilizer_* 风格）。
 fn log_compaction_align(report: &crate::compaction_align::CompactionAlignReport) {
-    let _ = crate::diagnostic_log::log_event(
+    crate::diagnostic_log::log_event(
         events::proxy::STABILIZER_COMPACTION_APPENDED,
         json!({
             "instances": report.instances,
@@ -2331,7 +2331,7 @@ async fn upstream_request_parts(
     // 重写，跳过观察以免噪声。
     if relay.protocol == RelayProtocol::ChatCompletions && relay.stabilize_prompt_prefix && !compact {
         if let Some(report) = crate::prefix_divergence::observe(probe_key.as_deref(), &body) {
-            let _ = crate::diagnostic_log::log_event(
+            crate::diagnostic_log::log_event(
                 if matches!(report.kind, crate::prefix_divergence::DivergenceKind::Baseline) {
                     events::proxy::STABILIZER_PREFIX_BASELINE
                 } else {
@@ -2367,7 +2367,7 @@ async fn upstream_request_parts(
     }
 
     if guard_inline_image_data_urls(&mut body) {
-        let _ = crate::diagnostic_log::log_event(
+        crate::diagnostic_log::log_event(
             events::misc::INLINE_IMAGE_DATA_URL_LEAK,
             json!({ "model": model, "protocol": format!("{:?}", relay.protocol) }),
         );
@@ -4526,7 +4526,7 @@ fn strip_image_resize_notice_blocks(messages: &mut Vec<Value>) {
     });
     if unpaired {
         // 非成对残片已随本步骤归零；只记 debug 日志，不影响转发。
-        let _ = crate::diagnostic_log::log_event(
+        crate::diagnostic_log::log_event(
             events::proxy::STABILIZER_UNPAIRED_NOTICE_STRIPPED,
             json!({
                 "note": "存在非成对的 image_resize_notice 标记，孤儿标签连同残片已按契约移除",
@@ -4945,7 +4945,7 @@ fn order_system_chunks_stably(chunks: &[String]) -> String {
     }
     for (name, instances, _) in dedup_last.iter() {
         if *instances > 1 {
-            let _ = crate::diagnostic_log::log_event(
+            crate::diagnostic_log::log_event(
                 events::proxy::STABILIZER_DEDUP_LAST_FOLDED,
                 json!({ "blockName": name, "instances": instances }),
             );
