@@ -891,10 +891,18 @@ fn stream_from_upstream(
                     Err(error) => {
                         // 读流错误：先补帧，再按既有行为把错误交给 HTTP 层中止 body；
                         // 这个顺序保证客户端至少还能拿到一个显式终止信号。
-                        let reason = close_native_responses_stream(observer, "stream_error", &tx);
+                        let error_text = error.to_string();
+                        let reason = match close_native_responses_stream(observer, "stream_error", &tx) {
+                            Some(reason) => format!("{reason}（传输错误：{error_text}）"),
+                            // 完成事件已经发出去了才断：这一轮不算「上游自报失败」，
+                            // 现场要能分清是哪种断法，不能含糊成一个笼统原因。
+                            None => format!(
+                                "原生 Responses 透传流在完成事件之后发生读取错误：{error_text}"
+                            ),
+                        };
                         let _ = log_event(
                             "codex_layer.stream_failed",
-                            json!({ "reason": reason.unwrap_or_else(|| "原生 Responses 上游已自报终止失败".to_string()), "requestId": request_id }),
+                            json!({ "reason": reason, "requestId": request_id }),
                         );
                         let item: StreamItem =
                             Err(Box::new(error) as Box<dyn StdError + Send + Sync>);
