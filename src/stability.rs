@@ -12,6 +12,8 @@ use std::collections::HashMap;
 
 /// 快照保留的最近 divergence 条数默认上限。
 pub const DEFAULT_RECENT_DIVERGENCES: usize = 10;
+/// 快照保留的最近轮次条数默认上限（界面「最近轮次表」消费，issue #20）。
+pub const DEFAULT_RECENT_TURNS: usize = 20;
 /// `show_prompt_snippets` 开启时单个 snip 的字符上限。
 pub const MAX_SNIPPET_CHARS: usize = 120;
 
@@ -22,6 +24,8 @@ pub struct StabilityAggregateOptions {
     pub show_prompt_snippets: bool,
     /// 最近 divergence 明细保留条数。
     pub recent_divergences: usize,
+    /// 最近轮次明细保留条数。
+    pub recent_turns: usize,
 }
 
 impl Default for StabilityAggregateOptions {
@@ -29,6 +33,7 @@ impl Default for StabilityAggregateOptions {
         Self {
             show_prompt_snippets: false,
             recent_divergences: DEFAULT_RECENT_DIVERGENCES,
+            recent_turns: DEFAULT_RECENT_TURNS,
         }
     }
 }
@@ -40,6 +45,18 @@ struct ParsedRecord {
     pid: u64,
     event: String,
     detail: Value,
+}
+
+/// 最近轮次明细行（issue #20 的「最近轮次表」消费）：`outcome` 为空表示
+/// 窗口内仍开着未收口；终态-only 行（收口找不到开流）也照实入表。
+#[derive(Debug)]
+struct TurnRow {
+    timestamp_ms: u64,
+    path: Option<String>,
+    compaction: bool,
+    request_id: Option<String>,
+    outcome: Option<&'static str>,
+    duration_ms: Option<u64>,
 }
 
 fn parse_record(line: &str) -> Option<ParsedRecord> {
@@ -96,7 +113,9 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
     let mut unpaired_notice_stripped = 0usize;
 
     // —— requestId 配对：键含 pid，跨进程重启不误配 ——
-    let mut open_times: HashMap<(u64, String), u64> = HashMap::new();
+    // (pid, requestId) → 开流在 turn_rows 里占的行号；收口按号回写 outcome 与耗时。
+    let mut open_index: HashMap<(u64, String), usize> = HashMap::new();
+    let mut turn_rows: Vec<TurnRow> = Vec::new();
     let mut durations: Vec<u64> = Vec::new();
     let mut terminal_without_open = 0usize;
     // 开流缺 requestId：天然配不上，显式计入 unpaired，不静默丢。
@@ -112,20 +131,43 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
             }
             "codex_layer.stream_open" => {
                 opens_total += 1;
-                if record.detail.get("compaction").and_then(Value::as_bool) == Some(true) {
+                let compaction =
+                    record.detail.get("compaction").and_then(Value::as_bool) == Some(true);
+                if compaction {
                     opens_compaction += 1;
                 }
-                if let Some(request_id) = record.detail.get("requestId").and_then(Value::as_str) {
-                    open_times.insert((record.pid, request_id.to_string()), record.timestamp_ms);
-                } else {
-                    open_missing_request_id += 1;
+                let request_id = record
+                    .detail
+                    .get("requestId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let index = turn_rows.len();
+                turn_rows.push(TurnRow {
+                    timestamp_ms: record.timestamp_ms,
+                    path: record
+                        .detail
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    compaction,
+                    request_id: request_id.clone(),
+                    outcome: None,
+                    duration_ms: None,
+                });
+                match request_id {
+                    Some(id) => {
+                        open_index.insert((record.pid, id), index);
+                    }
+                    None => open_missing_request_id += 1,
                 }
             }
             "codex_layer.stream_completed" => {
                 completed += 1;
                 pair_terminal(
                     record,
-                    &mut open_times,
+                    "completed",
+                    &mut open_index,
+                    &mut turn_rows,
                     &mut durations,
                     &mut terminal_without_open,
                 );
@@ -134,13 +176,21 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
                 failed += 1;
                 pair_terminal(
                     record,
-                    &mut open_times,
+                    "failed",
+                    &mut open_index,
+                    &mut turn_rows,
                     &mut durations,
                     &mut terminal_without_open,
                 );
             }
-            "codex_layer.conversion_rejected" => conversion_rejected += 1,
-            "codex_layer.upstream_error" => upstream_error += 1,
+            "codex_layer.conversion_rejected" => {
+                conversion_rejected += 1;
+                push_event_row(record, "rejected", &mut turn_rows);
+            }
+            "codex_layer.upstream_error" => {
+                upstream_error += 1;
+                push_event_row(record, "upstream_error", &mut turn_rows);
+            }
             "protocol_proxy.prefix_stabilizer_prefix_baseline" => baseline += 1,
             "protocol_proxy.prefix_stabilizer_prefix_divergence" => {
                 divergence += 1;
@@ -179,7 +229,25 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
         durations.sort_unstable();
         durations
     };
-    let open_without_terminal = open_times.len() + open_missing_request_id;
+    let open_without_terminal = open_index.len() + open_missing_request_id;
+
+    // 最近轮次：新→旧；outcome 为 null 的行由界面渲染成「开着未收口」。
+    let mut recent_turn_rows: Vec<&TurnRow> = turn_rows.iter().collect();
+    recent_turn_rows.sort_by_key(|row| std::cmp::Reverse(row.timestamp_ms));
+    let recent_turns: Vec<Value> = recent_turn_rows
+        .into_iter()
+        .take(options.recent_turns)
+        .map(|row| {
+            json!({
+                "timestampMs": row.timestamp_ms,
+                "path": row.path,
+                "compaction": row.compaction,
+                "requestId": row.request_id,
+                "outcome": row.outcome,
+                "durationMs": row.duration_ms,
+            })
+        })
+        .collect();
 
     json!({
         "window": {
@@ -203,6 +271,7 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
             "conversionRejected": conversion_rejected,
             "upstreamError": upstream_error,
         },
+        "recentTurns": recent_turns,
         "stability": {
             "baseline": baseline,
             "divergence": divergence,
@@ -240,27 +309,63 @@ pub fn aggregate_stability_snapshot(lines: &[&str], options: &StabilityAggregate
     })
 }
 
-/// 收口事件与开流按 `(pid, requestId)` 配对；配不上（含缺 requestId）计数不静默丢。
+/// 收口事件与开流按 `(pid, requestId)` 配对：配得上就回写开流行并采样耗时；
+/// 配不上（含缺 requestId）计数不静默丢，并照实入一行终态-only 明细。
 /// 时钟回拨导致的负耗时钳到 0：日志异常不该让分布统计整体报错。
 fn pair_terminal(
     record: &ParsedRecord,
-    open_times: &mut HashMap<(u64, String), u64>,
+    outcome: &'static str,
+    open_index: &mut HashMap<(u64, String), usize>,
+    turn_rows: &mut Vec<TurnRow>,
     durations: &mut Vec<u64>,
     terminal_without_open: &mut usize,
 ) {
-    let paired = record
-        .detail
-        .get("requestId")
-        .and_then(Value::as_str)
-        .and_then(|request_id| {
-            open_times
-                .remove(&(record.pid, request_id.to_string()))
-                .map(|opened_at| record.timestamp_ms.saturating_sub(opened_at))
-        });
+    let request_id = record.detail.get("requestId").and_then(Value::as_str);
+    let paired =
+        request_id.and_then(|id| open_index.remove(&(record.pid, id.to_string())));
     match paired {
-        Some(duration) => durations.push(duration),
-        None => *terminal_without_open += 1,
+        Some(index) => {
+            let duration = record.timestamp_ms.saturating_sub(turn_rows[index].timestamp_ms);
+            turn_rows[index].outcome = Some(outcome);
+            turn_rows[index].duration_ms = Some(duration);
+            durations.push(duration);
+        }
+        None => {
+            *terminal_without_open += 1;
+            turn_rows.push(TurnRow {
+                timestamp_ms: record.timestamp_ms,
+                path: None,
+                compaction: false,
+                request_id: request_id.map(str::to_string),
+                outcome: Some(outcome),
+                duration_ms: None,
+            });
+        },
     }
+}
+
+/// 拒绝 / 上游故障事件入最近轮次表（它们通常没有开流语境，耗时未知）。
+fn push_event_row(
+    record: &ParsedRecord,
+    outcome: &'static str,
+    turn_rows: &mut Vec<TurnRow>,
+) {
+    turn_rows.push(TurnRow {
+        timestamp_ms: record.timestamp_ms,
+        path: record
+            .detail
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        compaction: false,
+        request_id: record
+            .detail
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        outcome: Some(outcome),
+        duration_ms: None,
+    });
 }
 
 /// 最近秩法（nearest-rank，向上取秩）：p 分位取排序后第 `ceil(p*n)` 个值。
@@ -338,6 +443,23 @@ mod tests {
         assert_eq!(durations["max"], json!(1600));
         assert_eq!(durations["unpaired"]["openWithoutTerminal"], json!(2));
         assert_eq!(durations["unpaired"]["terminalWithoutOpen"], json!(2));
+        // 最近轮次表：新→旧；开流行被收口回写，终态-only 行照实入表。
+        let turns = snapshot["recentTurns"].as_array().unwrap();
+        assert_eq!(turns[0]["timestampMs"], json!(3100));
+        assert_eq!(turns[0]["outcome"], json!("failed"));
+        assert!(turns[0]["durationMs"].is_null(), "配不上开流的收口没有耗时");
+        let a_row = turns
+            .iter()
+            .find(|row| row["requestId"] == json!("A"))
+            .unwrap();
+        assert_eq!(a_row["timestampMs"], json!(1000), "行时间戳锚在开流时刻");
+        assert_eq!(a_row["outcome"], json!("completed"));
+        assert_eq!(a_row["durationMs"], json!(1600));
+        let c_row = turns
+            .iter()
+            .find(|row| row["requestId"] == json!("C"))
+            .unwrap();
+        assert!(c_row["outcome"].is_null(), "未收口的开流 outcome 为 null");
     }
 
     /// 同名 requestId 跨 pid（进程重启）不得互配。
@@ -401,7 +523,7 @@ mod tests {
 
         let shown = aggregate_stability_snapshot(
             &owned,
-            &StabilityAggregateOptions { show_prompt_snippets: true, recent_divergences: 10 },
+            &StabilityAggregateOptions { show_prompt_snippets: true, recent_divergences: 10, recent_turns: 20 },
         );
         let shown_stability = &shown["stability"];
         assert_eq!(shown_stability["snippets"], json!("truncated"));
@@ -421,6 +543,34 @@ mod tests {
     }
 
     /// 0 轮时比率是 null（未定义）而不是 0，避免假安全。
+
+    /// 拒绝/上游故障事件也要进最近轮次表：它们没有开流语境，耗时置空。
+    #[test]
+    fn rejected_and_upstream_errors_appear_in_recent_turns() {
+        let lines = [
+            line(
+                1500,
+                7,
+                "codex_layer.conversion_rejected",
+                json!({ "path": "/v1/responses", "requestId": "rj-1" }),
+            ),
+            line(
+                1600,
+                7,
+                "codex_layer.upstream_error",
+                json!({ "path": "/v1/responses", "requestId": "ue-1" }),
+            ),
+        ];
+        let owned: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let snapshot = aggregate_stability_snapshot(&owned, &StabilityAggregateOptions::default());
+        let turns = snapshot["recentTurns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["outcome"], json!("upstream_error"));
+        assert_eq!(turns[1]["outcome"], json!("rejected"));
+        assert!(turns[0]["durationMs"].is_null());
+        // 它们不参与 completed/failed 配对，unpaired 保持双零。
+        assert_eq!(snapshot["durationsMs"]["unpaired"]["terminalWithoutOpen"], json!(0));
+    }
     #[test]
     fn ratio_is_null_without_opens() {
         let lines = vec![line(
@@ -550,7 +700,7 @@ mod tests {
         let owned: Vec<&str> = lines.iter().map(String::as_str).collect();
         let snapshot = aggregate_stability_snapshot(
             &owned,
-            &StabilityAggregateOptions { show_prompt_snippets: false, recent_divergences: 5 },
+            &StabilityAggregateOptions { show_prompt_snippets: false, recent_divergences: 5, recent_turns: 20 },
         );
         let recent = snapshot["stability"]["recentDivergences"].as_array().unwrap();
         assert_eq!(recent.len(), 5);
