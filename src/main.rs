@@ -167,8 +167,10 @@ start/stop/restart/status 仅 macOS；serve/version 平台不受限。
 配置默认查找顺序：
   $CODEX_LAYER_CONFIG -> ./codex-layer.toml -> ~/.codex-layer/codex-layer.toml
 
-接入方式：把 codex 的 model_provider base_url 指到本代理（默认 127.0.0.1:57321/v1）。",
-        env!("CARGO_PKG_VERSION")
+接入方式：把 codex 的 model_provider base_url 指到本代理（默认 127.0.0.1:{default_port}/v1）。",
+        // 默认端口不写字面量：从单一真源取，帮助文本不可能跟实现分叉。
+        env!("CARGO_PKG_VERSION"),
+        default_port = protocol_proxy::DEFAULT_PROXY_PORT
     );
 }
 

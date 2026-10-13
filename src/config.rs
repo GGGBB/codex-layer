@@ -9,7 +9,7 @@
 //! ```toml
 //! [server]
 //! host = "127.0.0.1"
-//! port = 57321
+//! port = 12333
 //!
 //! [upstream]
 //! base_url = "http://127.0.0.1:11234/v1"
@@ -30,8 +30,14 @@ use crate::settings::{
     BackendSettings, RelayHeaderKeyValue, RelayModelRoute, RelayMode, RelayProfile, RelayProtocol,
 };
 
+use crate::protocol_proxy::DEFAULT_PROXY_PORT;
+
 /// 默认监听端口，可被 `[server] port` 覆盖。
-pub const DEFAULT_LISTEN_PORT: u16 = 57321;
+///
+/// 取值派生自 [`DEFAULT_PROXY_PORT`]，不在本模块另写一份端口字面量：「默认监听口」与
+/// 「回环守卫的默认识别形态」必须共用同一个真源，否则用户没写 `[server] port` 时会出现
+/// 代理实际监听 A 、守卫按 B 判定，把真实回环风险放过去。
+pub const DEFAULT_LISTEN_PORT: u16 = DEFAULT_PROXY_PORT;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
