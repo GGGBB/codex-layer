@@ -18,10 +18,12 @@
 
 use std::error::Error as StdError;
 use std::io::Read;
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::any;
@@ -44,6 +46,7 @@ use codex_layer::protocol_proxy::{
     responses_error_from_upstream, wrap_non_stream_response_as_compaction,
     upstream_conversion_error_response,
 };
+use codex_layer::stability::{self, StabilityAggregateOptions};
 
 /// 请求体上限（含解压后），与 CodexPlusPlus 的协议代理一致：32 MB。
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -91,9 +94,20 @@ fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> 
     // 只有入口的装配流需要它。
     protocol_proxy::set_runtime_settings(settings.clone());
 
-    let app = Router::new()
-        .route("/healthz", any(healthz))
-        .fallback(any(dispatch));
+    // 稳定性监看端点（issue #19）：`[stability] enabled = false`（默认）时不注册，
+    // 该路径落进 fallback，与其它陌生非 `/v1` 路径一样 404。
+    let stability_state = Arc::new(StabilityState {
+        window_bytes: config.stability.window_bytes.max(1),
+        show_prompt_snippets: config.stability.show_prompt_snippets,
+    });
+    let app = Router::new().route("/healthz", any(healthz));
+    let app = if config.stability.enabled {
+        app.route("/stability", any(stability_endpoint))
+            .with_state(stability_state)
+    } else {
+        app
+    };
+    let app = app.fallback(any(dispatch));
 
     let host = config.server.host.clone();
     let port = config.server.port;
@@ -193,6 +207,107 @@ async fn healthz() -> Response {
         StatusCode::OK,
         json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}),
     )
+}
+
+/// `/stability` 端点的装配层状态：聚合本体是 `stability.rs` 的纯函数，
+/// 这里只携带读取窗口与隐私开关（由 `[stability]` 配置注入）。
+struct StabilityState {
+    window_bytes: u64,
+    show_prompt_snippets: bool,
+}
+
+/// `GET /stability`：惰性读诊断日志尾部窗口，返回稳定性快照（只读，issue #19）。
+/// 聚合是纯函数；时钟与文件窗口形态等装配层字段在这里补上。
+async fn stability_endpoint(State(state): State<Arc<StabilityState>>) -> Response {
+    let options = StabilityAggregateOptions {
+        show_prompt_snippets: state.show_prompt_snippets,
+        ..StabilityAggregateOptions::default()
+    };
+    let path = diagnostic_log::diagnostic_log_path();
+    let window_bytes = state.window_bytes;
+    let read = tokio::task::spawn_blocking(move || read_log_tail(&path, window_bytes)).await;
+    let tail = match read {
+        Ok(Ok(tail)) => tail,
+        Ok(Err(error)) => {
+            let _ = log_event(
+                "codex_layer.stability_read_failed",
+                json!({ "error": error.to_string() }),
+            );
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"status": "failed", "message": format!("无法读取诊断日志：{error}")}),
+            );
+        }
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"status": "failed", "message": format!("读取任务失败：{error}")}),
+            );
+        }
+    };
+    let lines: Vec<&str> = tail.text.split('\n').collect();
+    let mut snapshot = stability::aggregate_stability_snapshot(&lines, &options);
+    snapshot["generatedAtMs"] = json!(unix_now_ms());
+    snapshot["window"]["fileBytes"] = json!(tail.file_bytes);
+    snapshot["window"]["windowBytes"] = json!(window_bytes);
+    snapshot["window"]["truncated"] = json!(tail.truncated);
+    json_response(StatusCode::OK, snapshot)
+}
+
+struct LogTail {
+    text: String,
+    file_bytes: u64,
+    truncated: bool,
+}
+
+/// 读日志尾部 `window_bytes` 字节并对齐换行边界：首尾残缺行都丢弃——
+/// 截断产物不该伪装成「解析失败」污染计数。日志不存在算空窗口（404 之外的
+/// 最诚实形态是空快照）。
+fn read_log_tail(path: &std::path::Path, window_bytes: u64) -> anyhow::Result<LogTail> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LogTail {
+                text: String::new(),
+                file_bytes: 0,
+                truncated: false,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let file_bytes = file.metadata()?.len();
+    let start = file_bytes.saturating_sub(window_bytes);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    let mut text = String::from_utf8_lossy(&tail).into_owned();
+    if start > 0 {
+        if let Some(pos) = text.find('\n') {
+            text.drain(..=pos);
+        } else {
+            text.clear();
+        }
+    }
+    if let Some(pos) = text.rfind('\n') {
+        text.truncate(pos + 1);
+    } else {
+        text.clear();
+    }
+    Ok(LogTail {
+        text,
+        file_bytes,
+        truncated: start > 0,
+    })
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn dispatch(request: Request) -> Response {

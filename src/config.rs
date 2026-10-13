@@ -43,6 +43,8 @@ pub struct Config {
     #[serde(default)]
     pub stabilizer: StabilizerConfig,
     #[serde(default)]
+    pub stability: StabilityConfig,
+    #[serde(default)]
     pub images: ImagesConfig,
     #[serde(default)]
     pub timeouts: TimeoutConfig,
@@ -157,6 +159,37 @@ impl Default for StabilizerConfig {
 
 fn default_true() -> bool {
     true
+}
+
+/// 稳定性监看数据面（issue #19）：`GET /stability` 只读快照的开关与读取边界。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StabilityConfig {
+    /// 是否注册 `GET /stability` 端点。默认关：不注册时该路径落进
+    /// fallback，行为与其它非 `/v1` 陌生路径一致（404）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 读诊断日志的尾部字节窗口上限：日志可达上百 MB，只读尾部窗口。
+    #[serde(default = "default_stability_window_bytes")]
+    pub window_bytes: u64,
+    /// 是否在快照里输出 divergence 的 `oldSnip`/`newSnip` 截断片段（上限 120 字符）。
+    /// 默认关：snip 可能含用户提示词，只给长度与位置不外传。
+    #[serde(default)]
+    pub show_prompt_snippets: bool,
+}
+
+impl Default for StabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_bytes: default_stability_window_bytes(),
+            show_prompt_snippets: false,
+        }
+    }
+}
+
+fn default_stability_window_bytes() -> u64 {
+    8 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -482,5 +515,55 @@ api_key = "sk-test"
         assert_eq!(config.timeouts.connect_seconds, 5);
         assert_eq!(config.timeouts.header_seconds, 30);
         assert_eq!(config.timeouts.stream_header_seconds, 120);
+    }
+
+    /// `[stability]` 缺省时：端点关、窗口 8MB、snip 不外传（隐私默认保守）。
+    #[test]
+    fn stability_defaults_disabled_with_8mb_window() {
+        let config: Config = toml::from_str(
+            r#"
+        [upstream]
+        base_url = "http://127.0.0.1:9/v1"
+        api_key = "sk-test"
+        "#,
+        )
+        .unwrap();
+        assert!(!config.stability.enabled);
+        assert_eq!(config.stability.window_bytes, 8 * 1024 * 1024);
+        assert!(!config.stability.show_prompt_snippets);
+    }
+
+    /// `[stability]` 段可显式开启；段内未知字段同样启动失败。
+    #[test]
+    fn stability_section_parses_and_rejects_unknown_fields() {
+        let config: Config = toml::from_str(
+            r#"
+        [upstream]
+        base_url = "http://127.0.0.1:9/v1"
+        api_key = "sk-test"
+
+        [stability]
+        enabled = true
+        window_bytes = 4096
+        show_prompt_snippets = true
+        "#,
+        )
+        .unwrap();
+        assert!(config.stability.enabled);
+        assert_eq!(config.stability.window_bytes, 4096);
+        assert!(config.stability.show_prompt_snippets);
+
+        let error = toml::from_str::<Config>(
+            r#"
+        [upstream]
+        base_url = "http://127.0.0.1:9/v1"
+        api_key = "sk-test"
+
+        [stability]
+        enabld = true
+        "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("enabld"), "{error}");
     }
 }
