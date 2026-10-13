@@ -19,12 +19,12 @@ Closes #
      - python3 scripts/smoke/streaming.py：PASS
      - （如涉端到端）临时 Label/端口/配置的一次往返结论 -->
 
-## 与上游 diff 可比性
 
-<!-- 是否触及移植区（protocol_proxy.rs、compaction_*.rs、
-     prefix_divergence.rs 及对应测试）：机械移植改动是否不改行为、
-     不破坏与上游的逐行 diff 可比性；机械改动与行为改动是否已分开提交。 -->
+## 改动可比性与回归风险
 
+<!-- 是否触及核心转换 / 钉定模块（protocol_proxy.rs、compaction_*.rs、
+     prefix_divergence.rs 及对应测试）：不改行为的搬运与接入改动是否真的
+     未改行为；与行为演进是否已分开提交。 -->
 ## 自查清单
 
 - [ ] 已关联 issue，`type/*` 与 `P1`/`P2` 标签已打
@@ -34,4 +34,4 @@ Closes #
 - [ ] 端到端自测仅用临时 Label + 临时端口 + 临时配置，未触碰本机
       `com.codex-layer.proxy`:57331 与 `com.user.mlx-ssm-env`
 - [ ] 无真实密钥入库，配置示例用占位符
-- [ ] 未做全仓 `cargo fmt`，移植区改动与行为改动分开提交
+- [ ] 未做全仓 `cargo fmt`，不改行为的改动与行为改动分开提交
