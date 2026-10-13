@@ -1,3 +1,6 @@
 target/
 .env
 *.log
+
+# agent 工作规范只留本地，不入库
+AGENTS.md
