@@ -1,15 +1,11 @@
 //! 内部数据模型。
 //!
-//! 移植自 CodexPlusPlus PR #2449 的
-//! `crates/codex-plus-core/src/settings.rs`（commit f9be7cf），按独立项目需求裁剪。
-//!
-//! 为什么还要留一份和 CodexPlusPlus 同名的 JSON 模型：转换层
-//! （`protocol_proxy`）与它带过来的测试都以 `RelayProfile` / `BackendSettings`
-//! 为输入，字段名保持兼容后，用户可以从 CodexPlusPlus 的 `settings.json`
-//! 直接迁移供应商配置，测试资产也能原样运行。
+//! 为什么还要留一份同名 JSON 模型：转换层（`protocol_proxy`）与既有测试都以
+//! `RelayProfile` / `BackendSettings` 为输入，字段名保持兼容后，用户可以从旧部署
+//! 的 `settings.json` 直接迁移供应商配置，测试资产也能原样运行。
 //! 本项目的常规配置入口是 TOML（见 `config.rs`），这里只是内部载体与兼容读取路径。
 //!
-//! 删掉的上游专有内容：官方混充 Key（officialMixApiKey / configContents /
+//! 删掉的聚合形态内容：官方混充 Key（officialMixApiKey / configContents /
 //! authContents）、sub2api、stepwise、聚合轮换（aggregateRelayProfiles）、
 //! 渠道限流与冷却、codex 客户端注入开关、皮肤、会话分享等。
 
@@ -40,7 +36,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// `apiKey` 允许写成 `null` 或缺省：与 CodexPlusPlus 的设置解析保持一致，
+/// `apiKey` 允许写成 `null` 或缺省：与设置文件的既有解析行为保持一致，
 /// 避免前端删掉输入框后解析失败。
 fn deserialize_profile_api_key<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -64,7 +60,7 @@ pub enum RelayMode {
     #[default]
     MixedApi,
     PureApi,
-    /// 仅为兼容 CodexPlusPlus 的设置文件保留；本项目不做聚合轮换。
+    /// 仅为兼容既有设置文件保留；本项目不做聚合轮换。
     Aggregate,
 }
 
@@ -94,7 +90,7 @@ pub struct RelayHeaderKeyValue {
     pub value: String,
 }
 
-/// 一个上游（在 CodexPlusPlus 里叫「供应商」）。
+/// 一个上游（在设置文件里叫「供应商」）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RelayProfile {
@@ -370,7 +366,7 @@ mod tests {
 
     #[test]
     fn default_profile_keeps_codex_plus_plus_identity() {
-        // 与 CodexPlusPlus 一致：默认 profile 的 id 固定为 default，
+        // 默认 profile 的 id 固定为 default，
         // 判定「设置退化成单条默认上游」依赖它。
         let profile = RelayProfile::default();
         assert_eq!(profile.id, "default");

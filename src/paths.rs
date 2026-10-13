@@ -1,8 +1,7 @@
 //! 状态目录与文件路径解析。
 //!
-//! 极小子集，来自 CodexPlusPlus PR #2449 的
-//! `crates/codex-plus-core/src/paths.rs`（commit f9be7cf）：本项目只需要
-//! 「设置文件在哪」与「诊断日志在哪」两条路径，以及测试用的路径覆盖钩子。
+//! 极小子集：本项目只需要「设置文件在哪」与「诊断日志在哪」两条路径，
+//! 以及测试用的路径覆盖钩子。
 //!
 //! 状态目录默认 `~/.codex-layer`，可用环境变量 `CODEX_LAYER_HOME` 整体改写；
 //! 两条路径各自还有更细的覆盖变量，便于临时排障而不改配置。
@@ -51,7 +50,7 @@ pub fn default_diagnostic_log_path() -> PathBuf {
     default_app_state_dir().join(DIAGNOSTIC_LOG_FILE)
 }
 
-/// 测试/进程内路径覆盖：与 CodexPlusPlus 同名同语义，移植过来的测试直接调用它。
+/// 测试/进程内路径覆盖：把设置文件指到临时目录，供测试隔离使用。
 fn settings_path_override() -> Option<PathBuf> {
     SETTINGS_PATH_OVERRIDE
         .get_or_init(|| Mutex::new(None))
