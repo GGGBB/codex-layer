@@ -22,14 +22,20 @@
   只做搬运与适配；接口适配的机械改动（含测试断言改写）必须在 commit 正文说明。
 ## 诊断日志
 
-- 统一 JSONL，经 `diagnostic_log::append_diagnostic_log(event, detail)` 写入，
-  路径由 `[log].path` 配置（默认 `~/.codex-layer/codex-layer.log`）。
+- 统一 JSONL，生产侧一律经 `diagnostic_log::log_event(event, detail)` 写入。它是
+  唯一入口，失败口径只写在它的文档注释里（吞掉错误、降级为
+  `diagnostic_log_write_failures` 计数、绝不阻断请求），因此不返回 `Result`——
+  调用方在类型上就无从忽略错误，不必各自写 `let _ =`。
+  底层 `append_diagnostic_log` 只给需要断言写入结果的测试与自检用。
+  落点由 `[log].path` 配置（默认 `~/.codex-layer/codex-layer.log`）。
 - 事件名为点分命名空间 `<模块>.<主题>_<动作>`：进程级用 `codex_layer.*`
   （如 `codex_layer.stream_open` / `codex_layer.stream_completed` /
   `codex_layer.conversion_rejected`），转换与稳定层用 `protocol_proxy.*`
   （如 `protocol_proxy.prefix_stabilizer_prefix_baseline` /
   `protocol_proxy.prefix_stabilizer_prefix_divergence`）。
-- 新增事件须沿用该命名，并登记进 README 的诊断事件表。
+- 新增事件：先在 `src/diagnostic_log.rs` 的 `events` 登记表加常量并加入所属族的
+  `ALL`，再落代码，最后到 README 的诊断事件表补一行。已发布的事件名与字段名是
+  数据契约，只增不改——改名会毁掉历史日志的可比性与监看解析。
 
 ## 错误处理
 
