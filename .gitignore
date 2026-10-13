@@ -2,5 +2,8 @@ target/
 .env
 *.log
 
+# macOS Finder 在工作区产生的目录元数据，容易被误提交
+.DS_Store
+
 # agent 工作规范只留本地，不入库
 AGENTS.md
