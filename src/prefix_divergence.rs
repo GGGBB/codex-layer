@@ -234,6 +234,11 @@ mod tests {
 
     #[test]
     fn first_round_reports_baseline_and_stores_file() {
+        // 本测试全程读全局诊断日志路径：与写日志/改落点的测试互斥，
+        // 否则 observe 落盘目录与断言目录可能被并发翻转成两个。
+        let _diag_guard = crate::diagnostic_log::DIAG_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let key = "thread-div-baseline-1";
         let report = observe(key_of(&request(key)), &body("SYS", json!([{"type": "function"}]))).expect("首轮必须登记");
         assert!(matches!(report.kind, DivergenceKind::Baseline));
