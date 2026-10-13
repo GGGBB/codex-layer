@@ -6956,6 +6956,13 @@ path = "{}"
         "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_3\",\"status\":\"failed\",\"error\":{\"message\":\"上游自报失败\"}}}\n\n",
     );
 
+    /// 上游按 Chat 的习惯自己补一句 `data: [DONE]` 就收尾。`[DONE]` 对 Responses 无意义，
+    /// 本层视其为普通数据：既不是完成事件，也不能拿它证明成功。
+    const DONE_MARKER_THEN_EOF_STREAM: &str = concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"半句\"}\n\n",
+        "data: [DONE]\n\n",
+    );
+
     /// 正常完成的流：客户端收到的字节必须与上游字节逐字节相同，
     /// 这是「旁路观察零改动」的硬断言。
     #[tokio::test]
@@ -6989,6 +6996,28 @@ path = "{}"
         assert!(
             !body.contains("[DONE]"),
             "失败收口不得补 DONE，否则客户端会当成正常结束"
+        );
+    }
+
+    /// 上游自己发了 `data: [DONE]` 再 EOF：`[DONE]` 对 Responses 无意义，本层视其为普通
+    /// 数据，所以这一轮仍是「未证明成功」——客户端仍要收到本层补的 `response.failed` 帧，
+    /// 且补的那一帧内不得有 `[DONE]`（上游自己发的字节照旧原样透传，一字节不改）。
+    #[tokio::test]
+    async fn done_marker_then_eof_still_appends_failure_frame() {
+        let harness = spawn_proxy(spawn_sse_upstream(DONE_MARKER_THEN_EOF_STREAM)).await;
+        let body = post_streaming_request(harness.proxy_port).await;
+        let frame = native_stream_failure_frame(
+            "原生 Responses 上游在完成事件前结束了响应流",
+            "stream_incomplete",
+        );
+        assert_eq!(
+            body,
+            format!("{DONE_MARKER_THEN_EOF_STREAM}{frame}"),
+            "DONE 不得被当成完成事件：上游字节原样透传，之后紧跟本层补的失败帧"
+        );
+        assert!(
+            !frame.contains("[DONE]"),
+            "本层补的失败帧内不得出现 DONE，否则客户端会把它当成正常结束的收尾标记"
         );
     }
 
