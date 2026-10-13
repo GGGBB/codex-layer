@@ -8618,3 +8618,95 @@ mod native_search_guard_tests {
         assert!(!namespaced.is_builtin_web_search_proxy("srv__web_search"));
     }
 }
+/// 端口覆盖的双名兼容（issue #28）：新名优先、旧名回落、两者都未设置时端口一字不变。
+/// 全部直接调纯函数，不起 HTTP，也不改进程级环境变量。
+#[cfg(test)]
+mod proxy_port_env_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_env_alone_still_overrides_the_port() {
+        let resolution = resolve_proxy_port(None, Some("57999"));
+        assert_eq!(resolution.port, 57999, "只设旧名时必须照旧生效");
+        assert!(resolution.legacy_source);
+        assert!(!resolution.legacy_conflict);
+    }
+
+    #[test]
+    fn new_env_alone_overrides_without_deprecation() {
+        let resolution = resolve_proxy_port(Some("57998"), None);
+        assert_eq!(resolution.port, 57998);
+        assert!(!resolution.legacy_source, "只设新名不该触发弃用");
+        assert!(!resolution.legacy_conflict);
+        assert!(deprecated_env_detail(&resolution).is_none());
+    }
+
+    #[test]
+    fn both_names_differing_prefers_new_and_reports_conflict() {
+        let resolution = resolve_proxy_port(Some("57998"), Some("57999"));
+        assert_eq!(resolution.port, 57998, "取值冲突时以新名为准");
+        assert!(resolution.legacy_source);
+        assert!(resolution.legacy_conflict);
+        let detail = deprecated_env_detail(&resolution).expect("旧名参与必须有 detail");
+        assert_eq!(detail.get("name"), Some(&json!(LEGACY_PROXY_PORT_ENV)));
+        assert_eq!(detail.get("replacement"), Some(&json!(PROXY_PORT_ENV)));
+        assert_eq!(detail.get("effectivePort"), Some(&json!(57998)));
+        assert_eq!(detail.get("conflict"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn both_names_equal_prefers_new_without_conflict() {
+        let resolution = resolve_proxy_port(Some("57997"), Some("57997"));
+        assert_eq!(resolution.port, 57997);
+        assert!(resolution.legacy_source, "旧名同值仍是冗余设置，照样提示改名");
+        assert!(!resolution.legacy_conflict);
+    }
+
+    #[test]
+    fn unset_or_invalid_names_keep_the_default_port() {
+        // 不设任何环境变量走的就是第一条：端口必须是默认值且无弃用诊断。
+        let cases = [
+            (None, None),
+            (Some("abc"), None),
+            (None, Some(" ")),
+            (Some("0"), Some("0")),
+        ];
+        for (preferred, legacy) in cases {
+            let resolution = resolve_proxy_port(preferred, legacy);
+            assert_eq!(
+                resolution.port,
+                DEFAULT_PROTOCOL_PROXY_PORT,
+                "非法取值不得改变端口：preferred={preferred:?} legacy={legacy:?}"
+            );
+            assert!(!resolution.legacy_source);
+            assert!(!resolution.legacy_conflict);
+            assert!(deprecated_env_detail(&resolution).is_none());
+        }
+    }
+
+    /// 弃用诊断确实落进 JSONL：事件名与字段可按 `codex_layer.deprecated_env` 检索。
+    #[test]
+    fn deprecation_detail_appends_one_jsonl_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex-layer.log");
+        crate::diagnostic_log::set_diagnostic_log_path(Some(path.clone()));
+        let resolution = resolve_proxy_port(Some("57996"), Some("57995"));
+        let expected = deprecated_env_detail(&resolution).expect("冲突必须有 detail");
+        let appended =
+            crate::diagnostic_log::append_diagnostic_log(DEPRECATED_ENV_EVENT, expected.clone());
+        crate::diagnostic_log::set_diagnostic_log_path(None);
+        appended.unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let record = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|line| line.get("event") == Some(&json!(DEPRECATED_ENV_EVENT)))
+            .expect("弃用事件必须落盘");
+        let detail = record.get("detail").expect("记录必须带 detail");
+        assert_eq!(detail.get("name"), Some(&json!(LEGACY_PROXY_PORT_ENV)));
+        assert_eq!(detail.get("replacement"), Some(&json!(PROXY_PORT_ENV)));
+        assert_eq!(detail.get("effectivePort"), Some(&json!(57996)));
+        assert_eq!(detail.get("conflict"), Some(&json!(true)));
+    }
+}
