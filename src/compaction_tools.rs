@@ -1,4 +1,3 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/src/compaction_tools.rs`，commit f9be7cf。
 // compaction 请求的 tools 回填缓存（「prompt 前缀稳定层」的组成部分，opt-in 同开关）。
 //
 // 背景（取证定案，见 COMPACT_PREFILL.md）：codex 客户端的 v2 压缩请求自带

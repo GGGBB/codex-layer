@@ -1,8 +1,7 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/src/compaction_align.rs`，commit f9be7cf。
 // 压缩轮「前缀对齐」（「prompt 前缀稳定层」的组成部分，opt-in 同开关）。
 //
 // 背景（取证定案，见 /tmp/compact_prefix_align_heartbeat.log 与 COMPACT_PREFILL.md）：
-// codex++ 客户端的自动压缩（auto compact）不走 /responses/compact，也不带
+// 带自动压缩（auto compact）的客户端变体不走 /responses/compact，也不带
 // compaction_trigger 控制项，而是把摘要指令原样追加在 input 末尾（user 角色）
 // 并发送 `tools: []`。既有 compact 判定（路径 / compaction_trigger）对这一形态
 // 双双落空：回填与改写全不触发，tools 由整块变空使 token 前缀在 chat 模板的
@@ -22,7 +21,7 @@
 use crate::compaction_tools;
 use serde_json::{json, Value};
 
-/// 压缩摘要指令的首行签名：codex prompts/templates/compact/prompt.md 与 codex++
+/// 压缩摘要指令的首行签名：codex prompts/templates/compact/prompt.md 与自动压缩形态的
 /// 客户端均以该句起头（客户端文本比 relay 的 COMPACTION_SUMMARY_INSTRUCTION 常
 /// 量多一个行尾换行，故一律用签名前缀匹配并保留客户端原始字节，
 /// 绝不做等值替换）。
@@ -365,7 +364,7 @@ mod tests {
     use super::*;
 
     fn instruction_text() -> String {
-        // 与 codex++ 客户端语料（/tmp/compact_forensics seq=3）一致：含行尾换行。
+        // 与自动压缩客户端语料（/tmp/compact_forensics seq=3）一致：含行尾换行。
         format!("{FALLBACK_INSTRUCTION_TEXT}\n")
     }
 

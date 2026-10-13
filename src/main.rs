@@ -1,9 +1,7 @@
 //! codex-layer —— 独立运行的 codex relay 稳定层。
 //!
-//! HTTP 管道从 CodexPlusPlus PR #2449 的 `src/launcher.rs`（commit f9be7cf）
-//! 里的「手写 HTTP/1.1 + 协议代理分发」改写为 axum：路由判定继续复用转换层的
-//! `is_*_proxy_path`（保证与 CodexPlusPlus 认同样的 codex 路径别名），
-//! 转发/回流行为逐条对齐原实现：
+//! HTTP 管道基于 axum：路由判定继续复用转换层的 `is_*_proxy_path`（codex 客户端会
+//! 发来多种路径别名，两侧必须认同一套），转发/回流行为逐条对齐客户端的既有期待：
 //!
 //! - `POST /v1/responses`（含 `/responses`、`/v1/v1/responses`、`/codex/v1/responses`
 //!   与四种 `/responses/compact` 写法）：按上游方言转换请求，流式时把上游 SSE
@@ -48,7 +46,7 @@ use codex_layer::protocol_proxy::{
 };
 use codex_layer::stability::{self, StabilityAggregateOptions};
 
-/// 请求体上限（含解压后），与 CodexPlusPlus 的协议代理一致：32 MB。
+/// 请求体上限（含解压后）：32 MB。
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 type StreamItem = Result<Bytes, Box<dyn StdError + Send + Sync + 'static>>;
@@ -770,7 +768,7 @@ async fn chat_completions_proxy(body: &str, user_agent: Option<&str>, path: &str
     }
 }
 
-/// 把上游回包变成一条 Responses 事件流。三条分支与 CodexPlusPlus 的转发实现一一对应。
+/// 把上游回包变成一条 Responses 事件流：压缩轮、Responses 方言、Chat 方言三条分支。
 fn stream_from_upstream(
     upstream: UpstreamProxyResponse,
     request_json: Option<Value>,

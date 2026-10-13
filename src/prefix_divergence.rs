@@ -1,4 +1,3 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/src/prefix_divergence.rs`，commit f9be7cf。
 // 「prompt 前缀稳定层」的分叉诊断探针（opt-in，随 stabilize_prompt_prefix 生效）。
 //
 // 背景（2026-10-11 凌晨取证）：codex 客户端重启后重放历史，system 区出现
@@ -173,7 +172,7 @@ pub fn observe(prompt_cache_key: Option<&str>, body: &Value) -> Option<Divergenc
 fn dump_baseline_file(key: &str, fingerprint: &str) {
     let digest = format!("{:016x}", fnv1a64(key.as_bytes()));
     // 基线含用户提示词、工具定义与工作区信息，必须落在诊断日志的私有目录
-    // 且权限 0600，不得写 world-writable 的 /tmp（GAP_ANALYSIS P0-4）；
+    // 且权限 0600，不得写 world-writable 的 /tmp；
     // 已存在的同名文件在覆写前同样收紧权限。
     let dir = match crate::diagnostic_log::diagnostic_log_path().parent() {
         Some(parent) => parent.to_path_buf(),
