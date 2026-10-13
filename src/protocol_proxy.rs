@@ -269,6 +269,10 @@ enum ChatReasoningStyle {
 struct CodexToolContext {
     custom_tools: BTreeMap<String, CodexCustomToolSpec>,
     function_tools: BTreeMap<String, CodexFunctionToolSpec>,
+    /// 客户端自己声明过的上行工具名（function / custom / tool_search / 命名空间子项），
+    /// 与上面两张表一起登记，但原生声明不得污染它。用于「客户端声明优先」的归一
+    /// 判据（issue #13 残余 2，本仓库自研，参照树无对应实现）。
+    client_tool_names: BTreeSet<String>,
     has_custom_tools: bool,
     has_namespace_tools: bool,
 }
@@ -336,10 +340,42 @@ impl CodexToolContext {
     /// 此前一律产出 `custom_tool_call`，而客户端只认 `web_search_call`
     /// （issue #1209 / #586：web_search 被错译成 custom_tool_call 后，客户端
     /// 拿不到搜索结果，表现为「工具调用后无反应」或上游报 tool 名不识别）。
+    ///
+    /// 归一优先级（issue #13 残余 2，本仓库自研：参照树 `build_codex_tool_context`
+    /// 只靠声明遍历的先后顺序决定同一名字归谁）：同名判定键是「Chat 上行工具名
+    /// `name`」，即上面两张表的键（回程就是拿 `tool_calls[].function.name` 查这些键），
+    /// 不看声明的 `type`；命名空间子项按展平后的上行名登记。同名冲突时客户端声明
+    /// 优先：名字出现在 `client_tool_names` 里（客户端执行侧声明过）就不再当作原生搜索
+    /// 谎报源，回程归 `function_call` / `custom_tool_call` 正常形态。
     fn is_builtin_web_search_proxy(&self, upstream_name: &str) -> bool {
+        if self.client_tool_names.contains(upstream_name) {
+            return false;
+        }
         self.custom_tools.get(upstream_name).is_some_and(|spec| {
             spec.kind == CodexCustomToolKind::BuiltIn && spec.openai_name == "web_search"
         })
+    }
+
+    /// 登记一个「客户端执行侧声明过的上行工具名」。见 `client_tool_names`。
+    fn mark_client_tool(&mut self, upstream_name: &str) {
+        self.client_tool_names.insert(upstream_name.to_string());
+    }
+
+    /// 客户端 function 声明覆盖同名的原生代理登记（仅 BuiltIn 形态）。
+    /// 否则回程仍会把它当成原生搜索项，产出客户端 function handler 不认的
+    /// custom_tool_call（issue #13 残余 2）。custom 形态无需处理：它的 insert
+    /// 本就直接覆盖 BuiltIn，回程形态与客户端 custom 工具一致。
+    fn drop_native_proxy_spec(&mut self, upstream_name: &str) {
+        let is_native_proxy = self
+            .custom_tools
+            .get(upstream_name)
+            .is_some_and(|spec| spec.kind == CodexCustomToolKind::BuiltIn);
+        if is_native_proxy {
+            self.custom_tools.remove(upstream_name);
+            if self.custom_tools.is_empty() {
+                self.has_custom_tools = false;
+            }
+        }
     }
 
     fn original_custom_tool_name(&self, upstream_name: &str) -> String {
@@ -424,7 +460,83 @@ impl UnsupportedNativeWebSearch {
     }
 }
 
-/// 从 Chat 请求里剥掉顶层 `web_search` 类原生工具声明：Chat 上游没有服务端搜索，
+/// 工具声明的递归下探深度上限：防御异常深的 `namespace` 嵌套（真实的 codex 声明
+/// 最深两层），超过就不再下探，剩的子项原样上行，由响应侧守卫兜住。
+const MAX_TOOL_DECL_DEPTH: usize = 8;
+
+/// 是否为原生搜索的工具类型名 / 被强制的工具名。
+fn is_native_search_tool_name(name: &str) -> bool {
+    matches!(name, "web_search" | "web_search_preview")
+}
+
+/// 请求里（递归看 `namespace` 子项）是否还有客户端执行的同名工具。用来判定
+/// `tool_choice` 是否被强制到了已被剥掉的声明上。
+fn has_client_executed_tool_named(tools: &[Value], name: &str, depth: usize) -> bool {
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+        if matches!(tool_type, "function" | "custom" | "tool_search")
+            && tool.get("name").and_then(Value::as_str) == Some(name)
+        {
+            return true;
+        }
+        if tool_type == "namespace"
+            && (tool.get("name").and_then(Value::as_str) == Some(name)
+                || (depth < MAX_TOOL_DECL_DEPTH
+                    && tool.get("tools").and_then(Value::as_array).is_some_and(|children| {
+                        has_client_executed_tool_named(children, name, depth + 1)
+                    })))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 递归剥掉原生搜索声明：顶层与 `namespace` 子项同一规则；子项被剥空的命名空间
+/// 整项去掉（留一个 `tools: []` 的空命名空间上行，等于告诉网关「还有工具」）。
+/// 返回是否发生了剥离。
+/// 只删「被本层剥空」的命名空间：客户端本来就声明成空的命名空间原样保留。
+///
+/// 本仓库自研（issue #13 残余 1）：参照树的 `remove_unsupported_native_search`
+/// （commit `5eaa66c`）只看顶层 `type`，对命名空间子项内的声明无处理。
+fn strip_native_search_tools(tools: &mut Vec<Value>, depth: usize) -> bool {
+    let before = tools.len();
+    tools.retain(|tool| {
+        !tool
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_native_search_tool_name)
+    });
+    let mut stripped = before != tools.len();
+    if depth >= MAX_TOOL_DECL_DEPTH {
+        return stripped;
+    }
+    let mut emptied: Vec<usize> = Vec::new();
+    for (index, tool) in tools.iter_mut().enumerate() {
+        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+            continue;
+        }
+        // 只删「被本层剥空」的命名空间；客户端本来就声明成空的原样保留
+        // （与 PR #11 钉住的「客户端声明保留」一致）。
+        let became_empty = tool
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|children| {
+                let child_stripped = strip_native_search_tools(children, depth + 1);
+                child_stripped && children.is_empty()
+            });
+        if became_empty {
+            stripped = true;
+            emptied.push(index);
+        }
+    }
+    for index in emptied.into_iter().rev() {
+        tools.remove(index);
+    }
+    stripped
+}
+
+/// 从 Chat 请求里剥掉 `web_search` 类原生工具声明（含 `namespace` 子项内的）：
 /// 留着声明等于邀请模型回一个「没有真正执行」的搜索调用（谎报 completed 的源头）。
 /// 同名 function/custom 和命名空间、tool_search 工具由客户端执行，必须保留。
 ///
@@ -434,21 +546,35 @@ fn remove_unsupported_native_search(body: &mut Value) -> anyhow::Result<()> {
     if choice
         .and_then(|choice| choice.get("type"))
         .and_then(Value::as_str)
-        .is_some_and(|kind| matches!(kind, "web_search" | "web_search_preview"))
+        .is_some_and(is_native_search_tool_name)
     {
         return Err(UnsupportedNativeWebSearch.into());
     }
     let required = choice.and_then(Value::as_str) == Some("required");
+    // 先记下被强制的工具名：`choice` 借用了 body，不能跨过下面的 get_mut。
+    let forced = choice
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| is_native_search_tool_name(name))
+        .map(ToString::to_string);
+
+    // 递归剥声明（含 namespace 子项）；子项被剥空的命名空间整项去掉。
     if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        let before = tools.len();
-        // 同名 function/custom 和命名空间工具由客户端执行，必须保留。
-        tools.retain(|tool| {
-            !matches!(
-                tool.get("type").and_then(Value::as_str),
-                Some("web_search" | "web_search_preview")
-            )
-        });
-        if before != tools.len() && required && tools.is_empty() {
+        let stripped = strip_native_search_tools(tools, 0);
+        // required 且剥完已无工具 = 无法降级，显式拒绝而不是静默改成无工具的请求。
+        if stripped && required && tools.is_empty() {
+            return Err(UnsupportedNativeWebSearch.into());
+        }
+    }
+    // tool_choice 强制到已被剥掉的声明上：不能假装执行，也不能静默取消强制，
+    // 按既有口径给结构化 400；客户端自己声明了同名工具则照常保留。
+    if let Some(forced) = forced {
+        let survives = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| has_client_executed_tool_named(tools, &forced, 0));
+        if !survives {
             return Err(UnsupportedNativeWebSearch.into());
         }
     }
@@ -1296,6 +1422,12 @@ impl ChatSseToResponsesConverter {
 
     pub fn has_terminal_event(&self) -> bool {
         self.failed || self.state.completed || self.state.finish_reason.is_some()
+    }
+
+    /// 终态事件是否为 `response.failed`。HTTP 流泵拿它决定诊断记 `stream_completed`
+    /// 还是 `stream_failed`：failed 收口的一轮绝不能记成「正常完成」（issue #13 残余 3）。
+    pub fn terminal_failed(&self) -> bool {
+        self.failed || self.state.terminal_failed
     }
 
     pub fn with_request(original_request: &Value) -> Self {
@@ -2598,6 +2730,8 @@ struct ToolCallState {
 struct ChatSseState {
     response_started: bool,
     completed: bool,
+    /// 终态事件是不是 `response.failed`（而不是 completed）。
+    terminal_failed: bool,
     response_id: String,
     model: String,
     created_at: u64,
@@ -2618,6 +2752,7 @@ impl Default for ChatSseState {
         Self {
             response_started: false,
             completed: false,
+            terminal_failed: false,
             response_id: "resp_compat".to_string(),
             model: String::new(),
             created_at: 0,
@@ -3042,6 +3177,8 @@ impl ChatSseState {
                     "response": response
                 }),
             );
+            // 与 `failed_into` 同一口径：这里不补 `data: [DONE]`（见那里的注释）。
+            self.terminal_failed = true;
             self.completed = true;
             return;
         }
@@ -3201,8 +3338,15 @@ impl ChatSseState {
         }
     }
 
+    /// 失败收口：只发 `response.failed`，**不补 `data: [DONE]`**（issue #13 残余 3 定档）。
+    /// 口径依据两条实证，不靠猜：
+    /// 1. 参照树同位置的 `failed_into` 也不补 `[DONE]`，移植区保持与来源逐行可比；
+    /// 2. 本仓库流泵里已经写着「必须显式补一个 failed 事件，否则客户端会永远等下去」——
+    ///    终态由 `response.failed` 事件本身表达，HTTP body 随后 EOF 收尾；`[DONE]`
+    ///    只跟在正常完成的终态后面。
     fn failed_into(&mut self, output: &mut String, message: String, error_type: Option<String>) {
         self.completed = true;
+        self.terminal_failed = true;
         let mut error = json!({ "message": message });
         if let Some(error_type) = error_type.filter(|value| !value.is_empty()) {
             error["type"] = json!(error_type);
@@ -5294,6 +5438,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         proxy_action: Some(action),
                     },
                 );
+                context.mark_client_tool(name);
                 context.has_custom_tools = true;
                 continue;
             }
@@ -5305,6 +5450,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                     proxy_action: None,
                 },
             );
+            context.mark_client_tool(name);
             context.has_custom_tools = true;
             continue;
         }
@@ -5346,6 +5492,8 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         );
                     }
                 }
+                // 客户端 custom 工具由客户端执行：同名时它赢（issue #13 残余 2）。
+                context.mark_client_tool(&name);
                 context.has_custom_tools = true;
             }
             "function" => {
@@ -5361,6 +5509,9 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                             namespace: String::new(),
                         },
                     );
+                    // 客户端 function 声明同名时它赢（issue #13 残余 2）。
+                    context.mark_client_tool(name);
+                    context.drop_native_proxy_spec(name);
                 }
             }
             "namespace" => add_namespace_tools_to_context(&mut context, tool),
@@ -5381,6 +5532,7 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                         proxy_action: None,
                     },
                 );
+                context.mark_client_tool(name);
                 context.has_custom_tools = true;
             }
             "web_search" | "local_shell" | "computer_use" => {
@@ -5389,14 +5541,16 @@ fn build_codex_tool_context(tools: Option<&Value>) -> CodexToolContext {
                     .and_then(Value::as_str)
                     .filter(|v| !v.is_empty())
                     .unwrap_or(tool_type);
-                context.custom_tools.insert(
-                    name.to_string(),
-                    CodexCustomToolSpec {
+                // 客户端已登记同名工具时不覆盖成 BuiltIn：回程才能还原成 function_call /
+                // custom_tool_call，而不是被当成原生搜索项（issue #13 残余 2）。
+                context
+                    .custom_tools
+                    .entry(name.to_string())
+                    .or_insert(CodexCustomToolSpec {
                         openai_name: name.to_string(),
                         kind: CodexCustomToolKind::BuiltIn,
                         proxy_action: None,
-                    },
-                );
+                    });
                 context.has_custom_tools = true;
             }
             _ => {}
@@ -5426,6 +5580,8 @@ fn add_namespace_tools_to_context(context: &mut CodexToolContext, namespace_tool
             continue;
         };
         let flat = flatten_namespace_tool_name(namespace, name);
+        // 命名空间子项也是客户端执行：按展平后的上行名登记归一判据（issue #13 残余 2）。
+        context.mark_client_tool(&flat);
         if namespace.is_empty() {
             context.function_tools.insert(
                 flat,
@@ -8260,5 +8416,130 @@ mod native_search_guard_tests {
             assert_eq!(messages[index - 1]["role"], json!("assistant"));
             assert_eq!(messages[index - 1]["tool_calls"][0]["id"], json!("ws_call_failed"));
         }
+    }
+
+    /// 命名空间子项内的原生声明同规则剥掉；剥空的命名空间整项去掉；
+    /// `tool_choice` 强制到被剥掉的项时按既有口径 400。
+    /// 本仓库自研（issue #13 残余 1）：参照树只看顶层 `type`。
+    #[test]
+    fn native_search_declarations_strip_recursively_from_namespaces() {
+        // 命名空间里还有客户端工具：只剥原生子项，命名空间本身保留。
+        let mut mixed = json!({"tools": [
+            {"type": "namespace", "name": "srv", "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "open_file", "parameters": {"type": "object"}}
+            ]}
+        ]});
+        remove_unsupported_native_search(&mut mixed).unwrap();
+        assert_eq!(
+            mixed.pointer("/tools/0/tools").cloned().unwrap_or_default(),
+            json!([{"type": "function", "name": "open_file", "parameters": {"type": "object"}}])
+        );
+
+        // 只剩原生子项：空命名空间整项去掉，不得留一个 tools: [] 上行。
+        let mut emptied = json!({"tools": [
+            {"type": "namespace", "name": "srv", "tools": [{"type": "web_search"}]},
+            {"type": "function", "name": "keep", "parameters": {"type": "object"}}
+        ]});
+        remove_unsupported_native_search(&mut emptied).unwrap();
+        let kinds: Vec<_> = emptied
+            .pointer("/tools")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|tool| tool["type"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(kinds, vec!["function"], "空命名空间不得上行");
+
+        // 嵌套两层：内层的原生声明也要剥，层层剥空后整项消失。
+        let mut nested = json!({"tools": [
+            {"type": "namespace", "name": "outer", "tools": [
+                {"type": "namespace", "name": "inner", "tools": [{"type": "web_search_preview"}]}
+            ]}
+        ]});
+        remove_unsupported_native_search(&mut nested).unwrap();
+        assert_eq!(nested.pointer("/tools").cloned().unwrap_or_default(), json!([]));
+
+        // 异常深的嵌套不得把递归炸到栈溢出：超深度上限就停下，调用正常返回。
+        let mut deep = json!({"type": "web_search"});
+        for _ in 0..(MAX_TOOL_DECL_DEPTH * 3) {
+            deep = json!({"type": "namespace", "name": "d", "tools": [deep]});
+        }
+        let mut bounded = json!({"tools": [deep], "tool_choice": "auto"});
+        remove_unsupported_native_search(&mut bounded).unwrap();
+
+        // 强制到已被剥掉的命名空间原生项：结构化 400，不静默取消强制。
+        let mut forced = json!({
+            "tools": [{"type": "namespace", "name": "srv", "tools": [{"type": "web_search"}]}],
+            "tool_choice": {"type": "function", "namespace": "srv", "name": "web_search"}
+        });
+        assert!(remove_unsupported_native_search(&mut forced)
+            .unwrap_err()
+            .is::<UnsupportedNativeWebSearch>());
+
+        // 客户端自己声明了同名 function 并被强制：照常放行（它不是原生搜索）。
+        let mut client_forced = json!({
+            "tools": [{"type": "function", "name": "web_search", "parameters": {"type": "object"}}],
+            "tool_choice": {"type": "function", "name": "web_search"}
+        });
+        remove_unsupported_native_search(&mut client_forced).unwrap();
+
+        // required 且命名空间剥到空：同样 400。
+        let mut required = json!({
+            "tools": [{"type": "namespace", "name": "srv", "tools": [{"type": "web_search"}]}],
+            "tool_choice": "required"
+        });
+        assert!(remove_unsupported_native_search(&mut required)
+            .unwrap_err()
+            .is::<UnsupportedNativeWebSearch>());
+    }
+
+    /// 归一规则钉死（issue #13 残余 2，本仓库自研）：同名判定键是 Chat 上行工具名
+    /// （`custom_tools` / `function_tools` 的键，不看声明的 `type`），同名冲突时
+    /// 客户端声明优先，与声明顺序无关。
+    #[test]
+    fn client_declaration_wins_same_upstream_name_collision() {
+        let native = json!({ "type": "web_search" });
+        let client_function = json!({
+            "type": "function",
+            "name": "web_search",
+            "parameters": { "type": "object" }
+        });
+        let client_custom = json!({ "type": "custom", "name": "web_search" });
+        for tools in [
+            json!([native.clone(), client_function.clone()]),
+            json!([client_function.clone(), native.clone()]),
+            json!([native.clone(), client_custom.clone()]),
+            json!([client_custom.clone(), native.clone()]),
+        ] {
+            let context = build_codex_tool_context(Some(&tools));
+            assert!(
+                !context.is_builtin_web_search_proxy("web_search"),
+                "客户端声明必须赢，不论声明顺序：{tools}"
+            );
+            let item = response_tool_call_item("call_1", "web_search", "{}", &context);
+            assert_ne!(
+                item["type"],
+                json!("web_search_call"),
+                "客户端执行的调用不得伪装成搜索项：{item}"
+            );
+            assert_eq!(item["status"], json!("completed"), "客户端调用不是谎报源");
+        }
+
+        // 只有原生声明时语义不变：仍是原生搜索代理项，回程标 failed（issue #3）。
+        let only_native = build_codex_tool_context(Some(&json!([native])));
+        assert!(only_native.is_builtin_web_search_proxy("web_search"));
+        let item = response_tool_call_item("call_2", "web_search", "{}", &only_native);
+        assert_eq!(item["type"], json!("web_search_call"));
+        assert_eq!(item["status"], json!("failed"));
+
+        // 键语义显式钉住：命名空间子项按展平后的上行名登记，裸名 web_search
+        // 与展平名不是同一个键，因此顶层原生声明仍按原生搜索处理。
+        let namespaced = build_codex_tool_context(Some(&json!([
+            {"type": "namespace", "name": "srv", "tools": [client_function]},
+            {"type": "web_search"}
+        ])));
+        assert!(namespaced.is_builtin_web_search_proxy("web_search"));
+        assert!(!namespaced.is_builtin_web_search_proxy("srv__web_search"));
     }
 }
