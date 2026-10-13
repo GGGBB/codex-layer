@@ -70,7 +70,7 @@ fn compaction_trigger_detection() {
 
 #[test]
 fn compaction_trigger_is_detected_in_any_position() {
-    // GAP_ANALYSIS P0-5：旧实现只看「从尾部数第一个带 type 的 item」，
+    // 旧实现只看「从尾部数第一个带 type 的 item」，
     // trigger 一旦被客户端放到中间就整轮漏检。
     let mid_trigger = json!({
         "model": "m",
@@ -95,7 +95,7 @@ fn compaction_trigger_is_detected_in_any_position() {
 
 #[tokio::test]
 async fn compaction_trigger_is_stripped_from_every_position_for_chat_upstream() {
-    // GAP_ANALYSIS P0-5：ChatCompletions 上游的压缩轮必须把全部 trigger
+    // ChatCompletions 上游的压缩轮必须把全部 trigger
     // 剥净并注入摘要指令；旧实现只弹尾部，中间那份会原样透给上游。
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -155,7 +155,7 @@ async fn compaction_trigger_is_stripped_from_every_position_for_chat_upstream() 
 
 #[tokio::test]
 async fn json_compaction_summary_on_stream_request_is_not_flagged_as_stream() {
-    // GAP_ANALYSIS P0-6：请求 stream=true、但兼容上游直接回 application/json 摘要时
+    // 请求 stream=true、但兼容上游直接回 application/json 摘要时
     //（部分网关无视 stream），旧实现仍把响应标为 stream，上游返回的 JSON 会被
     // 当成 SSE 解析，提出 0 段文本后只能给出 failed 压缩响应。
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -217,7 +217,7 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
         "input": [
             { "type": "message", "role": "user",
               "content": [{ "type": "input_text", "text": "latest question" }] },
-            // GAP_ANALYSIS P0-2：本层自己生成的摘要带命名空间，回放只认这种形态。
+            // 本层自己生成的摘要带命名空间，回放只认这种形态。
             local_compaction_item("PRIOR_SUMMARY")
         ]
     }))
@@ -237,7 +237,7 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
 
 #[test]
 fn legacy_unmarked_plaintext_summary_still_expands_once() {
-    // GAP_ANALYSIS P0-2 切换点兼容：引入命名空间之前持久化的旧会话把摘要
+    // 切换点兼容：引入命名空间之前持久化的旧会话把摘要
     // 裸放在 `encrypted_content` 里。整段 input 不含新格式项时仍回退展开，
     // 旧会话不致直接不可用；下一轮压缩会写入带标记的新格式。
     let converted = responses_to_chat_completions(json!({
@@ -301,7 +301,7 @@ fn legacy_session_replays_bare_summary_regardless_of_content_shape() {
 #[test]
 fn mixed_session_unmarked_compaction_item_fails_loud() {
     // 新格式已在该会话出现之后，未标记项既不能当自家摘要回放，也不能静默丢弃
-    // （GAP_ANALYSIS P0-2 命名空间 + P0-3 fail-loud 闸门）。
+    // （摘要命名空间标记 + fail-loud 闸门）。
     let error = responses_to_chat_completions(json!({
         "model": "deepseek-v4-flash",
         "input": [
@@ -363,7 +363,7 @@ fn encrypted_content_part_in_agent_message_is_forwarded_in_order() {
 
 #[test]
 fn chat_conversion_rejects_opaque_encrypted_agent_content_without_echoing_payload() {
-    // GAP_ANALYSIS P0-3：opaque 片段、空片段、顶层独立 encrypted_content 项
+    // opaque 片段、空片段、顶层独立 encrypted_content 项
     // 都要给出结构化错误，且错误不回显原文。
     let opaque = "mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh";
     for input in [
@@ -380,7 +380,7 @@ fn chat_conversion_rejects_opaque_encrypted_agent_content_without_echoing_payloa
         json!({"type":"encrypted_content","encrypted_content":opaque}),
         // 顶层明文形态同样走闸门：本层保不住 agent 消息的角色与结构，不假装能转。
         json!([{"type":"encrypted_content","encrypted_content":"AGENT_PAYLOAD_SENTINEL"}]),
-        // 空片段：#2474 语义，静默跳过等于发出被抽空内容的请求。
+        // 空片段：静默跳过等于发出被抽空内容的请求。
         json!([{"type":"message","role":"user","content":[{"type":"encrypted_content"}]}]),
         json!([{"type":"message","role":"user","content":[{"type":"encrypted_content","text":""}]}]),
     ] {
@@ -408,7 +408,7 @@ fn chat_conversion_rejects_opaque_encrypted_agent_content_without_echoing_payloa
 
 #[test]
 fn chat_conversion_rejects_invalid_local_compaction_history() {
-    // GAP_ANALYSIS P0-3：带本项目命名空间但解不出摘要的项属「新格式损坏」，
+    // 带本项目命名空间但解不出摘要的项属「新格式损坏」，
     // 既不能回放也不能静默抽成空任务。
     for content in [
         "codexlayer:summary:v1:not-json",
@@ -568,7 +568,7 @@ fn wrap_non_stream_response_produces_single_compaction_item() {
 
 #[test]
 fn gates_map_to_actionable_responses_errors() {
-    // GAP_ANALYSIS P0-3：闸门要给出可行动的文案与错误码，而不是笼统的转换失败。
+    // 闸门要给出可行动的文案与错误码，而不是笼统的转换失败。
     let native = responses_to_chat_completions(json!({
         "model": "deepseek-v4-flash",
         "input": [
@@ -694,7 +694,7 @@ fn summary_converter_does_not_relabel_native_compaction_as_local_text() {
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque-summary\"}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
     );
-    // GAP_ANALYSIS P0-2：上游的 `compaction` 项携带的是原生 opaque 状态，
+    // 上游的 `compaction` 项携带的是原生 opaque 状态，
     // 不得被本层揭重命名为本地明文摘送。
     let mut converter = CompactionSseConverter::new("custom-model");
     converter.push_upstream_bytes(upstream.as_bytes());
@@ -926,7 +926,7 @@ async fn chat_compaction_v2_request_routes_to_summary_endpoint_and_flags_respons
     assert_eq!(result.status_code, 200);
 }
 
-/// #2031：GLM 系上游只接受纯 base64，不认 `data:image/...;base64,` 前缀。
+/// GLM 系上游只接受纯 base64，不认 `data:image/...;base64,` 前缀。
 #[test]
 fn glm_image_urls_are_stripped_to_bare_base64() {
     let converted = responses_to_chat_completions(json!({
@@ -1563,7 +1563,7 @@ fn responses_request_preserves_reasoning_content_for_thinking_followup() {
     assert_eq!(converted["messages"][2]["role"], "tool");
 }
 
-// #1860 错误 1：孤立的 function_call（后面没有 function_call_output）不能变成
+// 错误形态 1：孤立的 function_call（后面没有 function_call_output）不能变成
 // assistant.tool_calls，否则 DeepSeek 报 "must be followed by tool messages"。
 #[test]
 fn responses_request_drops_orphaned_function_call_without_output() {
@@ -1612,7 +1612,7 @@ fn responses_request_drops_orphaned_function_call_without_output() {
     }
 }
 
-// #1860 错误 2：thinking 模式下带 tool_calls 的 assistant 消息必须回传 reasoning_content。
+// 错误形态 2：thinking 模式下带 tool_calls 的 assistant 消息必须回传 reasoning_content。
 #[test]
 fn responses_request_attaches_reasoning_content_to_tool_call_message() {
     let converted = responses_to_chat_completions(json!({
@@ -1794,7 +1794,7 @@ fn responses_request_merges_reasoning_text_and_tool_calls_like_ccx() {
 
 #[test]
 fn responses_request_keeps_reasoning_when_text_message_precedes_tool_call() {
-    // issue #2210：reasoning → 不带 tool_calls 的 assistant 文本消息 → function_call。
+    // 触发时序：reasoning → 不带 tool_calls 的 assistant 文本消息 → function_call。
     // 文本消息先把 pending_reasoning 消费掉，随后的 function_call 走
     // flush_tool_calls 的 merge 分支（最后一条已是 assistant），旧实现在那里
     // 提前 return，把这条 reasoning 静默丢弃。
@@ -1857,7 +1857,7 @@ fn responses_request_keeps_reasoning_when_text_message_precedes_tool_call() {
 
 #[test]
 fn responses_request_relocates_developer_notice_between_tool_outputs() {
-    // issue #2275 / #2257：<image_resize_notice> 这类提示以 developer（映射成 system）
+    // <image_resize_notice> 这类提示以 developer（映射成 system）
     // 形式插在两条 tool 结果之间。配对判定用 take_while 只数连续 tool 消息，
     // 数到夹心就停，于是第二个 tool_call 被判 orphaned 从 tool_calls 摘掉，
     // 而它的 tool 消息还在原位 → 上游 400「No tool output found for tool call」。
@@ -2036,7 +2036,7 @@ fn responses_request_to_chat_inlines_ref_siblings_in_tool_defs() {
 
 #[test]
 fn responses_request_flattens_top_level_one_of_in_tool_parameters() {
-    // issue #2367：zod-to-json-schema 会生成顶层 oneOf 的 schema，
+    // zod-to-json-schema 会生成顶层 oneOf 的 schema，
     // Anthropic（Claude）上游直接拒绝、整轮 400、模型完全不可用。
     // 转换后顶层不得再有组合器，且各分支贡献的字段要出现在 properties 里。
     let converted = responses_to_chat_completions(json!({
@@ -2532,7 +2532,7 @@ fn namespace_tool_null_type_parameters_normalized() {
 }
 
 /// 模拟严格供应商（deepseek 风格）：对请求里每个工具参数 schema 做校验，
-/// 发现 `type: null` 或缺失 required 字段时返回 400（对应 issue #2247 的拒绝行为），
+/// 发现 `type: null` 或缺失 required 字段时返回 400（对应严格供应商的拒绝行为），
 /// 合法则回 200。返回捕获到的上游请求体，供断言实际收到的 schema 形状。
 async fn strict_provider_accepts(tools: Value) -> Result<(Value, u16, Value), (u16, Value)> {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -3137,7 +3137,7 @@ fn chat_completion_response_maps_reasoning_tool_calls_and_usage_details() {
     );
 }
 
-/// #332 / #1012：Gemini 3 系要求 functionCall 回传 thought_signature，否则整轮 400。
+/// Gemini 3 系要求 functionCall 回传 thought_signature，否则整轮 400。
 /// 签名由上游产生、本仓不理解其语义，因此原样透传 `extra_content`：
 /// 上游返回时记住（按 call_id），下一轮构造请求时挂回对应的 tool_call。
 #[test]
@@ -4937,7 +4937,7 @@ fn spawn_chat_server() -> ChatServer {
     ChatServer { base_url, handle }
 }
 
-// ── tool 输出中的图片（issue #1996）────────────────────────────────────
+// ── tool 输出中的图片────────────────────────────────────
 //
 // `view_image` 的结果以 `function_call_output.output[].input_image` 回来。这个数组
 // 曾被整体 JSON 序列化成 tool 消息的字符串 content，于是 base64 被当普通文本送进上游
@@ -5303,7 +5303,7 @@ fn responses_item_id_normalization_falls_back_to_call_id() {
     assert_eq!(body["input"][0]["id"], "fc_call_a");
 }
 
-/// #1431 / #1781：流式转换曾把 message item 命名为 `{response_id}_msg`，
+/// 流式转换曾把 message item 命名为 `{response_id}_msg`，
 /// 而 response_id 以 `resp_` 开头，于是产出 `resp_xxx_msg`。
 /// 这个 id 会写进 rollout，切回官方 provider 后重放时被拒（invalid_id_prefix）。
 #[test]
@@ -5359,7 +5359,7 @@ fn converted_message_item_id_uses_msg_prefix() {
     assert!(!id.ends_with("_msg"), "不能是 resp_*_msg 形态，实际 {id}");
 }
 
-/// #2263：Codex 发出的 `type: "tool_search"` 工具必须透传为 chat 的 function 工具，
+/// Codex 发出的 `type: "tool_search"` 工具必须透传为 chat 的 function 工具，
 /// 不能落入 `_ => {}` 被静默丢弃，否则模型永远检索不到 mcp__* 工具。
 #[test]
 fn responses_request_passes_tool_search_through_to_chat_tools() {
@@ -5412,7 +5412,7 @@ fn responses_request_passes_tool_search_through_to_chat_tools() {
     );
 }
 
-/// #2263：模型调用回 tool_search 时必须还原成 `tool_search_call` item，
+/// 模型调用回 tool_search 时必须还原成 `tool_search_call` item，
 /// 官方客户端的 handler 只接受这个类型（function_call 形态会被拒绝）。
 #[test]
 fn chat_response_restores_tool_search_call_item() {
@@ -5465,7 +5465,7 @@ fn chat_response_restores_tool_search_call_item() {
     );
 }
 
-/// #2263：流式路径同样要还原成 tool_search_call，且 id 前缀为 tsc_。
+/// 流式路径同样要还原成 tool_search_call，且 id 前缀为 tsc_。
 #[test]
 fn chat_sse_restores_tool_search_call_item() {
     let converted = chat_sse_to_responses_sse_with_request(
@@ -5499,7 +5499,7 @@ data: [DONE]
     assert!(!converted.contains("custom_tool_call_input.delta"));
 }
 
-/// #2263：历史回放时 tool_search_call / tool_search_output 要映射成
+/// 历史回放时 tool_search_call / tool_search_output 要映射成
 /// chat 的 assistant tool_call + role:tool 消息，保持调用配对完整。
 #[test]
 fn responses_input_maps_tool_search_history_items() {
@@ -5546,7 +5546,7 @@ fn responses_input_maps_tool_search_history_items() {
     assert!(content.contains("mcp__calendar__create_event"));
 }
 
-/// #2263：tool_search_output 先于对应 call 出现（压缩/截断后的回放常见）
+/// tool_search_output 先于对应 call 出现（压缩/截断后的回放常见）
 /// 时走孤儿输出路径，不能 panic 也不能丢内容。
 #[test]
 fn responses_input_handles_orphan_tool_search_output() {
@@ -5585,7 +5585,7 @@ fn responses_input_handles_orphan_tool_search_output() {
     assert!(content.contains("mcp__calendar__list"));
 }
 
-/// #2263：模型吐出畸形 arguments JSON 时，tool_search_call 还原必须兜底成
+/// 模型吐出畸形 arguments JSON 时，tool_search_call 还原必须兜底成
 /// 空对象而不是产出非法 item 或 panic。
 #[test]
 fn chat_response_tool_search_call_tolerates_malformed_arguments() {
@@ -5638,7 +5638,7 @@ fn chat_response_tool_search_call_tolerates_malformed_arguments() {
     assert_eq!(item["execution"], "client");
 }
 
-/// #2263：tool_search_call 缺 call_id 时回退用 id 字段；两者皆空则整个
+/// tool_search_call 缺 call_id 时回退用 id 字段；两者皆空则整个
 /// item 被丢弃（与 function_call 分支的防御行为一致）。
 #[test]
 fn responses_input_tool_search_call_falls_back_to_id_and_drops_empty() {
@@ -5683,7 +5683,7 @@ fn responses_input_tool_search_call_falls_back_to_id_and_drops_empty() {
     assert_eq!(tool_calls[0]["function"]["name"], "tool_search");
 }
 
-/// #2263：上游模型在未声明 tool_search 工具时越权调用它，退化为普通
+/// 上游模型在未声明 tool_search 工具时越权调用它，退化为普通
 /// function_call item 转发给客户端——这是选定的默认行为，测试钉住防漂移。
 #[test]
 fn chat_response_keeps_undeclared_tool_search_as_plain_function_call() {
@@ -6715,7 +6715,7 @@ fn current_turn_mark_absent_when_stabilizer_off() {
 
 #[test]
 fn current_turn_mark_skipped_when_request_ends_with_tool_result() {
-    // GAP_ANALYSIS P0-1（维护者 P1）：等待工具结果后的继续请求里，
+    // 维护者 P1：等待工具结果后的继续请求里，
     // 最后一条 user 是历史旧问题；无条件回钉会把旧问题误导成「当前问题」。
     // 此类请求只解包、不钉定。
     let body = json!({
@@ -6745,7 +6745,7 @@ fn current_turn_mark_skipped_when_request_ends_with_tool_result() {
 
 #[test]
 fn stabilizer_keeps_chunk_body_whitespace_verbatim() {
-    // 维护者 P2（GAP_ANALYSIS P1-4）：规范序只规范块间分隔，不得裁剪块体
+    // 维护者 P2：规范序只规范块间分隔，不得裁剪块体
     // 自身首尾空白（「非易变内容逐字节不变」的 opt-in 契约）。
     let body = json!({
         "instructions": "  padded root system  ",
