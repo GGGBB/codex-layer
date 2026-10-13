@@ -30,6 +30,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use codex_layer::config::Config;
+use codex_layer::cli::{self, Command};
 use codex_layer::diagnostic_log;
 use codex_layer::http_client;
 use codex_layer::protocol_proxy::{
@@ -50,16 +51,27 @@ const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 type StreamItem = Result<Bytes, Box<dyn StdError + Send + Sync + 'static>>;
 
 fn main() -> anyhow::Result<()> {
+    // ollama 式包命令：子命令与参数解析在 cli::parse_cli（纯函数，可单测）。
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        print_usage();
-        return Ok(());
+    let command = cli::parse_cli(&args)?;
+    match command {
+        Command::Help => {
+            print_usage();
+            Ok(())
+        }
+        Command::Version => {
+            println!("codex-layer {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Command::Serve { config } => run_serve(config),
+        // 常驻四命令：macOS 走 launchctl，其余平台明确报不支持。
+        command => cli::run_launchd_command(&command, &Config::default_path),
     }
-    if args.iter().any(|arg| arg == "--version") {
-        println!("codex-layer {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-    let config_path = resolve_config_path(&args);
+}
+
+/// 前台运行（serve，默认子命令）：装配与监听逻辑与旧 main 同源。
+fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let config_path = config_override.unwrap_or_else(Config::default_path);
     let config = Config::load(&config_path)?;
 
     init_tracing();
@@ -115,24 +127,23 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-fn resolve_config_path(args: &[String]) -> std::path::PathBuf {
-    if let Some(index) = args
-        .iter()
-        .position(|arg| arg == "--config" || arg == "-c")
-        .and_then(|index| index.checked_add(1))
-        .filter(|index| *index < args.len())
-    {
-        return std::path::PathBuf::from(&args[index]);
-    }
-    Config::default_path()
-}
+// 旧 resolve_config_path 已并入 cli::parse_cli（纯函数化，含子命令）。
 
 fn print_usage() {
     println!(
         "codex-layer {} —— codex relay 的稳定层
 
 用法：
-  codex-layer [--config <路径>] [-c <路径>] [--help] [--version]
+  codex-layer [serve]   [--config <路径> | -c <路径>]   前台运行（默认子命令）
+  codex-layer start     [--config <路径>] [--label <L>]  注册 LaunchAgent 常驻（macOS）
+  codex-layer stop      [--label <L>]                    注销常驻（macOS）
+  codex-layer restart   [--config <路径>] [--label <L>]  重写 plist 并整包重载
+  codex-layer status    [--config <路径>] [--label <L>]  打印 pid / 监听口 / 配置路径
+  codex-layer version                                     打印版本
+
+常驻默认 Label：com.codex-layer.proxy；start 会把配置绝对路径与
+CODEX_LAYER_CONFIG 环境写进 plist，标准输出/错误重定向到日志目录。
+start/stop/restart/status 仅 macOS；serve/version 平台不受限。
 
 配置默认查找顺序：
   $CODEX_LAYER_CONFIG -> ./codex-layer.toml -> ~/.codex-layer/codex-layer.toml

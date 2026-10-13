@@ -38,6 +38,27 @@ cargo build --release
 ./target/release/codex-layer --version
 ```
 
+## 快速开始（ollama 式包命令）
+
+仓库根目录提供 `install.sh`：`cargo build --release` 后把二进制装到
+`$HOME/.local/bin`（`PREFIX` 环境变量可覆盖；全程不用 sudo，不动 shell rc），
+结束时打印下一步指引。装完后终端直接敲：
+
+| 命令 | 行为 |
+| --- | --- |
+| `codex-layer` | 前台运行（默认子命令，等价 `codex-layer serve`） |
+| `codex-layer start` | macOS 注册 LaunchAgent 常驻：程序生成 plist（KeepAlive + RunAtLoad，标准输出/错误
+重定向到日志目录，Environment 带 `CODEX_LAYER_CONFIG`）后 bootstrap |
+| `codex-layer stop` | `launchctl bootout` 注销 |
+| `codex-layer restart` | 重写 plist + bootout + bootstrap 整包重载（新配置/新 plist 直接生效） |
+| `codex-layer status` | 打印注册状态与 PID（解析 `launchctl print`）、监听口、配置与日志路径 |
+| `codex-layer version` | 打印版本 |
+
+`--config/-c` 全子命令透传；`--label`（默认 `com.codex-layer.proxy`）只对常驻四命令
+开放，用于多实例并跑与测试实例隔离。start / stop / restart / status 仅 macOS；
+非 macOS 上它们给明确可读的不支持错误，serve / version 平台不受限。
+本机部署与 launchctl 运维命令见 [docs/DEPLOY_LOCAL.md](docs/DEPLOY_LOCAL.md)。
+
 ## 配置
 
 配置查找顺序：`$CODEX_LAYER_CONFIG` -> `./codex-layer.toml` -> `~/.codex-layer/codex-layer.toml`。

@@ -11,6 +11,7 @@
 
 pub mod compaction_align;
 pub mod compaction_tools;
+pub mod cli;
 pub mod config;
 pub mod diagnostic_log;
 pub mod http_client;
