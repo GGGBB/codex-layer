@@ -94,8 +94,9 @@ fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> 
     // 只有入口的装配流需要它。
     protocol_proxy::set_runtime_settings(settings.clone());
 
-    // 稳定性监看端点（issue #19）：`[stability] enabled = false`（默认）时不注册，
-    // 未启用时由 handler 显式 404（与陌生路径同状态码，语义是「未启用」）。
+    // 稳定性监看端点（issue #19）：路由始终注册（Router 的状态泛型不能按配置
+    // 分叉，强行条件注册会编译不过）；`[stability] enabled = false`（默认）时
+    // 由 handler 显式返回 404「未启用」，与陌生路径同状态码。
     let stability_state = Arc::new(StabilityState {
         enabled: config.stability.enabled,
         window_bytes: config.stability.window_bytes.max(1),
@@ -803,6 +804,8 @@ fn stream_from_upstream(
             let _ = tx.send(Ok(Bytes::from(payload)));
             // 压缩轮也要有收口事件（issue #19）：没有收口的 stream_open 会永远卡在
             // unpaired 里，单轮耗时分布统计也就无从谈起。
+            // 口径：收口时间记在 payload 下发之时，不含客户端读流耗时——
+            // 压缩轮耗时系统性偏小是有意的服务端侧口径，便于跨轮对比（PR #24 review）。
             let _ = log_event(
                 "codex_layer.stream_completed",
                 json!({ "model": model.clone(), "requestId": request_id, "compaction": true }),
