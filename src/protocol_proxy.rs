@@ -7842,6 +7842,18 @@ mod response_compatibility_tests {
         assert!(!supports_reasoning_effort("google/gemini-2.5-pro"));
         assert!(!supports_reasoning_effort("glm-5.3"));
     }
+
+    /// 严格开关只额外放行 Gemini 系：非 Gemini 的 Default 方言模型（如 llama）
+    /// 不得因开关打开而被多写 `reasoning_effort`——fail-closed 兜底，
+    /// 固定住「白名单与 Gemini 子串之外的模型不受影响」这条验收标准。
+    #[test]
+    fn standard_protocol_opt_in_does_not_leak_reasoning_effort_to_non_gemini() {
+        let body = responses_to_chat_completions_with_options(json!({
+            "model": "llama-4-scout-instruct", "input": "hi", "reasoning": {"effort": "high"}
+        }), true, false)
+        .unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+    }
 }
 
 /// 供应商自定义请求头必须真正写进发往上游的请求（issue #1685）。
