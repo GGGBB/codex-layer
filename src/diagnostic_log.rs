@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn compact_diagnostic_log_keeps_tail_and_drops_partial_first_line() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("codex-plus.log");
+        let path = temp.path().join("codex-layer.log");
         std::fs::write(&path, "line-1\nline-2\nline-3\nline-4\n").unwrap();
 
         compact_diagnostic_log(&path, 12, 16).unwrap();
