@@ -785,6 +785,10 @@ pub fn responses_to_chat_completions_with_options(
         relocate_turn_aborted_blocks(&mut messages);
     }
     if stabilize_prompt_prefix {
+        // 延迟工具命名空间通告块搬家（opt-in）：一次性通告挪进瞬态区，头部字节恒稳。
+        relocate_deferred_tools_notice_blocks(&mut messages);
+    }
+    if stabilize_prompt_prefix {
         // 轮次标记：把「本轮要回答的指令」显式钉在最后一条 user 消息上，
         // 根治上下文重建（切模型/压缩）时旧问题被回放成最新指令的串线问题。
         mark_current_user_turn(&mut messages);
@@ -5414,6 +5418,94 @@ fn relocate_turn_aborted_blocks(messages: &mut Vec<Value>) {
         .max(1);
     messages.splice(insert_at..insert_at, block_messages);
 }
+
+/// 「prompt 前缀稳定层」（opt-in）：客户端会在 system 区追加一个 `<tools>` 命名空间
+/// 通告块（2026-10-13 监看实锤：`mcp__ddg_search` 的 Added/Removed 通告反复增删，
+/// 把其后的工具列表序列化整段推移约 70B，前缀在约 50KB 处对分叉）。块的语义是
+/// 「紧邻下一轮的一次性通告」，正确归宿是瞬态区——参照 `relocate_turn_aborted_blocks`
+/// 先例：从头部 system 合并文本中摘除，改挂到最后一条 user 消息之前。模型可见内容
+/// 不丢、不改写、不谎报可用性（宁可搬家不可说谎）。只认内容含
+/// 「deferred tool namespaces:」的块，其它 `<tools>` 块（如真正的工具定义）一律不碰；
+/// 未闭合残片原样保留并停止扫描。无块时零改写，与旧行为逐字节一致。
+fn relocate_deferred_tools_notice_blocks(messages: &mut Vec<Value>) {
+    const OPEN: &str = "<tools>";
+    const CLOSE: &str = "</tools>";
+    const NOTICE_MARK: &str = "deferred tool namespaces:";
+    let Some(head) = messages.first_mut() else { return };
+    if head.get("role").and_then(Value::as_str) != Some("system") {
+        return;
+    }
+    let Some(Value::String(content)) = head.get("content") else { return };
+    if !content.contains(OPEN) {
+        return;
+    }
+    let content = content.clone();
+    // 扫描通告块区间：非通告内容的 <tools> 块跳过；只见开标签的残片保守放弃、停止扫描。
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(open_rel) = content[cursor..].find(OPEN) {
+        let open = cursor + open_rel;
+        let Some(close_rel) = content[open..].find(CLOSE) else {
+            break;
+        };
+        let close_at = open + close_rel;
+        let end = close_at + CLOSE.len();
+        if content[open + OPEN.len()..close_at].contains(NOTICE_MARK) {
+            spans.push((open, end));
+        }
+        cursor = end;
+    }
+    if spans.is_empty() {
+        return;
+    }
+    let blocks: Vec<String> = spans
+        .iter()
+        .map(|&(open, end)| content[open..end].to_string())
+        .collect();
+    // 逐字节剥离：块两侧紧邻的空白随块吞掉（客户端通告块自带的前导换行与拼接分隔符
+    // 一并消失），两侧都还有正文时补回一个空行分隔——摘除后的头部与从未注入该块的
+    // 头部逐字节相等，前缀恢复纯追加。
+    let mut stripped = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    for (index, &(open, end)) in spans.iter().enumerate() {
+        let segment = &content[cursor..open];
+        let trimmed = segment.trim_end_matches([' ', '\t', '\n', '\r']);
+        let swallowed_newline = trimmed.len() < segment.len() || stripped.ends_with(['\n', '\r']);
+        stripped.push_str(trimmed);
+        let next_start = if index + 1 < spans.len() {
+            spans[index + 1].0
+        } else {
+            content.len()
+        };
+        let following = &content[end..next_start];
+        let following_trimmed = following.trim_start_matches([' ', '\t', '\n', '\r']);
+        if !stripped.is_empty() && !following_trimmed.is_empty() && swallowed_newline {
+            stripped.push_str("\n\n");
+        }
+        cursor = end + (following.len() - following_trimmed.len());
+    }
+    stripped.push_str(&content[cursor..]);
+    let stripped = stripped.trim_end_matches([' ', '\t', '\n', '\r']).to_string();
+    // 残缺回退判定：块外正文为空说明摘除会掏空 system，宁留原状。
+    if stripped.is_empty() {
+        return;
+    }
+    if let Some(Value::String(target)) = head.get_mut("content") {
+        *target = stripped;
+    } else {
+        return;
+    }
+    let block_messages: Vec<Value> = blocks
+        .into_iter()
+        .map(|block| json!({ "role": "system", "content": block }))
+        .collect();
+    // 插到最后一条 user 消息之前；没有 user 消息则挂在 system 之后。
+    let insert_at = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(1)
+        .max(1);
+    messages.splice(insert_at..insert_at, block_messages);
 
 const CURRENT_TURN_OPEN: &str = "<current_user_turn>";
 const CURRENT_TURN_CLOSE: &str = "</current_user_turn>";
