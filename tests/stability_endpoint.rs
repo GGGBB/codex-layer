@@ -27,7 +27,6 @@ fn reserve_port() -> u16 {
 struct Harness {
     dir: tempfile::TempDir,
     proxy_port: u16,
-    log_path: std::path::PathBuf,
     _child: ChildGuard,
 }
 
@@ -87,7 +86,6 @@ path = "{}"
     Harness {
         dir,
         proxy_port,
-        log_path,
         _child: ChildGuard(child),
     }
 }
