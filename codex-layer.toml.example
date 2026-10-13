@@ -35,6 +35,16 @@ prompt_prefix = true
 # 开启后 Gemini 系模型（含非白名单 ID）会开始收到标准 reasoning_effort 字段（issue #4）。
 standard_openai_protocol = false
 
+[stability]
+# 稳定性监看数据面（issue #19）：GET /stability 只读聚合快照。
+# 默认关：该路径返回 404「未启用」。
+enabled = false
+# 读诊断日志的尾部字节窗口上限（日志可达上百 MB，只读尾部）。
+window_bytes = 8388608
+# divergence 的 oldSnip/newSnip 可能含用户提示词：默认不外传，只给长度与位置；
+# 开启才输出截断到 120 字符的片段，并在响应里带警示字段。
+show_prompt_snippets = false
+
 [images]
 # 对这些模型剥离图片块（图片替换成占位文本），用于纯文本上游。
 # strip_models = ["some-text-only-model"]
