@@ -435,6 +435,28 @@ prompt_prefix = true
         assert_eq!(active.base_url, "http://127.0.0.1:11234/v1");
     }
 
+    /// 「默认监听口」与「回环守卫的默认识别形态」必须同源：改号只改一处真源。
+    /// 任何一侧单独漂移都会让「base_url 指回本代理自身」的守卫按错的端口判定，
+    /// 把本该 fail-loud 的回环配置放过去。
+    #[test]
+    fn default_listen_port_shares_the_guard_default() {
+        assert_eq!(
+            DEFAULT_LISTEN_PORT, DEFAULT_PROXY_PORT,
+            "默认监听口与守卫默认端口不得分叉"
+        );
+        // 不写 `[server]` 时的实际默认值，以及默认端口的具体取值（钉住防误改）。
+        let config: Config = toml::from_str(
+            r#"
+[upstream]
+base_url = "http://127.0.0.1:11234/v1"
+api_key = "sk-test"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.port, DEFAULT_PROXY_PORT);
+        assert_eq!(config.server.port, 12333);
+    }
+
     #[test]
     fn unknown_field_is_rejected() {
         let error = toml::from_str::<Config>(

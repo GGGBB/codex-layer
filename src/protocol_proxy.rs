@@ -2947,6 +2947,9 @@ fn is_local_protocol_proxy_base_url_with(base_url: &str, effective_port: u16) ->
 mod image_proxy_tests {
     use super::UPSTREAM_IMAGE_HEADER_TIMEOUT;
     use super::is_local_protocol_proxy_base_url;
+    use super::is_local_protocol_proxy_base_url_with;
+    use super::resolve_proxy_port;
+    use super::{DEFAULT_PROXY_PORT, LEGACY_DEFAULT_PROXY_PORT};
     use std::time::Duration;
 
     #[test]
@@ -2954,8 +2957,27 @@ mod image_proxy_tests {
         assert_eq!(UPSTREAM_IMAGE_HEADER_TIMEOUT, Duration::from_secs(600));
     }
 
+    /// 新默认端口的常见回环形态均须被识别。
     #[test]
     fn local_protocol_proxy_detection_covers_common_loopback_forms() {
+        assert_eq!(DEFAULT_PROXY_PORT, 12333, "默认端口取值被误改");
+        for base_url in [
+            "http://127.0.0.1:12333",
+            "http://127.0.0.1:12333/",
+            "http://127.0.0.1:12333/v1",
+            "http://localhost:12333/v1/",
+            "http://[::1]:12333/v1",
+        ] {
+            assert!(is_local_protocol_proxy_base_url(base_url), "{base_url}");
+        }
+    }
+
+    /// 旧默认端口改号后仍须被识别：这是正向要求，不是遗留残留。改号前把图片上游
+    /// 配成旧默认的用户，改号后仍必须被拦下并明确报错，不得退化成一次真实的回环请求。
+    #[test]
+    fn legacy_default_port_is_still_recognized_after_renumbering() {
+        assert_eq!(LEGACY_DEFAULT_PROXY_PORT, 57321);
+        assert_ne!(LEGACY_DEFAULT_PROXY_PORT, DEFAULT_PROXY_PORT, "新旧默认不得相等");
         for base_url in [
             "http://127.0.0.1:57321",
             "http://127.0.0.1:57321/",
@@ -2963,18 +2985,65 @@ mod image_proxy_tests {
             "http://localhost:57321/v1/",
             "http://[::1]:57321/v1",
         ] {
-            assert!(is_local_protocol_proxy_base_url(base_url), "{base_url}");
-        }
-
-        for base_url in [
-            "https://127.0.0.1:57321/v1",
-            "http://127.0.0.1:57322/v1",
-            "http://api.example.test:57321/v1",
-            "not-a-url",
-        ] {
-            assert!(!is_local_protocol_proxy_base_url(base_url), "{base_url}");
+            assert!(
+                is_local_protocol_proxy_base_url(base_url),
+                "旧默认端口不得因改号而逃逸：{base_url}"
+            );
         }
     }
+
+    /// 纯函数形态：识别集 = {生效端口（含环境变量显式端口）, 新默认, 旧默认}；
+    /// 同时要求 https 、非回环 host 、其它端口不被误判为自身。
+    #[test]
+    fn guard_recognizes_effective_new_and_legacy_ports_but_nothing_else() {
+        // 环境变量显式端口这种形态：走真实端口解析链路取出生效端口，不依赖进程环境。
+        let explicit = resolve_proxy_port(Some("57341"), None);
+        assert_eq!(explicit.port, 57341);
+        assert!(!explicit.legacy_source);
+        assert!(is_local_protocol_proxy_base_url_with(
+            "http://127.0.0.1:57341/v1",
+            explicit.port,
+        ));
+        // 显式端口生效时，两个默认端口仍在识别集内（守卫只放宽识别范围）。
+        for base_url in [
+            "http://127.0.0.1:12333/v1",
+            "http://127.0.0.1:57321/v1",
+        ] {
+            assert!(
+                is_local_protocol_proxy_base_url_with(base_url, explicit.port),
+                "默认端口应始终在识别集内：{base_url}"
+            );
+        }
+        // 未设环境变量时的默认生效端口。
+        let default = resolve_proxy_port(None, None);
+        assert_eq!(default.port, DEFAULT_PROXY_PORT);
+        assert!(is_local_protocol_proxy_base_url_with(
+            "http://127.0.0.1:12333/v1",
+            default.port,
+        ));
+
+        for base_url in [
+            // scheme 不是 http
+            "https://127.0.0.1:12333/v1",
+            "https://127.0.0.1:57321/v1",
+            // host 不是回环形态
+            "http://api.example.test:12333/v1",
+            "http://api.example.test:57321/v1",
+            "http://10.0.0.5:12333/v1",
+            // 端口不在识别集内
+            "http://127.0.0.1:57322/v1",
+            "http://127.0.0.1:11234/v1",
+            "http://localhost:57342/v1",
+            // 不可解析
+            "not-a-url",
+        ] {
+            assert!(
+                !is_local_protocol_proxy_base_url_with(base_url, 57341),
+                "不应被误判为本地代理自身：{base_url}"
+            );
+        }
+    }
+
 }
 
 pub fn models_url(base_url: &str) -> String {
