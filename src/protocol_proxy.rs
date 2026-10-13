@@ -7672,7 +7672,8 @@ fn apply_chat_reasoning_options(result: &mut Value, body: &Value, model: &str, s
         ChatReasoningStyle::DeepSeek
         | ChatReasoningStyle::LowHigh
         | ChatReasoningStyle::Default
-            if supports_reasoning_effort(model) =>
+            if supports_reasoning_effort(model)
+                || (standard && model.to_ascii_lowercase().contains("gemini")) =>
         {
             result["reasoning_effort"] = json!(mapped);
         }
@@ -7799,6 +7800,8 @@ fn supports_reasoning_effort(model: &str) -> bool {
             .is_some_and(|ch| ch.is_ascii_digit() && ch >= '5')
         || infer_chat_reasoning_style(model) == ChatReasoningStyle::DeepSeek
         || infer_chat_reasoning_style(model) == ChatReasoningStyle::LowHigh
+        // #2464 已验证的网关模型；其它 Gemini 由供应商的标准协议开关显式启用。
+        || model.eq_ignore_ascii_case("gemini-3.8-flash")
 }
 
 fn is_openai_o_series(model: &str) -> bool {
@@ -7808,6 +7811,37 @@ fn is_openai_o_series(model: &str) -> bool {
             .as_bytes()
             .get(1)
             .is_some_and(|byte| byte.is_ascii_digit())
+}
+
+/// 与各家 Chat 网关的兼容性对拍（含 Gemini 系 `reasoning_effort` 转发闸门，issue #4）。
+///
+/// 移植来源：BigPizzaV3/CodexPlusPlus commit `943d814`（fix: harden Gemini reasoning
+/// and web search conversion）经 commit `5eaa66c` 收敛后的最终形态（上游 issue
+/// #2464）；断言逐字保留。参照侧该模块另有的 web_search 谎报对拍已随本仓库
+/// issue #3 的移植落地在 `native_search_guard_tests`，不重复搬运。
+#[cfg(test)]
+mod response_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn gemini_reasoning_conversion_respects_standard_protocol_opt_in() {
+        for standard in [false, true] {
+            let body = responses_to_chat_completions_with_options(json!({
+                "model":"gemini-3.8-flash", "input":"hi", "reasoning":{"effort":"high"}
+            }), standard, false).unwrap();
+            assert_eq!(body["reasoning_effort"], "high");
+        }
+        let request = json!({"model":"google/gemini-other", "input":"hi", "reasoning":{"effort":"high"}});
+        assert!(responses_to_chat_completions(request.clone()).unwrap().get("reasoning_effort").is_none());
+        assert_eq!(responses_to_chat_completions_with_options(request, true, false).unwrap()["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn gemini_models_receive_reasoning_effort() {
+        assert!(supports_reasoning_effort("gemini-3.8-flash"));
+        assert!(!supports_reasoning_effort("google/gemini-2.5-pro"));
+        assert!(!supports_reasoning_effort("glm-5.3"));
+    }
 }
 
 /// 供应商自定义请求头必须真正写进发往上游的请求（issue #1685）。
