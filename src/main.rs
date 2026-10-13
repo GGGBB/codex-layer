@@ -95,19 +95,19 @@ fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> 
     protocol_proxy::set_runtime_settings(settings.clone());
 
     // 稳定性监看端点（issue #19）：`[stability] enabled = false`（默认）时不注册，
-    // 该路径落进 fallback，与其它陌生非 `/v1` 路径一样 404。
+    // 未启用时由 handler 显式 404（与陌生路径同状态码，语义是「未启用」）。
     let stability_state = Arc::new(StabilityState {
+        enabled: config.stability.enabled,
         window_bytes: config.stability.window_bytes.max(1),
         show_prompt_snippets: config.stability.show_prompt_snippets,
     });
-    let app = Router::new().route("/healthz", any(healthz));
-    let app = if config.stability.enabled {
-        app.route("/stability", any(stability_endpoint))
-            .with_state(stability_state)
-    } else {
-        app
-    };
-    let app = app.fallback(any(dispatch));
+    // 路径必须在 fallback 之前显式注册（照 /healthz 的写法），否则会被当成
+    // OpenAI 请求处理。
+    let app = Router::new()
+        .route("/healthz", any(healthz))
+        .route("/stability", any(stability_endpoint))
+        .with_state(stability_state)
+        .fallback(any(dispatch));
 
     let host = config.server.host.clone();
     let port = config.server.port;
@@ -212,6 +212,7 @@ async fn healthz() -> Response {
 /// `/stability` 端点的装配层状态：聚合本体是 `stability.rs` 的纯函数，
 /// 这里只携带读取窗口与隐私开关（由 `[stability]` 配置注入）。
 struct StabilityState {
+    enabled: bool,
     window_bytes: u64,
     show_prompt_snippets: bool,
 }
@@ -219,6 +220,15 @@ struct StabilityState {
 /// `GET /stability`：惰性读诊断日志尾部窗口，返回稳定性快照（只读，issue #19）。
 /// 聚合是纯函数；时钟与文件窗口形态等装配层字段在这里补上。
 async fn stability_endpoint(State(state): State<Arc<StabilityState>>) -> Response {
+    if !state.enabled {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({
+                "status": "failed",
+                "message": "稳定性监看端点未启用：在配置 [stability] 中设 enabled = true",
+            }),
+        );
+    }
     let options = StabilityAggregateOptions {
         show_prompt_snippets: state.show_prompt_snippets,
         ..StabilityAggregateOptions::default()
@@ -476,12 +486,16 @@ fn proxy_error(path: &str, status: StatusCode, message: &str) -> Response {
 
 /// 转换层主动拒答的出口：闸门错误返回结构化的 Responses 错误（400 +
 /// 可行动文案），其余错误保持原有的 502 + 文本消息行为不变。
-fn proxy_conversion_error(path: &str, error: &anyhow::Error) -> Response {
+fn proxy_conversion_error(
+    path: &str,
+    error: &anyhow::Error,
+    request_id: Option<&str>,
+) -> Response {
     if let Some((status_code, body)) = upstream_conversion_error_response(error) {
         let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
         let _ = log_event(
             "codex_layer.conversion_rejected",
-            json!({ "path": path, "status": status_code, "error": error.to_string() }),
+            json!({ "path": path, "status": status_code, "error": error.to_string(), "requestId": request_id }),
         );
         tracing::warn!(target: "codex-layer", path = %path, error = %error, "转换层拒绝请求");
         return json_response(status, body);
@@ -553,14 +567,18 @@ async fn raw_upstream_proxy(
 }
 
 /// 上游错误的统一出口：错误信封按 Responses 协议整形，状态码沿用上游。
-async fn upstream_error(upstream: UpstreamProxyResponse, path: &str) -> anyhow::Result<Response> {
+async fn upstream_error(
+    upstream: UpstreamProxyResponse,
+    path: &str,
+    request_id: Option<&str>,
+) -> anyhow::Result<Response> {
     let status_code = upstream.status_code;
     let content_type = upstream.content_type.clone();
     let body = upstream.response.bytes().await?;
     let error = responses_error_from_upstream(status_code, &content_type, &body);
     let _ = log_event(
         "codex_layer.upstream_error",
-        json!({ "path": path, "statusCode": status_code, "message": error }),
+        json!({ "path": path, "statusCode": status_code, "message": error, "requestId": request_id }),
     );
     Ok(json_response(
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -574,7 +592,7 @@ async fn models_proxy(user_agent: Option<&str>) -> Response {
         Err(error) => return proxy_error("/v1/models", StatusCode::BAD_GATEWAY, &error.to_string()),
     };
     if !upstream.is_success() {
-        return match upstream_error(upstream, "/v1/models").await {
+        return match upstream_error(upstream, "/v1/models", None).await {
             Ok(response) => response,
             Err(error) => proxy_error("/v1/models", StatusCode::BAD_GATEWAY, &error.to_string()),
         };
@@ -609,6 +627,9 @@ async fn responses_proxy(
     path: &str,
 ) -> Response {
     let request_json: Option<Value> = serde_json::from_str(body).ok();
+    // 请求级关联 id（issue #19）：只进诊断日志，绝不进发往上游的请求体或请求头——
+    // 出站体每轮多一个随机字段 = 前缀每轮都变 = 钉定与深缓存全废。
+    let request_id = uuid::Uuid::new_v4().to_string();
     let model = request_json
         .as_ref()
         .and_then(|request| request.get("model"))
@@ -627,10 +648,10 @@ async fn responses_proxy(
     .await
     {
         Ok(upstream) => upstream,
-        Err(error) => return proxy_conversion_error(path, &error),
+        Err(error) => return proxy_conversion_error(path, &error, Some(&request_id)),
     };
     if !upstream.is_success() {
-        return match upstream_error(upstream, path).await {
+        return match upstream_error(upstream, path, Some(&request_id)).await {
             Ok(response) => response,
             Err(error) => proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string()),
         };
@@ -639,9 +660,14 @@ async fn responses_proxy(
     if upstream.is_stream {
         let _ = log_event(
             "codex_layer.stream_open",
-            json!({ "path": path, "wireApi": format!("{:?}", upstream.wire_api), "compaction": upstream.compaction }),
+            json!({ "path": path, "wireApi": format!("{:?}", upstream.wire_api), "compaction": upstream.compaction, "requestId": request_id.clone() }),
         );
-        return sse_response(stream_from_upstream(upstream, request_json, model));
+        return sse_response(stream_from_upstream(
+            upstream,
+            request_json,
+            model,
+            request_id,
+        ));
     }
 
     let upstream_body = match upstream.response.bytes().await {
@@ -710,7 +736,7 @@ async fn chat_completions_proxy(body: &str, user_agent: Option<&str>, path: &str
     let upstream = match open_chat_completions_proxy_request(body, user_agent).await
     {
         Ok(upstream) => upstream,
-        Err(error) => return proxy_conversion_error(path, &error),
+        Err(error) => return proxy_conversion_error(path, &error, None),
     };
     let status = StatusCode::from_u16(upstream.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = if upstream.content_type.is_empty() {
@@ -748,11 +774,14 @@ fn stream_from_upstream(
     upstream: UpstreamProxyResponse,
     request_json: Option<Value>,
     model: String,
+    request_id: String,
 ) -> impl futures_util::Stream<Item = StreamItem> + Send + 'static {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let wire_api = upstream.wire_api;
     let response = upstream.response;
     tokio::spawn(async move {
+        // 后面每个诊断事件只借用一次：影子绑定成 &str，json! 序列化时各自复制。
+        let request_id = request_id.as_str();
         let mut chunks = response.bytes_stream();
         if upstream.compaction {
             // 压缩轮无增量展示诉求：收齐上游文本后一次性下发单个 compaction 项。
@@ -772,6 +801,12 @@ fn stream_from_upstream(
             }
             let payload = converter.finish();
             let _ = tx.send(Ok(Bytes::from(payload)));
+            // 压缩轮也要有收口事件（issue #19）：没有收口的 stream_open 会永远卡在
+            // unpaired 里，单轮耗时分布统计也就无从谈起。
+            let _ = log_event(
+                "codex_layer.stream_completed",
+                json!({ "model": model.clone(), "requestId": request_id, "compaction": true }),
+            );
             return;
         }
         if wire_api == UpstreamWireApi::Responses {
@@ -798,7 +833,7 @@ fn stream_from_upstream(
                     if converter.has_failed() {
                         let _ = log_event(
                             "codex_layer.stream_failed",
-                            json!({ "reason": "上游返回了流式错误事件" }),
+                            json!({ "reason": "上游返回了流式错误事件", "requestId": request_id }),
                         );
                         return;
                     }
@@ -811,7 +846,7 @@ fn stream_from_upstream(
                     let _ = tx.send(Ok(Bytes::from(failed)));
                     let _ = log_event(
                         "codex_layer.stream_failed",
-                        json!({ "reason": error.to_string() }),
+                        json!({ "reason": error.to_string(), "requestId": request_id }),
                     );
                     return;
                 }
@@ -827,7 +862,7 @@ fn stream_from_upstream(
             let _ = tx.send(Ok(Bytes::from(failed)));
             let _ = log_event(
                 "codex_layer.stream_failed",
-                json!({ "reason": "上游缺少完成事件" }),
+                json!({ "reason": "上游缺少完成事件", "requestId": request_id }),
             );
             return;
         }
@@ -841,10 +876,13 @@ fn stream_from_upstream(
         if terminal_failed {
             let _ = log_event(
                 "codex_layer.stream_failed",
-                json!({ "reason": "转换层以 response.failed 终态收口" }),
+                json!({ "reason": "转换层以 response.failed 终态收口", "requestId": request_id }),
             );
         } else {
-            let _ = log_event("codex_layer.stream_completed", json!({ "model": model }));
+            let _ = log_event(
+                "codex_layer.stream_completed",
+                json!({ "model": model, "requestId": request_id }),
+            );
         }
     });
     futures_util::stream::unfold(rx, |mut rx| async move {
