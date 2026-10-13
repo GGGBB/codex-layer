@@ -6767,3 +6767,240 @@ fn stabilizer_keeps_chunk_body_whitespace_verbatim() {
         "块体首尾空白必须原样透传: {content:?}"
     );
 }
+
+/// 原生 Responses 透传支路的端到端守卫验证：起真实二进制 + 真实 SSE 上游，
+/// 断言装配真的生效，并断言守卫对透传字节零改动。
+/// 上游一律临时端口 + 临时配置，绝不碰本机常驻中继的端口与配置。
+mod native_responses_stream_guard_e2e {
+    use codex_layer::protocol_proxy::native_stream_failure_frame;
+    use std::io::{Read, Write};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// 子进程守卫：断言失败也不留常驻二进制。
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    struct Harness {
+        // 名字叫 _dir 也要留字段：它一掉，临时目录连同日志配置就被清了。
+        _dir: tempfile::TempDir,
+        proxy_port: u16,
+        _child: ChildGuard,
+    }
+
+    fn reserve_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// 请求头结束位置（含空行）。
+    fn header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n").map(|position| position + 4)
+    }
+
+    fn content_length(buffer: &[u8]) -> usize {
+        let head = String::from_utf8_lossy(buffer).to_lowercase();
+        head.lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.trim() == "content-length")
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// 起一个只回一轮 SSE 的裸 TCP 上游：收完请求后原样下发 `sse`，随即关闭连接。
+    /// 「关闭」就是 EOF——上游没发终止事件时，客户端看到的正是半途而废。
+    fn spawn_sse_upstream(sse: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // 先把请求读干净再回应：提前关连接会让代理踩 broken pipe，
+            // 那就变成「请求没发出去」而不是「流被截断」，测的就不是守卫了。
+            let mut received: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let started = Instant::now();
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(size) => {
+                        received.extend_from_slice(&chunk[..size]);
+                        if let Some(end) = header_end(&received)
+                            && received.len() >= end + content_length(&received)
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "测试上游未能读完代理转来的请求"
+                );
+            }
+            let head = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "content-type: text/event-stream\r\n",
+                "cache-control: no-cache\r\n",
+                "connection: close\r\n",
+                "\r\n",
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(sse.as_bytes());
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        port
+    }
+
+    /// 把代理指向上面那个临时 SSE 上游，方言固定 responses（原生透传支路）。
+    async fn spawn_proxy(upstream_port: u16) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy_port = reserve_port();
+        let config_path = dir.path().join("codex-layer.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[server]
+host = "127.0.0.1"
+port = {proxy_port}
+
+[upstream]
+base_url = "http://127.0.0.1:{upstream_port}/v1"
+api_key = "sk-e2e-test"
+protocol = "responses"
+
+[log]
+path = "{}"
+"#,
+                dir.path().join("codex-layer.log").display()
+            )
+        )
+        .unwrap();
+
+        let child = Command::new(env!("CARGO_BIN_EXE_codex-layer"))
+            .env("CODEX_LAYER_CONFIG", &config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = client
+                .get(format!("http://127.0.0.1:{proxy_port}/healthz"))
+                .send()
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false);
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "codex-layer 未在 5 秒内就绪"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        Harness {
+            _dir: dir,
+            proxy_port,
+            _child: ChildGuard(child),
+        }
+    }
+
+    async fn post_streaming_request(port: u16) -> String {
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test-model","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"你好"}]}]}"#.to_string())
+            .send()
+            .await
+            .expect("代理必须有响应");
+        assert!(
+            response.status().is_success(),
+            "守卫不得把透传改成错误状态码：{}",
+            response.status()
+        );
+        let bytes = response.bytes().await.expect("读取事件流失败");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    const COMPLETED_STREAM: &str = concat!(
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+    );
+
+    const TRUNCATED_STREAM: &str = concat!(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\"}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"半句\"}\n\n",
+    );
+
+    const SELF_REPORTED_FAILED_STREAM: &str = concat!(
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_3\",\"status\":\"failed\",\"error\":{\"message\":\"上游自报失败\"}}}\n\n",
+    );
+
+    /// 正常完成的流：客户端收到的字节必须与上游字节逐字节相同，
+    /// 这是「旁路观察零改动」的硬断言。
+    #[tokio::test]
+    async fn completed_stream_is_forwarded_byte_for_byte() {
+        let harness = spawn_proxy(spawn_sse_upstream(COMPLETED_STREAM)).await;
+        let body = post_streaming_request(harness.proxy_port).await;
+        assert_eq!(
+            body, COMPLETED_STREAM,
+            "观察到完成事件时不得多一个字节、也不少一个字节"
+        );
+    }
+
+    /// 上游在完成事件前 EOF：装配必须真的生效——上游原字节之后
+    /// 紧跟一帧显式 `response.failed`，且不补 `[DONE]`。
+    #[tokio::test]
+    async fn eof_without_terminal_event_appends_failure_frame() {
+        let harness = spawn_proxy(spawn_sse_upstream(TRUNCATED_STREAM)).await;
+        let body = post_streaming_request(harness.proxy_port).await;
+        let expected = format!(
+            "{TRUNCATED_STREAM}{}",
+            native_stream_failure_frame(
+                "原生 Responses 上游在完成事件前结束了响应流",
+                "stream_incomplete",
+            )
+        );
+        assert_eq!(
+            body, expected,
+            "截断流必须在原字节后补显式失败帧"
+        );
+        assert!(body.contains("stream_incomplete"));
+        assert!(
+            !body.contains("[DONE]"),
+            "失败收口不得补 DONE，否则客户端会当成正常结束"
+        );
+    }
+
+    /// 上游自己已经宣告过终止失败：客户端手里已有显式信号，
+    /// 本层不得再补一帧重复噪音。
+    #[tokio::test]
+    async fn self_reported_failure_is_not_appended_twice() {
+        let harness = spawn_proxy(spawn_sse_upstream(SELF_REPORTED_FAILED_STREAM)).await;
+        let body = post_streaming_request(harness.proxy_port).await;
+        assert_eq!(
+            body, SELF_REPORTED_FAILED_STREAM,
+            "上游自报失败的流不得被本层再补一帧"
+        );
+    }
+}

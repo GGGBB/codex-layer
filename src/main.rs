@@ -1026,6 +1026,68 @@ fn sse_response(stream: impl futures_util::Stream<Item = StreamItem> + Send + 's
         })
 }
 
+/// 收口函数的单元对拍：补帧与否只看「上游有没有自报终止失败」，
+/// 而「这一轮算不算失败」只看守卫收口结果，两者必须分开成立。
+#[cfg(test)]
+mod native_stream_guard_tests {
+    use super::{Bytes, StreamItem, close_native_responses_stream, native_stream_failure_frame};
+    use codex_layer::protocol_proxy::NativeResponsesSseObserver;
+
+    fn observer_with(payload: &str) -> NativeResponsesSseObserver {
+        let mut observer = NativeResponsesSseObserver::default();
+        observer.push_bytes(payload.as_bytes());
+        observer
+    }
+
+    /// 未证明成功且上游没自报失败：必须补且只补一帧，内容就是失败收口帧。
+    #[test]
+    fn unproven_stream_gets_exactly_one_failure_frame() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
+        let observer = observer_with(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"半句\"}\n\n",
+        );
+        let reason = close_native_responses_stream(observer, "stream_incomplete", &tx)
+            .expect("无终止事件的流不得算成功");
+        let item = rx.try_recv().expect("必须补一帧").expect("补帧不是错误项");
+        assert_eq!(
+            item,
+            Bytes::from(native_stream_failure_frame(&reason, "stream_incomplete")),
+            "补的帧必须就是失败收口帧，错误 type 沿用调用方口径"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "只能补一帧，多补会被客户端当成重复终态"
+        );
+    }
+
+    /// 上游自报 `response.failed`：仍算失败（要返回原因），但不补帧。
+    #[test]
+    fn self_reported_failure_reports_reason_without_a_frame() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
+        let observer = observer_with("data: {\"type\":\"response.failed\"}\n\n");
+        let reason = close_native_responses_stream(observer, "stream_incomplete", &tx)
+            .expect("上游自报失败也是失败");
+        assert!(reason.contains("response.failed"));
+        assert!(
+            rx.try_recv().is_err(),
+            "客户端已有显式终止信号，再补只是重复噪音"
+        );
+    }
+
+    /// 观察到完成事件：既不补帧也不报失败。
+    #[test]
+    fn completed_stream_appends_nothing_and_reports_no_failure() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
+        let observer = observer_with(
+            "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n",
+        );
+        assert!(
+            close_native_responses_stream(observer, "stream_incomplete", &tx).is_none()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+}
+
 #[cfg(test)]
 mod stability_endpoint_tests {
     use super::{
