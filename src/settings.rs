@@ -365,7 +365,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_keeps_codex_plus_plus_identity() {
+    fn default_profile_keeps_default_id_and_disabled_switches() {
         // 默认 profile 的 id 固定为 default，
         // 判定「设置退化成单条默认上游」依赖它。
         let profile = RelayProfile::default();
@@ -374,8 +374,10 @@ mod tests {
         assert!(!profile.uses_no_auth());
     }
 
+    /// 钉住 camelCase 形态的设置文件仍可解析：这是旧部署的向后兼容入口，
+    /// 不是历史残留。字段名契约一旦改动，旧部署的供应商配置会直接读不出来。
     #[test]
-    fn codex_plus_plus_settings_json_is_compatible() {
+    fn camel_case_settings_json_still_parses() {
         let settings: BackendSettings = serde_json::from_value(serde_json::json!({
             "relayProfiles": [{
                 "id": "chat",
