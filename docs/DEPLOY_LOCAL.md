@@ -60,6 +60,15 @@ plist 里 ProgramArguments 为 `<二进制> serve --config <绝对路径>`，
 EnvironmentVariables 带 `CODEX_LAYER_CONFIG`；KeepAlive + RunAtLoad，
 崩溃自动拉起、登录自启。
 
+## 监听端口覆盖
+
+默认监听 57321。需要换端口时设环境变量 `CODEX_LAYER_PROXY_PORT`；历史变量名
+`CODEX_PLUS_PROTOCOL_PROXY_PORT` 仍会被读取，但未设新名时才生效；两者同时设为不同
+值时以新名为准。旧名属弃用入口：只要它参与生效，诊断日志会写一条
+`codex_layer.deprecated_env`（每进程仅一次）提醒改名。不设任何端口环境变量时，
+端口就是默认值 57321，行为与改名前一致。launchd 常驻改端口要写进 plist 的
+`EnvironmentVariables`，改完 `codex-layer restart` 生效。
+
 ## 日志事件排查
 
 `codex-layer status` 报「未注册」→ `launchctl print` 的 stderr 核对 Label/域；
@@ -79,6 +88,7 @@ tail -f ~/.codex-layer/codex-layer.log | rg prefix_stabilizer
 | `prefix_stabilizer_compaction_appended` | 压缩轮 tools 回填发生 |
 | `prefix_stabilizer_unpaired_notice_stripped` | 孤立图片占位残片被移除 |
 | `codex_layer.started` / `conversion_rejected` | 常驻启动 / 转换层主动拒答（400 闸门） |
+| `codex_layer.deprecated_env` | 端口覆盖仍在用历史变量名，附新名与生效端口 |
 
 ## 卸载 / 回滚
 
