@@ -1,8 +1,8 @@
 # 最小 CI：cargo test + 冒烟脚本。job 名是 main ruleset 的必需检查上下文，不得改名。
 #
-# 不跑 `cargo fmt --check`：AGENTS.md 明确禁止全仓格式化（移植代码须与来源
-# PR 保持逐行 diff 可比性），本地实测 `cargo fmt --check` 有 115 处差异，
-# 放进 CI 会红。新写文件按默认风格即可。
+# 不跑 `cargo fmt --check`：全仓格式化被仓库纪律禁止（移植代码须与上游
+# 保持逐行 diff 可比性），本地实测有 115 处差异，放进 CI 会红。
+# 新写文件按默认风格即可。
 # 不跑 `cargo clippy -- -D warnings`：同理无法保证现状通过，保持 CI 全绿起步。
 name: CI
 
