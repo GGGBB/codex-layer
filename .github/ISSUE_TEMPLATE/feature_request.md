@@ -8,7 +8,7 @@ labels: ["type/feature"]
 ## 背景与动机
 
 <!-- 为什么需要这个能力；若是与上游参照的语义差距，写明参照实现的位置
-     （BigPizzaV3/CodexPlusPlus 参照树 personal/stabilizer-agent-payload）。 -->
+     （参照实现的既有语义，见 `docs/` 内部说明与代码文件头注释）。 -->
 
 ## 期望行为
 
@@ -17,7 +17,7 @@ labels: ["type/feature"]
 ## 不做清单（边界）
 
 <!-- 明确本请求不包含什么；CodexPlusPlus 专有形态（多渠道轮换、官方登录、
-     聚合供应商、VLM 三态等）默认不进入本项目。 -->
+     聚合供应商、VLM 描述管线等多渠道产品形态）默认不进入本项目。 -->
 
 ## 涉及模块（可选）
 
