@@ -134,7 +134,8 @@ env_key = "CODEX_LAYER_KEY"
 （出站体每轮多一个随机字段等于前缀每轮都变，深缓存全废），集成测试
 `tests/stability_endpoint.rs` 钉住了这条红线。
 
-开启 `[stability] enabled = true` 后新增只读端点 `GET /stability`：惰性读诊断
+只读端点 `GET /stability`（路由始终注册在 `fallback` 之前；`[stability]`
+的 `enabled = true` 才返回快照）：惰性读诊断
 日志尾部窗口（默认最近 8MB），返回聚合快照——轮次计数、baseline/divergence
 及比率、钉定器生效次数、按 requestId 配对的单轮耗时 p50/p95/max（配不上的
 显式计入 `unpaired`，不静默丢）。隐私：`oldSnip`/`newSnip` 可能含用户提示词，
