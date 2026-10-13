@@ -135,11 +135,11 @@ dead-code warning，而不同命令编译的目标不同，看到的条数天然
 
 - `content_starts_signature` never used —— `src/compaction_align.rs:176`
 - `first_text_of` never used —— `src/compaction_align.rs:207`
-- `message_has_image` never used —— `src/protocol_proxy.rs:5048`
+- `message_has_image` never used —— `src/protocol_proxy.rs:4696`
 
 只有带测试 / example 编译才多出的 4 条：
 
-- `OPEN_PAGE_BLOCK` never used —— `src/protocol_proxy.rs:8610`（属于 lib 的
+- `OPEN_PAGE_BLOCK` never used —— `src/protocol_proxy.rs:8258`（属于 lib 的
   `#[cfg(test)]` 测试模块，所以 `cargo build` 看不到它）
 - `fnv` never used —— `examples/prefix_replay.rs:12`
 - `fam_off` unused variable —— `examples/prefix_replay.rs:137`
