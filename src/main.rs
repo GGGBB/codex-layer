@@ -900,8 +900,8 @@ fn stream_from_upstream(
                                 "原生 Responses 透传流在完成事件之后发生读取错误：{error_text}"
                             ),
                         };
-                        let _ = log_event(
-                            "codex_layer.stream_failed",
+                        log_event(
+                            events::layer::STREAM_FAILED,
                             json!({ "reason": reason, "requestId": request_id }),
                         );
                         let item: StreamItem =
@@ -915,14 +915,14 @@ fn stream_from_upstream(
             // 没观察到完成事件就一律补失败帧（与 Chat 泵的收口口径一致）。
             match close_native_responses_stream(observer, "stream_incomplete", &tx) {
                 Some(reason) => {
-                    let _ = log_event(
-                        "codex_layer.stream_failed",
+                    log_event(
+                        events::layer::STREAM_FAILED,
                         json!({ "reason": reason, "requestId": request_id }),
                     );
                 }
                 None => {
-                    let _ = log_event(
-                        "codex_layer.stream_completed",
+                    log_event(
+                        events::layer::STREAM_COMPLETED,
                         json!({ "model": model, "requestId": request_id }),
                     );
                 }
