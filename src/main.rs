@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 use codex_layer::config::Config;
 use codex_layer::cli::{self, Command};
 use codex_layer::diagnostic_log;
+use codex_layer::diagnostic_log::events;
 use codex_layer::http_client;
 use codex_layer::protocol_proxy::{
     self, ChatSseToResponsesConverter, CompactionSseConverter, ProxySessionHeaders, UpstreamWireApi,
@@ -127,8 +128,8 @@ fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> 
             stabilize_prompt_prefix = active.stabilize_prompt_prefix,
             "codex-layer 已启动；把 codex 的 base_url 指到这里"
         );
-        let _ = diagnostic_log::append_diagnostic_log(
-            "codex_layer.started",
+        let _ = log_event(
+            events::layer::STARTED,
             json!({
                 "listen": format!("{host}:{port}"),
                 "config": config_path.display().to_string(),
@@ -239,7 +240,7 @@ async fn stability_endpoint(
         Ok(bytes) => bytes,
         Err(message) => {
             let _ = log_event(
-                "codex_layer.stability_bad_request",
+                events::layer::STABILITY_BAD_REQUEST,
                 json!({ "message": message }),
             );
             return json_response(
@@ -258,7 +259,7 @@ async fn stability_endpoint(
         Ok(Ok(tail)) => tail,
         Ok(Err(error)) => {
             let _ = log_event(
-                "codex_layer.stability_read_failed",
+                events::layer::STABILITY_READ_FAILED,
                 json!({ "error": error.to_string() }),
             );
             return json_response(
@@ -405,7 +406,7 @@ async fn dispatch(request: Request) -> Response {
     if method == Method::GET && is_responses_proxy_path(&path) {
         // codex 会试探 WebSocket 传输；本层只支持 HTTP。
         let _ = log_event(
-            "codex_layer.responses_upgrade_required",
+            events::layer::RESPONSES_UPGRADE_REQUIRED,
             json!({ "path": path }),
         );
         return json_response(
@@ -528,13 +529,14 @@ fn decode_request_body(body: &[u8], content_encoding: Option<&str>) -> anyhow::R
     String::from_utf8(decoded).map_err(|error| anyhow::anyhow!("请求体不是 UTF-8：{error}"))
 }
 
-fn log_event(event: &str, detail: Value) -> std::io::Result<()> {
-    diagnostic_log::append_diagnostic_log(event, detail)
+fn log_event(event: &'static str, detail: Value) -> std::io::Result<()> {
+    // 纯转发：写入能力与失败口径都在 lib 统一入口（#31），bin 侧不留独立实现。
+    diagnostic_log::log_event(event, detail)
 }
 
 fn proxy_error(path: &str, status: StatusCode, message: &str) -> Response {
     let _ = log_event(
-        "codex_layer.proxy_failed",
+        events::layer::PROXY_FAILED,
         json!({ "path": path, "status": status.as_u16(), "error": message }),
     );
     tracing::warn!(target: "codex-layer", path = %path, error = %message, "请求失败");
@@ -554,7 +556,7 @@ fn proxy_conversion_error(
     if let Some((status_code, body)) = upstream_conversion_error_response(error) {
         let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
         let _ = log_event(
-            "codex_layer.conversion_rejected",
+            events::layer::CONVERSION_REJECTED,
             json!({ "path": path, "status": status_code, "error": error.to_string(), "requestId": request_id }),
         );
         tracing::warn!(target: "codex-layer", path = %path, error = %error, "转换层拒绝请求");
@@ -599,7 +601,7 @@ async fn raw_upstream_proxy(
         Ok(upstream) => upstream,
         Err(error) => {
             let _ = log_event(
-                "codex_layer.proxy_failed",
+                events::layer::PROXY_FAILED,
                 json!({ "kind": kind, "path": path, "error": error.to_string() }),
             );
             return json_response(StatusCode::BAD_GATEWAY, json!({"status": "failed", "message": error.to_string()}));
@@ -612,7 +614,7 @@ async fn raw_upstream_proxy(
         upstream.content_type.clone()
     };
     let _ = log_event(
-        "codex_layer.upstream_response",
+        events::layer::UPSTREAM_RESPONSE,
         json!({ "kind": kind, "path": path, "statusCode": upstream.status_code }),
     );
     match upstream.response.bytes().await {
@@ -637,7 +639,7 @@ async fn upstream_error(
     let body = upstream.response.bytes().await?;
     let error = responses_error_from_upstream(status_code, &content_type, &body);
     let _ = log_event(
-        "codex_layer.upstream_error",
+        events::layer::UPSTREAM_ERROR,
         json!({ "path": path, "statusCode": status_code, "message": error, "requestId": request_id }),
     );
     Ok(json_response(
@@ -719,7 +721,7 @@ async fn responses_proxy(
 
     if upstream.is_stream {
         let _ = log_event(
-            "codex_layer.stream_open",
+            events::layer::STREAM_OPEN,
             json!({ "path": path, "wireApi": format!("{:?}", upstream.wire_api), "compaction": upstream.compaction, "requestId": request_id.clone() }),
         );
         return sse_response(stream_from_upstream(
@@ -866,7 +868,7 @@ fn stream_from_upstream(
             // 口径：收口时间记在 payload 下发之时，不含客户端读流耗时——
             // 压缩轮耗时系统性偏小是有意的服务端侧口径，便于跨轮对比（PR #24 review）。
             let _ = log_event(
-                "codex_layer.stream_completed",
+                events::layer::STREAM_COMPLETED,
                 json!({ "model": model.clone(), "requestId": request_id, "compaction": true }),
             );
             return;
@@ -894,7 +896,7 @@ fn stream_from_upstream(
                     }
                     if converter.has_failed() {
                         let _ = log_event(
-                            "codex_layer.stream_failed",
+                            events::layer::STREAM_FAILED,
                             json!({ "reason": "上游返回了流式错误事件", "requestId": request_id }),
                         );
                         return;
@@ -907,7 +909,7 @@ fn stream_from_upstream(
                     );
                     let _ = tx.send(Ok(Bytes::from(failed)));
                     let _ = log_event(
-                        "codex_layer.stream_failed",
+                        events::layer::STREAM_FAILED,
                         json!({ "reason": error.to_string(), "requestId": request_id }),
                     );
                     return;
@@ -923,7 +925,7 @@ fn stream_from_upstream(
             );
             let _ = tx.send(Ok(Bytes::from(failed)));
             let _ = log_event(
-                "codex_layer.stream_failed",
+                events::layer::STREAM_FAILED,
                 json!({ "reason": "上游缺少完成事件", "requestId": request_id }),
             );
             return;
@@ -937,12 +939,12 @@ fn stream_from_upstream(
         // response.failed 时，诊断记 stream_failed。
         if terminal_failed {
             let _ = log_event(
-                "codex_layer.stream_failed",
+                events::layer::STREAM_FAILED,
                 json!({ "reason": "转换层以 response.failed 终态收口", "requestId": request_id }),
             );
         } else {
             let _ = log_event(
-                "codex_layer.stream_completed",
+                events::layer::STREAM_COMPLETED,
                 json!({ "model": model, "requestId": request_id }),
             );
         }
