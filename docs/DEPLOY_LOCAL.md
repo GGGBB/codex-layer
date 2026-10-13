@@ -62,12 +62,18 @@ EnvironmentVariables 带 `CODEX_LAYER_CONFIG`；KeepAlive + RunAtLoad，
 
 ## 监听端口覆盖
 
-默认监听 57321。需要换端口时设环境变量 `CODEX_LAYER_PROXY_PORT`；历史变量名
+默认监听 `127.0.0.1:12333`。换端口只改配置的 `[server] port`：实际监听口**只来自配置**。
+launchd 常驻时 plist 里**不含端口**——`ProgramArguments` 只有
+`serve --config <绝对路径>`，`EnvironmentVariables` 只带 `CODEX_LAYER_CONFIG` 等，
+所以改完配置直接 `codex-layer restart` 就生效，不必也不该去 plist 里塞端口。
+
+环境变量 `CODEX_LAYER_PROXY_PORT` **不改变监听端口**，它只设定「回环守卫」认定为本代理
+的端口：当图片上游 base_url 被误配成指回本地代理自身时，守卫据此直接拒答并明确报错，
+而不是发出一次真实的回环请求。守卫的识别集除了这个生效端口，还包含新旧默认端口，
+因此改号前把上游配成旧默认 57321 的用户仍会被拦下。历史变量名
 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 仍会被读取，但未设新名时才生效；两者同时设为不同
 值时以新名为准。旧名属弃用入口：只要它参与生效，诊断日志会写一条
-`codex_layer.deprecated_env`（每进程仅一次）提醒改名。不设任何端口环境变量时，
-端口就是默认值 57321，行为与改名前一致。launchd 常驻改端口要写进 plist 的
-`EnvironmentVariables`，改完 `codex-layer restart` 生效。
+`codex_layer.deprecated_env`（每进程仅一次）提醒改名。
 
 ## 日志事件排查
 
@@ -100,6 +106,8 @@ rm ~/.local/bin/codex-layer                        # 二进制按安装 PREFIX �
 
 ## 与本机既有服务的隔离
 
-本机存在用户自持常驻 `com.user.codex-layer`（监听 57331）：包命令的默认 Label
-是 `com.codex-layer.proxy`（默认监听 57321），两者互不占用。端到端验证一律
-用临时 Label + 临时端口（如 `com.codex-layer.e2e-*` + 5734x），验完 bootout。
+包命令的默认 Label 是 `com.codex-layer.proxy`，默认监听 12333；历史上用过的两个端口
+——旧默认 57321 与用户自持常驻曾占的 57331——都不在新默认的占用范围内，因此本机
+已有的自持实例不会与它抢端口。同机还要跑第二个实例时，必须换 Label 并在配置里显式
+写 `[server] port`。端到端验证一律用临时 Label + 临时端口（如
+`com.codex-layer.e2e-*` + 5734x），验完 bootout。
