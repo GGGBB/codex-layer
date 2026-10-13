@@ -6411,6 +6411,90 @@ fn web_search_call_history_idempotent_second_conversion_stable() {
     assert_eq!(first, second, "转换层输出必须确定");
 }
 
+#[test]
+fn chat_response_with_forged_native_search_fails_whole_response() {
+    // 上游把原生 web_search 当 function tool「调用」（实际没执行搜索）：整响应必须
+    // failed + invalid_upstream_tool_call，不得谎报 completed（issue #3）。
+    let response = chat_completion_to_response_with_request(
+        json!({"id": "chatcmpl_fake_search", "model": "gpt-5.4", "choices": [{
+            "message": {"tool_calls": [{
+                "id": "call_fake",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": "{\"input\":\"Codex 版本\"}"}
+            }]},
+            "finish_reason": "tool_calls"
+        }]}),
+        &json!({ "model": "gpt-5.4", "tools": [{ "type": "web_search" }] }),
+    )
+    .unwrap();
+
+    assert_eq!(response["status"], "failed");
+    assert_eq!(response["error"]["type"], "invalid_upstream_tool_call");
+    assert_eq!(response["output"][0]["type"], "web_search_call");
+    assert_eq!(response["output"][0]["status"], "failed");
+    // 各家网关常用的 input 键要能映射成 action 目标，不得退成空 action
+    assert_eq!(response["output"][0]["action"]["query"], "Codex 版本");
+}
+
+#[test]
+fn chat_sse_with_forged_native_search_ends_with_response_failed() {
+    let converted = chat_sse_to_responses_sse_with_request(
+        r#"data: {"id":"chatcmpl_fake_search","model":"gpt-5.4","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_fake","type":"function","function":{"name":"web_search","arguments":"{\"input\":"}}]}}]}
+
+data: {"id":"chatcmpl_fake_search","model":"gpt-5.4","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Codex-version\"}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#,
+        &json!({ "model": "gpt-5.4", "tools": [{ "type": "web_search" }] }),
+    );
+
+    assert!(
+        converted.contains("event: response.failed"),
+        "流式路径必须收口为 response.failed：{converted}"
+    );
+    assert!(converted.contains("invalid_upstream_tool_call"));
+    assert!(converted.contains("\"type\":\"web_search_call\""));
+    assert!(converted.contains("\"status\":\"failed\""));
+    assert!(
+        !converted.contains("event: response.completed"),
+        "谎报 completed 必须消失：{converted}"
+    );
+}
+
+#[test]
+fn chat_request_strips_native_search_and_rejects_forced_native_search() {
+    // 顶层原生搜索声明必须被剥掉，客户端执行的同名 function 工具原样保留。
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-5.4",
+        "input": "hi",
+        "tools": [
+            { "type": "web_search" },
+            { "type": "function", "name": "web_search", "parameters": { "type": "object" } }
+        ]
+    }))
+    .unwrap();
+    let names: Vec<_> = converted
+        .pointer("/tools")
+        .and_then(Value::as_array)
+        .expect("tools 必须存在")
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["web_search"], "只允许留下客户端执行的那一项");
+    // 强制原生搜索：结构化 400，不退 502，也不静默改成无工具请求。
+    let error = responses_to_chat_completions(json!({
+        "model": "gpt-5.4",
+        "input": "hi",
+        "tools": [{ "type": "web_search" }],
+        "tool_choice": { "type": "web_search" }
+    }))
+    .unwrap_err();
+    let (status, body) = upstream_conversion_error_response(&error).expect("闸门给状态码");
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "unsupported_native_web_search");
+}
+
 // —— 轮次标记（串线根治：上下文重建时旧问题被回放成最新指令）——
 
 fn current_turn_body(last_text: &str) -> Value {

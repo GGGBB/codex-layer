@@ -3660,6 +3660,19 @@ fn append_responses_item(
                 Some(sources) if !sources.is_null() => {
                     serde_json::to_string(sources).unwrap_or_else(|_| format!("Web search ({status}) results: {sources}"))
                 }
+                // 被本层守卫链标为 failed 的原生搜索项根本没搜过（issue #3）：
+                // 回放时不得沿用「was performed / do not repeat」，那是反向谎报，
+                // 会让模型放弃本该重做的检索；空 action 额外点明连查询词都没有。
+                _ if status == "failed" => {
+                    let detail = if web_search_action_has_target(&action) {
+                        "no results were produced"
+                    } else {
+                        "not even a query was recorded"
+                    };
+                    format!(
+                        "Web search ({status}): this layer never executed a server-side search, and {detail}. Do not treat it as completed; use a client-side search tool or continue without searching."
+                    )
+                }
                 _ => format!(
                     "Web search ({status}) was performed; its query and results were not preserved in this history. Do not repeat it; continue with the available context."
                 ),
@@ -6622,13 +6635,16 @@ fn web_search_item_id(call_id: &str) -> String {
 ///
 /// 客户端 rollout 里的形态是 `{"type":"search","query":…,"queries":[…]}` 或
 /// `{"type":"open_page","url":…}`。上游各家字段名不一（query / queries / url），
-/// 这里按存在性择一，都取不到就退化成 `{"type":"search"}`，让客户端自己判空。
+/// 这里按存在性择一，都取不到就退化成 `{"type":"search"}`（空 action，由
+/// `web_search_action_has_target` 判空）。各家网关最常用的 `input` 键也要认，
+/// 只认 `query` 会把有内容的调用错读成空 action。
 fn web_search_action_from_arguments(arguments: &str) -> Value {
     let parsed = responses_arguments_to_chat_parse(arguments);
     let query = parsed
         .get("query")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty());
+        .or_else(|| parsed.get("input").and_then(Value::as_str))
+        .filter(|value| !value.trim().is_empty());
     let url = parsed
         .get("url")
         .and_then(Value::as_str)
@@ -6662,6 +6678,32 @@ fn web_search_action_from_arguments(arguments: &str) -> Value {
         }
         (None, None) => json!({ "type": "search" }),
     }
+}
+
+/// action 里是否真的带了可追溯的检索目标（query / queries / url）。
+/// 客户端剩下只有 `{"type":"search"}` 时，回放文案要说「没留下查询词」，
+/// 不能含糊地讲成「搜过了、结果没存下来」。
+///
+/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`。
+fn web_search_action_has_target(action: &Value) -> bool {
+    action
+        .get("query")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+        || action
+            .get("queries")
+            .and_then(Value::as_array)
+            .is_some_and(|queries| {
+                queries.iter().any(|query| {
+                    query
+                        .as_str()
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
+            })
+        || action
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
 }
 
 /// 是否为「本层产出的原生搜索项」。Chat 路由下的 `web_search_call` 只可能来自
@@ -8092,5 +8134,70 @@ mod native_search_guard_tests {
             .as_str()
             .unwrap_or_default()
             .contains("客户端搜索工具"));
+    }
+
+    /// 各家网关最常用的 `input` 键必须能映射成 action 目标；只留
+    /// `{"type":"search"}` 的空 action 要能被判出来。
+    #[test]
+    fn input_key_maps_to_action_target_and_empty_action_is_detected() {
+        let from_input = web_search_action_from_arguments(r#"{"input":"Codex 版本"}"#);
+        assert_eq!(from_input["query"], json!("Codex 版本"));
+        assert!(web_search_action_has_target(&from_input));
+        assert!(!web_search_action_has_target(
+            &web_search_action_from_arguments(r#"{"input":"   "}"#)
+        ), "只空白的 input 仍是空 action");
+        assert!(!web_search_action_has_target(&json!({ "type": "search" })));
+        assert!(web_search_action_has_target(&json!({
+            "type": "search",
+            "queries": ["Codex 版本"]
+        })));
+        assert!(web_search_action_has_target(&json!({
+            "type": "open_page",
+            "url": "https://example.com/a"
+        })));
+    }
+
+    /// 被本层标为 failed 的历史项回放时不得声称「已执行搜索、不要重复」：
+    /// 那是反向谎报，会把模型劝退，用户请求静默落空。
+    #[test]
+    fn failed_native_search_history_replay_does_not_claim_a_search_ran() {
+        for (action, expected) in [
+            (json!({ "type": "search" }), "not even a query was recorded"),
+            (
+                json!({ "type": "search", "query": "Codex 版本" }),
+                "no results were produced",
+            ),
+        ] {
+            let out = responses_to_chat_completions(json!({
+                "model": "gpt-5.4",
+                "input": [
+                    { "role": "user", "content": "帮我查一下最新版本" },
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_call_failed",
+                        "status": "failed",
+                        "action": action.clone()
+                    }
+                ]
+            }))
+            .unwrap();
+            let messages = out["messages"].as_array().unwrap();
+            let tool_msg = messages
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .expect("failed 项也要留下回放痕迹，不得整项消失");
+            let text = tool_msg["content"].as_str().unwrap_or_default();
+            assert!(text.contains("never executed"), "必须如实说明没执行搜索：{text}");
+            assert!(text.contains(expected), "判空文案不符：{text}");
+            assert!(!text.contains("was performed"), "不得反向谎报：{text}");
+            assert!(!text.contains("Do not repeat"), "未执行的搜索不得劝阻重做：{text}");
+            // 配对完整性：tool 消息必须紧跟在带同 id tool_calls 的 assistant 之后
+            let index = messages
+                .iter()
+                .position(|message| message["role"] == "tool")
+                .unwrap();
+            assert_eq!(messages[index - 1]["role"], json!("assistant"));
+            assert_eq!(messages[index - 1]["tool_calls"][0]["id"], json!("ws_call_failed"));
+        }
     }
 }
