@@ -255,7 +255,141 @@ pub fn should_report_already_bootstrapped(stderr: &str, print_ok: bool) -> bool 
     print_ok || launchctl_error_is_already_bootstrapped(stderr)
 }
 
+/// restart 摘除旧注册后、紧随的 bootstrap 失败是否属卸除窗口的瞬态、
+/// 应有界重试（#15 期望行为 1）。`start` 没有紧随 bootout（bootout_ran=false）
+/// 时不重试。瞬态判据两类：
+/// - 旧版形态：`Bootstrap failed: 5: Input/output error (Already exists)`
+///   一类带身份文本（复用 `launchctl_error_is_already_bootstrapped`）；
+/// - 新版形态（本机 2026-10 restart 复现实测）：只给
+///   `Bootstrap failed: 5: Input/output error`，不带身份信息。
+///   确定性失败（plist 不存在）也给同形错误，所以重试必须有界，
+///   耗尽后由 `launchctl print` 终判（#15 根因：bootout 是异步的）。
+pub fn should_retry_bootstrap_after_bootout(bootout_ran: bool, stderr: &str) -> bool {
+    if !bootout_ran {
+        return false;
+    }
+    if launchctl_error_is_already_bootstrapped(stderr) {
+        return true;
+    }
+    stderr.contains("Bootstrap failed:") && stderr.contains("Input/output error")
+}
+
+/// bootstrap 重试耗尽后的终态判定（#15 期望行为 2）。终判以
+/// `launchctl print` 为权威（bootstrap 的 I/O error 文本不带身份，不可靠）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapTerminalOutcome {
+    /// print 复核已注册：bootstrap 其实在卸除窗口内已生效，别再重复卸载。
+    Registered,
+    /// print 复核未注册：服务已被本次 restart 卸掉，必须显式恢复。
+    Unregistered,
+}
+
+pub fn bootstrap_terminal_outcome(print_ok: bool) -> BootstrapTerminalOutcome {
+    if print_ok {
+        BootstrapTerminalOutcome::Registered
+    } else {
+        BootstrapTerminalOutcome::Unregistered
+    }
+}
+
+/// 「未注册」终态的完整恢复命令（含 --label 的确切形态，可直接复制）。
+pub fn restart_unregistered_recovery(label: &str, config_path: &Path) -> String {
+    format!(
+        // 子命令必须在前（parse_cli 约定）；flag 在前会被当作 serve 报
+        // 未知参数，不可复制的命令没有意义（#15 验收：可直接执行）。
+        "codex-layer start --label {label} -c {}",
+        config_path.display()
+    )
+}
+
+/// 监听口探测结果的三分类（#15 次要缺陷 1 的判定侧）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenProbe {
+    Ready,
+    /// connect 被拒：这个地址上确实没人在听。
+    Refused,
+    /// 超时 / 网络不可达等：无法判定，保守归为不可达。
+    Unreachable,
+}
+
+pub fn classify_listen_probe(result: &std::io::Result<std::net::TcpStream>) -> ListenProbe {
+    match result {
+        Ok(_) => ListenProbe::Ready,
+        // 本机实测形态：未监听时 connect 报 Connection refused (os error 61)
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => ListenProbe::Refused,
+        _ => ListenProbe::Unreachable,
+    }
+}
+
+/// 「已在注册」终态的下一步建议（#15 次要缺陷 3）。不再指向 restart：
+/// restart 内部是 bootout+bootstrap，正是会卸服务的路径（#15 事故主体），
+/// 建议回路不压在上面；给 status 复核与 stop → start 两段式安全路径。
+pub fn already_registered_guidance(label: &str, domain: &str) -> String {
+    format!(
+        "{label} 已在注册（{domain}），用 `codex-layer status --label {label}` 复核；\
+         要让新配置/新 plist 生效，先 `codex-layer stop --label {label}`，\
+         确认输出「未注册」后再 `codex-layer start --label {label}`"
+    )
+}
+
 // ———— 运行面：真实 launchctl 调用（macOS），非 macOS 给不支持错误 ————
+
+/// 卸除窗口重试参数（#15 期望行为 1）。本机实测：bootout 卸除窗口亚秒级
+/// 排空（重启往返见 PR #16 实测记录）；上限按 issue 建议约 3s / 10 次量级。
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_RETRY_MAX_ATTEMPTS: usize = 10;
+#[cfg(target_os = "macos")]
+const BOOTSTRAP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// 监听口就绪等待参数（#15 次要缺陷 1）。本机实测：serve 绑定监听口在
+/// 百毫秒量级（2026-10，临时 Label 实测），窗口足够宽且等待有界。
+#[cfg(target_os = "macos")]
+const LISTEN_READY_MAX_ATTEMPTS: usize = 10;
+#[cfg(target_os = "macos")]
+const LISTEN_READY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// 有界等待监听口就绪；就绪返回 true（含耗时），未就绪返回 false
+/// （调用方打印排查提示；未就绪不作为失败退出）。
+#[cfg(target_os = "macos")]
+fn wait_listen_ready(host: &str, port: u16) -> (bool, std::time::Duration) {
+    use std::time::Instant;
+    let started = Instant::now();
+    for attempt in 1..=LISTEN_READY_MAX_ATTEMPTS {
+        let probe = format!("{host}:{port}")
+            .parse::<std::net::SocketAddr>()
+            .map_err(std::io::Error::other)
+            .and_then(std::net::TcpStream::connect);
+        if classify_listen_probe(&probe) == ListenProbe::Ready {
+            return (true, started.elapsed());
+        }
+        if attempt < LISTEN_READY_MAX_ATTEMPTS {
+            std::thread::sleep(LISTEN_READY_INTERVAL);
+        }
+    }
+    (false, started.elapsed())
+}
+
+/// bootstrap 带卸除窗口重试（#15 期望行为 1）：耗尽或遇确定性错误时返回
+/// 最后一错；重试途中成功也算成功。
+#[cfg(target_os = "macos")]
+fn bootstrap_with_retry(bootout_ran: bool, domain: &str, plist_path: &Path) -> Result<(), String> {
+    let plist_arg = plist_path.display().to_string();
+    let mut last_error = String::new();
+    for attempt in 1..=BOOTSTRAP_RETRY_MAX_ATTEMPTS {
+        let output = run_launchctl(&["bootstrap", domain, &plist_arg]);
+        if output.status.success() {
+            return Ok(());
+        }
+        last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !should_retry_bootstrap_after_bootout(bootout_ran, &last_error) {
+            break;
+        }
+        if attempt < BOOTSTRAP_RETRY_MAX_ATTEMPTS {
+            std::thread::sleep(BOOTSTRAP_RETRY_INTERVAL);
+        }
+    }
+    Err(last_error)
+}
 
 /// 常驻命令总入口（start/stop/restart/status）。`config_lookup` 注入
 /// 配置路径的默认查找逻辑（Config::default_path），便于测试与复用。
@@ -348,26 +482,60 @@ fn run_launchd_macos(
 
     if kind == "restart" {
         // 旧注册先摘掉；不存在也算成功（restart 等价 start）。
+        // 注意 bootout 成功与否决定随后 bootstrap 是否可重试（#15：
+        // bootout 异步，卸除窗口内 bootstrap 只给 error 5）。
         let _ = run_launchctl(&["bootout", &target]);
     }
-    let output = run_launchctl(&["bootstrap", &domain, &plist_path.display().to_string()]);
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        // 新版 macOS 的 bootstrap 错误文本不带身份（Input/output error），
-        // 用 launchctl print 复核注册态再下结论。
+    let bootout_ran = kind == "restart";
+    let bootstrap_error = bootstrap_with_retry(bootout_ran, &domain, &plist_path).err();
+    if let Some(stderr) = &bootstrap_error {
+        // 重试耗尽或确定性失败：launchctl print 复核注册态作终判。
         let print_ok = run_launchctl(&["print", &target]).status.success();
-        if should_report_already_bootstrapped(&stderr, print_ok) {
-            bail!(
-                "{label} 已在注册（{domain}）；要让新配置/新 plist 生效请用 \
-                 `codex-layer restart --label {label}`"
-            );
+        if !bootout_ran && should_report_already_bootstrapped(stderr, print_ok) {
+            // `start` 撞上已注册服务的典型场景：建议 status 复核 +
+            // stop → start 两段式；不再把回路指向 restart
+            // （#15 次要缺陷 3：restart 正是会卸服务的路径）。
+            bail!("{}", already_registered_guidance(label, &domain));
         }
-        bail!("launchctl bootstrap 失败：{}", stderr.trim());
+        match bootstrap_terminal_outcome(print_ok) {
+            // bootstrap 的 I/O error 文本不带身份；print 复核为已注册即
+            // 视作在卸除窗口内已生效，给出复核指引即可
+            // （#15 期望行为 2「已注册」支）。
+            BootstrapTerminalOutcome::Registered => println!(
+                "已注册常驻服务：{label}（{domain}，末次 bootstrap 报错但 print 复核已生效）"
+            ),
+            BootstrapTerminalOutcome::Unregistered => bail!(
+                "launchctl bootstrap 失败（重试 {BOOTSTRAP_RETRY_MAX_ATTEMPTS} 次耗尽）：{stderr}\n\
+                 服务当前未注册（已被本次 {kind} 卸载），恢复命令：{}",
+                restart_unregistered_recovery(label, &config_path)
+            ),
+        }
+    } else {
+        println!("已注册常驻服务：{label}（{domain}）");
+        println!("  plist:  {}", plist_path.display());
+        println!("  配置:   {}", config_path.display());
     }
-    println!("已注册常驻服务：{label}（{domain}）");
-    println!("  plist:  {}", plist_path.display());
-    println!("  配置:   {}", config_path.display());
-    println!("  下一步：`codex-layer status` 看 pid 与监听口");
+    // 注册成功 / 终判已生效后：有界等待监听口就绪（#15 次要缺陷 1）。
+    // 未就绪不作为失败退出，但给明确排查方向（端口被占、上游不可达）。
+    match crate::config::Config::load(&config_path) {
+        Ok(config) => {
+            let (host, port) = (config.server.host.as_str(), config.server.port);
+            let (ready, waited) = wait_listen_ready(host, port);
+            if ready {
+                println!(
+                    "监听口:   {host}:{port} 已就绪（等待 {:.1}s）",
+                    waited.as_secs_f64()
+                );
+            } else {
+                println!(
+                    "监听口:   {host}:{port} 未就绪（已等待 {:.1}s）——排查：端口被占、\
+                     上游不可达致启动失败；看 launchd stderr 重定向日志（{label}.err.log）",
+                    waited.as_secs_f64()
+                );
+            }
+        }
+        Err(error) => println!("监听口:   未知（配置读取失败：{error}）"),
+    }
     Ok(())
 }
 
@@ -700,6 +868,127 @@ mod tests {
         assert!(!should_report_already_bootstrapped(raw, false));
         // 旧版文本命中 + print_ok 短路同样成立
         assert!(should_report_already_bootstrapped("Already exists", false));
+    }
+
+    #[test]
+    fn transient_bootstrap_error_after_bootout_is_retried() {
+        // 本机实测（2026-10，#15 复现）：bootout 成功后的卸除窗口里，
+        // bootstrap 只给不带身份的 error 5 —— 静默卸载事故的根源形态，
+        // 必须有界重试。
+        let raw = "Bootstrap failed: 5: Input/output error";
+        assert!(should_retry_bootstrap_after_bootout(true, raw));
+        // 旧版带身份文本：本质是「还没拆完」，同属瞬态。
+        assert!(should_retry_bootstrap_after_bootout(
+            true,
+            "Bootstrap failed: 5: Input/output error (Already exists)"
+        ));
+        // start 无前置 bootout：同形文本更可能是确定性失败（plist 非法等），
+        // 重试救不回来，立刻失败交给终态判定。
+        assert!(!should_retry_bootstrap_after_bootout(false, raw));
+        // 瞬态族之外的失败不重试。
+        assert!(!should_retry_bootstrap_after_bootout(
+            true,
+            "Bootstrap failed: 125: Operation not permitted"
+        ));
+    }
+
+    #[test]
+    fn bootstrap_terminal_outcome_print_is_authority() {
+        // 终判以 launchctl print 为权威：已注册→给复核指引；
+        // 未注册→明确已被本次操作卸载 + 可直接复制的恢复命令（见下）。
+        assert_eq!(
+            bootstrap_terminal_outcome(true),
+            BootstrapTerminalOutcome::Registered
+        );
+        assert_eq!(
+            bootstrap_terminal_outcome(false),
+            BootstrapTerminalOutcome::Unregistered
+        );
+    }
+
+    #[test]
+    fn unregistered_recovery_command_is_directly_copyable() {
+        let cmd = restart_unregistered_recovery(
+            "com.codex-layer.test.restart5",
+            std::path::Path::new("/tmp/smoke/config.toml"),
+        );
+        assert_eq!(
+            cmd,
+            "codex-layer start --label com.codex-layer.test.restart5 -c /tmp/smoke/config.toml"
+        );
+        // roundtrip：恢复命令本身必须能被 parse_cli 解回 Start，
+        // 「可直接复制」才不是空话。
+        let tokens: Vec<String> = cmd.split(' ').skip(1).map(str::to_string).collect();
+        match parse_cli(&tokens).expect("恢复命令必须可被解析") {
+            Command::Start { config, label } => {
+                assert_eq!(label, "com.codex-layer.test.restart5");
+                assert_eq!(
+                    config.unwrap(),
+                    std::path::PathBuf::from("/tmp/smoke/config.toml")
+                );
+            }
+            other => panic!("期望 Start，实为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn already_registered_guidance_never_points_at_restart() {
+        // #15 次要缺陷 3：旧文案把「已在注册」的出路指向 restart，
+        // 而 restart 正是会卸服务的路径；新文案建议 status 复核 +
+        // stop → start 两段式，全文不得出现 restart。
+        let text = already_registered_guidance("com.codex-layer.proxy", "gui/501");
+        assert!(!text.contains("restart"), "{text}");
+        assert!(
+            text.contains("status --label com.codex-layer.proxy"),
+            "{text}"
+        );
+        assert!(
+            text.contains("stop --label com.codex-layer.proxy"),
+            "{text}"
+        );
+        assert!(
+            text.contains("start --label com.codex-layer.proxy"),
+            "{text}"
+        );
+        // 顺序约束：先 stop、确认未注册、再 start。
+        let stop_at = text.find("stop --label").unwrap();
+        let start_at = text.find("start --label").unwrap();
+        assert!(stop_at < start_at, "{text}");
+    }
+
+    #[test]
+    fn guidance_and_recovery_strings_are_clean_single_line() {
+        // 多行字符串续行极易把 `\"` 当续行写错，留下裸换行与散字符；
+        // 用单行性把这些文案钉死。
+        let text = already_registered_guidance("com.codex-layer.proxy", "gui/501");
+        assert!(!text.contains('\n'), "{text:?}");
+        assert!(!text.contains("\""), "{text:?}");
+        let cmd = restart_unregistered_recovery(
+            "com.codex-layer.proxy",
+            std::path::Path::new("/tmp/cfg.toml"),
+        );
+        assert!(!cmd.contains('\n'), "{cmd:?}");
+    }
+
+    #[test]
+    fn listen_probe_classifies_real_connection_outcomes() {
+        // Ready 真实分支：bind + connect 临时端口，不靠 sleep。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connected = std::net::TcpStream::connect(addr);
+        assert_eq!(classify_listen_probe(&connected), ListenProbe::Ready);
+        // 本机实测形态：未监听时 connect 报 Connection refused (os error 61)。
+        let refused = Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 61)",
+        ));
+        assert_eq!(classify_listen_probe(&refused), ListenProbe::Refused);
+        // 超时/不可达等无法判定的形态保守归为 Unreachable。
+        let timeout = Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Connection timed out (os error 60)",
+        ));
+        assert_eq!(classify_listen_probe(&timeout), ListenProbe::Unreachable);
     }
 
     #[cfg(not(target_os = "macos"))]
