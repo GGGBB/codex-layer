@@ -393,6 +393,68 @@ impl UnsupportedEncryptedAgentContent {
     }
 }
 
+/// Chat 路由不执行服务端原生搜索：请求里声明了顶层 `web_search` 类原生工具，
+/// 或 `tool_choice` 强制原生搜索时的结构化错误（issue #3 / GAP_ANALYSIS P1-3）。
+/// 剥掉声明之后上游不会再被邀请「假调用」；强制原生搜索无法降级，只能显式拒绝。
+
+/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`
+/// （fix: reject unsupported native search in chat relay）。
+#[derive(Debug)]
+pub struct UnsupportedNativeWebSearch;
+
+impl std::fmt::Display for UnsupportedNativeWebSearch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported_native_web_search: Chat 路由不执行服务端原生搜索，请使用客户端搜索工具或支持原生搜索的 Responses 上游"
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedNativeWebSearch {}
+
+impl UnsupportedNativeWebSearch {
+    pub fn response_body(&self) -> Value {
+        json!({"error": {
+            "type": "invalid_request_error",
+            "code": "unsupported_native_web_search",
+            "param": "tool_choice",
+            "message": self.to_string()
+        }})
+    }
+}
+
+/// 从 Chat 请求里剥掉顶层 `web_search` 类原生工具声明：Chat 上游没有服务端搜索，
+/// 留着声明等于邀请模型回一个「没有真正执行」的搜索调用（谎报 completed 的源头）。
+/// 同名 function/custom 和命名空间、tool_search 工具由客户端执行，必须保留。
+///
+/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`。
+fn remove_unsupported_native_search(body: &mut Value) -> anyhow::Result<()> {
+    let choice = body.get("tool_choice");
+    if choice
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "web_search" | "web_search_preview"))
+    {
+        return Err(UnsupportedNativeWebSearch.into());
+    }
+    let required = choice.and_then(Value::as_str) == Some("required");
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        let before = tools.len();
+        // 同名 function/custom 和命名空间工具由客户端执行，必须保留。
+        tools.retain(|tool| {
+            !matches!(
+                tool.get("type").and_then(Value::as_str),
+                Some("web_search" | "web_search_preview")
+            )
+        });
+        if before != tools.len() && required && tools.is_empty() {
+            return Err(UnsupportedNativeWebSearch.into());
+        }
+    }
+    Ok(())
+}
+
 /// 历史里的原生压缩状态无法转成文本摘要时的结构化错误（GAP_ANALYSIS P0-3）：
 /// 错误体给可行动文案（换 Responses 上游或新开会话），不假装能转换。
 #[derive(Debug)]
@@ -434,6 +496,9 @@ pub fn upstream_conversion_error_response(error: &anyhow::Error) -> Option<(u16,
     if let Some(gate) = error.downcast_ref::<UnsupportedEncryptedAgentContent>() {
         return Some((400, gate.response_body()));
     }
+    if let Some(gate) = error.downcast_ref::<UnsupportedNativeWebSearch>() {
+        return Some((400, gate.response_body()));
+    }
     None
 }
 
@@ -446,6 +511,10 @@ pub fn responses_to_chat_completions_with_options(
     standard: bool,
     stabilize_prompt_prefix: bool,
 ) -> anyhow::Result<Value> {
+    // Chat 路由不执行服务端原生搜索：先剥掉原生搜索声明，强制原生搜索直接 400
+    // （issue #3）。必须在工具映射之前跑，否则声明会被翻译成 function 工具留下。
+    remove_unsupported_native_search(&mut body)?;
+
     // 本地摘要先就地展开（只认命名空间内的项），剩下的 `compaction` 项
     // 都是上游原生状态，不得当明文回放（GAP_ANALYSIS P0-2/P0-3）。
     expand_local_compaction_history(&mut body);
@@ -623,16 +692,28 @@ fn chat_completion_to_response_with_context(
         tool_context,
     ));
 
+    // 上游伪造的原生搜索调用：整响应收口为 failed，不谎报 completed（issue #3）。
+    let invalid_web_search = output.iter().any(invalid_web_search_output_item);
     let mut response = json!({
         "id": response_id,
         "object": "response",
         "created_at": body.get("created").and_then(Value::as_u64).unwrap_or(0),
-        "status": response_status(choice.get("finish_reason").and_then(Value::as_str)),
+        "status": if invalid_web_search {
+            "failed"
+        } else {
+            response_status(choice.get("finish_reason").and_then(Value::as_str))
+        },
         "model": body.get("model").and_then(Value::as_str).unwrap_or(""),
         "output": output,
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
 
+    if invalid_web_search {
+        response["error"] = json!({
+            "type": "invalid_upstream_tool_call",
+            "message": "Chat 上游返回了未执行的原生 web_search 调用，请使用客户端搜索工具"
+        });
+    }
     if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
         response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
     }
@@ -2940,6 +3021,30 @@ impl ChatSseState {
         self.finalize_text_into(output);
         self.finalize_tools_into(output);
 
+        // fail-loud：上游伪造的原生搜索调用不得谎报 completed，整轮改发
+        // response.failed（issue #3，流式路径与非流式路径同口径）。
+        if self
+            .output_items
+            .iter()
+            .any(|(_, item)| invalid_web_search_output_item(item))
+        {
+            let mut response = self.base_response("failed", self.completed_output_items());
+            response["error"] = json!({
+                "type": "invalid_upstream_tool_call",
+                "message": "Chat 上游返回了未执行的原生 web_search 调用，请使用客户端搜索工具"
+            });
+            copy_response_request_fields(&mut response, self.original_request.as_ref());
+            push_sse(
+                output,
+                "response.failed",
+                json!({
+                    "type": "response.failed",
+                    "response": response
+                }),
+            );
+            self.completed = true;
+            return;
+        }
         let status = response_status(self.finish_reason.as_deref());
         let mut response = self.base_response(status, self.completed_output_items());
         if status == "incomplete" {
@@ -6460,10 +6565,12 @@ fn response_tool_call_item(
 ) -> Value {
     if tool_context.is_builtin_web_search_proxy(name) {
         // 客户端只认 web_search_call，custom_tool_call 会被当作未知工具丢弃。
+        // Chat 路由不会真的执行搜索，因此这里产出的调用一律 failed：
+        // 谎报 completed 等于把模型幻觉包装成「已搜索完成」的事实（issue #3）。
         return json!({
             "id": web_search_item_id(call_id),
             "type": "web_search_call",
-            "status": "completed",
+            "status": "failed",
             "call_id": call_id,
             "action": web_search_action_from_arguments(arguments)
         });
@@ -6555,6 +6662,15 @@ fn web_search_action_from_arguments(arguments: &str) -> Value {
         }
         (None, None) => json!({ "type": "search" }),
     }
+}
+
+/// 是否为「本层产出的原生搜索项」。Chat 路由下的 `web_search_call` 只可能来自
+/// 上游伪造的 function 调用（真正的原生搜索走 Responses 上游，不经这里），
+/// 因此只要出现就是谎报源，整响应必须 failed（issue #3）。
+///
+/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`。
+fn invalid_web_search_output_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("web_search_call")
 }
 
 fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
@@ -7883,4 +7999,98 @@ mod prefix_stabilizer_tests {
         assert!(common > image_at, "分叉不得发生在图片之前：common={common}, image_at={image_at}");
     }
 
+}
+
+/// Chat 路由「不执行服务端原生搜索」守卫链（issue #3 / GAP_ANALYSIS P1-3）。
+///
+/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`
+/// （fix: reject unsupported native search in chat relay）。
+#[cfg(test)]
+mod native_search_guard_tests {
+    use super::*;
+
+    /// 剥声明只剥原生声明；客户端执行的同名工具必须原样留下。
+    #[test]
+    fn chat_search_filter_preserves_client_tools_and_rejects_forced_native_search() {
+        let native = json!({ "type": "web_search" });
+        for client in [
+            json!({ "type": "function", "name": "web_search", "parameters": { "type": "object" } }),
+            json!({ "type": "custom", "name": "web_search" }),
+            json!({ "type": "tool_search", "execution": "client" }),
+            json!({ "type": "namespace", "name": "search", "tools": [] }),
+        ] {
+            let mut body = json!({
+                "tools": [native.clone(), client.clone()],
+                "tool_choice": "required"
+            });
+            remove_unsupported_native_search(&mut body).unwrap();
+            assert_eq!(body["tools"], json!([client]));
+        }
+        // required 且只剩原生声明 = 无法降级，必须显式拒绝而不是静默改成无工具的请求。
+        for choice in [json!("required"), json!({ "type": "web_search" })] {
+            let mut body = json!({ "tools": [native.clone()], "tool_choice": choice });
+            assert!(remove_unsupported_native_search(&mut body)
+                .unwrap_err()
+                .is::<UnsupportedNativeWebSearch>());
+        }
+        // auto 下的原生声明静默剥离（本层不代理执行搜索）。
+        let mut automatic = json!({ "tools": [native], "tool_choice": "auto" });
+        remove_unsupported_native_search(&mut automatic).unwrap();
+        assert_eq!(automatic["tools"], json!([]));
+    }
+
+    /// 上游把搜索写得再真（带 query）也不会真执行，收口必须是 failed。
+    #[test]
+    fn native_search_with_query_is_still_not_executed_by_chat_converter() {
+        let request = json!({ "tools": [{ "type": "web_search" }] });
+        let chat_body = json!({"choices": [{"message": {"tool_calls": [{"id": "call_search", "type": "function", "function": {
+            "name": "web_search",
+            "arguments": "{\"query\":\"Codex\"}"
+        }}]}, "finish_reason": "tool_calls"}]});
+        let response = chat_completion_to_response_with_request(chat_body, &request).unwrap();
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["output"][0]["status"], "failed");
+        assert_eq!(
+            response["error"]["type"],
+            json!("invalid_upstream_tool_call")
+        );
+    }
+
+    /// 判定本身不得把客户端执行的代理项误判为谎报源。
+    #[test]
+    fn only_native_search_items_count_as_lying_sources() {
+        assert!(invalid_web_search_output_item(&json!({
+            "type": "web_search_call",
+            "status": "completed"
+        })));
+        assert!(!invalid_web_search_output_item(&json!({
+            "type": "custom_tool_call",
+            "name": "web_search"
+        })));
+        assert!(!invalid_web_search_output_item(&json!({
+            "type": "function_call",
+            "name": "web_search"
+        })));
+    }
+
+    /// 闸门错误必须走结构化 400，不能退成 502 文本或静默改请求。
+    #[test]
+    fn forced_native_search_gate_maps_to_structured_bad_request() {
+        let error = responses_to_chat_completions(json!({
+            "model": "gpt-5.4",
+            "input": "hi",
+            "tools": [{ "type": "web_search" }],
+            "tool_choice": { "type": "web_search" }
+        }))
+        .unwrap_err();
+        let (status, body) =
+            upstream_conversion_error_response(&error).expect("闸门错误必须映射为结构化错误体");
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], json!("unsupported_native_web_search"));
+        assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("客户端搜索工具"));
+    }
 }

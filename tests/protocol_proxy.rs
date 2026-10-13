@@ -2760,7 +2760,9 @@ fn responses_request_maps_codex_custom_and_namespace_tools_to_chat_functions() {
         .collect();
     assert!(names.contains(&"exec"));
     assert!(names.contains(&"mcp__vscode_mcp__open_file"));
-    assert!(names.contains(&"web_search"));
+    // Chat 路由不执行服务端原生搜索：顶层 `web_search` 声明必须被剥掉，
+    // 否则等于邀请上游回一个没真执行的搜索调用（issue #3）。
+    assert!(!names.contains(&"web_search"));
     assert_eq!(
         converted["tools"][0]["function"]["parameters"]["properties"]["input"]["type"],
         "string"
