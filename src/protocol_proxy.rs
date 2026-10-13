@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
+use crate::diagnostic_log::events;
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 
@@ -178,7 +179,7 @@ pub fn resolve_proxy_port(
 }
 
 /// 弃用诊断的事件名。
-pub const DEPRECATED_ENV_EVENT: &str = "codex_layer.deprecated_env";
+pub const DEPRECATED_ENV_EVENT: &str = events::layer::DEPRECATED_ENV;
 
 /// 由解析结果构造弃用诊断的 detail；无需告警时返回 None（纯函数，便于断言）。
 pub fn deprecated_env_detail(resolution: &ProxyPortResolution) -> Option<Value> {
@@ -212,7 +213,7 @@ pub fn protocol_proxy_port() -> u16 {
     );
     if let Some(detail) = deprecated_env_detail(&resolution) {
         if !deprecated_env_already_reported() {
-            let _ = crate::diagnostic_log::append_diagnostic_log(DEPRECATED_ENV_EVENT, detail);
+            let _ = crate::diagnostic_log::log_event(DEPRECATED_ENV_EVENT, detail);
         }
     }
     resolution.port
@@ -1820,8 +1821,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         upstream_request_parts(&relay, request_json, request_path).await?;
     let is_compaction_request = compaction;
     let header_timeout = response_header_timeout(is_stream);
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "protocol_proxy.upstream_request",
+    let _ = crate::diagnostic_log::log_event(
+        events::proxy::UPSTREAM_REQUEST,
         json!({
             "relayId": relay.id,
             "relayName": relay.name,
@@ -1856,8 +1857,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let upstream = match send_upstream_request_for_responses(builder, is_stream).await {
         Ok(upstream) => upstream,
         Err(error) => {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "protocol_proxy.upstream_request_failed",
+            let _ = crate::diagnostic_log::log_event(
+                events::proxy::UPSTREAM_REQUEST_FAILED,
                 json!({
                     "relayId": relay.id,
                     "relayName": relay.name,
@@ -1880,8 +1881,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "protocol_proxy.upstream_response",
+    let _ = crate::diagnostic_log::log_event(
+        events::proxy::UPSTREAM_RESPONSE,
         json!({
             "relayId": relay.id,
             "relayName": relay.name,
@@ -1965,8 +1966,8 @@ pub async fn open_models_proxy_request(
     validate_upstream(&relay)?;
 
     let endpoint = models_url(&relay.base_url);
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "protocol_proxy.models_request",
+    let _ = crate::diagnostic_log::log_event(
+        events::proxy::MODELS_REQUEST,
         json!({
             "relayId": relay.id,
             "relayName": relay.name,
@@ -2012,8 +2013,8 @@ pub async fn open_audio_transcriptions_proxy_request(
     }
 
     let endpoint = audio_transcriptions_url(&relay.base_url);
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "protocol_proxy.audio_transcriptions_request",
+    let _ = crate::diagnostic_log::log_event(
+        events::proxy::AUDIO_TRANSCRIPTIONS_REQUEST,
         json!({
             "relayId": relay.id,
             "relayName": relay.name,
@@ -2139,8 +2140,8 @@ async fn open_image_proxy_request(
     };
     let endpoint = endpoint_kind.url(&base_url);
     let wire_api = endpoint_kind.wire_api();
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "protocol_proxy.image_request",
+    let _ = crate::diagnostic_log::log_event(
+        events::proxy::IMAGE_REQUEST,
         json!({
             "relayId": relay.id,
             "relayName": relay.name,
@@ -2240,8 +2241,8 @@ pub async fn open_chat_completions_proxy_request(
 
 /// 前缀对齐诊断事件（命名沿用 prefix_stabilizer_* 风格）。
 fn log_compaction_align(report: &crate::compaction_align::CompactionAlignReport) {
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "protocol_proxy.prefix_stabilizer_compaction_appended",
+    let _ = crate::diagnostic_log::log_event(
+        events::proxy::STABILIZER_COMPACTION_APPENDED,
         json!({
             "instances": report.instances,
             "moved": report.moved,
@@ -2330,11 +2331,11 @@ async fn upstream_request_parts(
     // 重写，跳过观察以免噪声。
     if relay.protocol == RelayProtocol::ChatCompletions && relay.stabilize_prompt_prefix && !compact {
         if let Some(report) = crate::prefix_divergence::observe(probe_key.as_deref(), &body) {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
+            let _ = crate::diagnostic_log::log_event(
                 if matches!(report.kind, crate::prefix_divergence::DivergenceKind::Baseline) {
-                    "protocol_proxy.prefix_stabilizer_prefix_baseline"
+                    events::proxy::STABILIZER_PREFIX_BASELINE
                 } else {
-                    "protocol_proxy.prefix_stabilizer_prefix_divergence"
+                    events::proxy::STABILIZER_PREFIX_DIVERGENCE
                 },
                 json!({
                     "oldLen": report.old_len,
@@ -2366,8 +2367,8 @@ async fn upstream_request_parts(
     }
 
     if guard_inline_image_data_urls(&mut body) {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "inline_image_data_url_leak",
+        let _ = crate::diagnostic_log::log_event(
+            events::misc::INLINE_IMAGE_DATA_URL_LEAK,
             json!({ "model": model, "protocol": format!("{:?}", relay.protocol) }),
         );
         debug_assert!(false, "base64 图片泄漏进文本字段，检查协议转换路径");
@@ -4525,8 +4526,8 @@ fn strip_image_resize_notice_blocks(messages: &mut Vec<Value>) {
     });
     if unpaired {
         // 非成对残片已随本步骤归零；只记 debug 日志，不影响转发。
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.prefix_stabilizer_unpaired_notice_stripped",
+        let _ = crate::diagnostic_log::log_event(
+            events::proxy::STABILIZER_UNPAIRED_NOTICE_STRIPPED,
             json!({
                 "note": "存在非成对的 image_resize_notice 标记，孤儿标签连同残片已按契约移除",
                 "volatileBlocks": VOLATILE_INJECTION_BLOCK_NAMES,
@@ -4944,8 +4945,8 @@ fn order_system_chunks_stably(chunks: &[String]) -> String {
     }
     for (name, instances, _) in dedup_last.iter() {
         if *instances > 1 {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "protocol_proxy.prefix_stabilizer_dedup_last_folded",
+            let _ = crate::diagnostic_log::log_event(
+                events::proxy::STABILIZER_DEDUP_LAST_FOLDED,
                 json!({ "blockName": name, "instances": instances }),
             );
         }
@@ -8687,6 +8688,10 @@ mod proxy_port_env_tests {
     /// 弃用诊断确实落进 JSONL：事件名与字段可按 `codex_layer.deprecated_env` 检索。
     #[test]
     fn deprecation_detail_appends_one_jsonl_record() {
+        // 日志落点是全局静态：与同样写日志的测试互斥，避免路径互踩。
+        let _diag_guard = crate::diagnostic_log::DIAG_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("codex-layer.log");
         crate::diagnostic_log::set_diagnostic_log_path(Some(path.clone()));

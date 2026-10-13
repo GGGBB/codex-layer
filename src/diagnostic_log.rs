@@ -84,6 +84,13 @@ pub mod events {
         ];
     }
 
+    /// 历史无前缀事件名族：名字是已发布契约，原样保留；新事件禁止
+    /// 再往这一族加（必须带归族前缀，见登记表完整性单测）。
+    pub mod misc {
+        pub const INLINE_IMAGE_DATA_URL_LEAK: &str = "inline_image_data_url_leak";
+        pub const ALL: &[&str] = &[INLINE_IMAGE_DATA_URL_LEAK];
+    }
+
     /// sink 自身序列化失败的兜底事件。
     pub const SERIALIZATION_FAILED: &str = "diagnostic_log.serialization_failed";
 }
@@ -255,18 +262,26 @@ mod tests {
         for name in events::proxy::ALL {
             assert!(name.starts_with("protocol_proxy."), "归族前缀错误：{name}");
         }
+        // misc 族豁免归族前缀约束（历史无前缀名是已发布契约），但只出不进。
+        for name in events::misc::ALL {
+            assert!(!name.contains('.'), "misc 族条目不得带前缀点：{name}");
+        }
         assert!(events::SERIALIZATION_FAILED.starts_with("diagnostic_log."));
         let mut unique: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for name in events::layer::ALL
             .iter()
             .chain(events::proxy::ALL.iter())
+            .chain(events::misc::ALL.iter())
             .chain(std::iter::once(&events::SERIALIZATION_FAILED))
         {
             assert!(unique.insert(*name), "登记表里出现重复事件名：{name}");
         }
         assert_eq!(
             unique.len(),
-            events::layer::ALL.len() + events::proxy::ALL.len() + 1,
+            events::layer::ALL.len()
+                + events::proxy::ALL.len()
+                + events::misc::ALL.len()
+                + 1,
             "登记表计数与成员不符"
         );
         for name in events::layer::ALL
