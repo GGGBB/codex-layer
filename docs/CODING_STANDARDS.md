@@ -59,3 +59,9 @@
   逐行 diff 失去可比性）；新写文件按 rustfmt 默认风格即可。
 - 移植 commit 不改行为；接口适配的机械改动（含测试断言改写）必须在 commit
   正文说明。
+
+## Git 并发
+
+- 多贡献者环境下 `git switch` / `git checkout` 等改 HEAD 的命令属**危险操作**：
+  共享同一 checkout 时会连带改掉其他人的工作目录（#10 事故）。必须在专属
+  worktree 内执行，隔离规范见 CONTRIBUTING.md「worktree 隔离」。

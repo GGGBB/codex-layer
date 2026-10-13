@@ -18,12 +18,44 @@ git -c user.name="codex-layer-<角色>" \
 角色名用英文小写（如 `governance`、`stabilizer`、`ci-maintainer`）。
 维护者（maintainer）负责 review 与合并；**贡献者不自 merge 自己的 PR**。
 
+贡献者认领 issue 时**建分支即建 worktree**，二者同时发生（见下节「worktree 隔离」）。
+
+## worktree 隔离（必读）
+
+分支约定在并发下形同虚设：多个贡献者共享同一个 checkout 时，任何一方的
+`git switch` / `git checkout` 都会改掉其他人的 HEAD，提交会静默落在别人的
+分支上（issue #10 的事故教训）。为此规定：
+
+1. **开工前必须建立自己的工作目录，不得复用主 checkout**。一个角色一个
+   worktree，与分支一次性创建：
+
+   ```bash
+   git -C /Users/zifengwang/Documents/Codex/codex-layer worktree add \
+       /Users/zifengwang/Documents/Codex/codex-layer-workspace/worktrees/<角色> \
+       -b agent/<issue号>-<slug> origin/main
+   ```
+
+2. **全程只在自己的 worktree 内执行 git 与构建命令**；主 checkout 由维护者
+   独占，仅用于 review、合并与 ruleset 运维。对主 checkout 也不要隔空操作
+   （`git -C 主checkout ...`、改它的分支指针等）。
+3. **构建产物隔离**：worktree 天然拥有独立 `target/`；若显式设置
+   `CARGO_TARGET_DIR`，必须用按角色命名的独立目录（如
+   `/tmp/codex-layer-target-<角色>`），不得互踩。
+4. **开工前自检**：
+
+   ```bash
+   git -C <自己的 worktree> rev-parse --abbrev-ref HEAD
+   ```
+
+   输出必须等于自己的分支名；不等则**停下并回报**，不允许「先干活再说」。
+
 ## 流程
 
 1. **issue 先行**：每个变更先有对应 issue。已有 backlog（见 `docs/GAP_ANALYSIS.md`
    与已开的 issues）优先认领，不重复立项。
 2. **分支**：从 main 切出，命名 `agent/<issue号>-<slug>`，
-   例如 `agent/3-web-search-guard`。
+   例如 `agent/3-web-search-guard`；在自己的 worktree 内创建
+   （见「worktree 隔离」）。
 3. **commit 纪律**：移植 commit 与改行为 commit 严格分开。移植 commit 保留来源
    逐字节内容与文件头来源注释（来源仓库/PR/文件/commit），不改行为；
    行为改动 commit 正文说明动机、行为影响面与测试证据。
@@ -46,6 +78,10 @@ git -c user.name="codex-layer-<角色>" \
 
 ## 自测纪律（必读）
 
+- 所有 git 与 cargo 命令只在自己的专属 worktree 内执行（主 checkout 由维护者
+  独占）；开工先 `git rev-parse --abbrev-ref HEAD` 自检 HEAD 是自己的分支名，
+  不等即停手回报；构建产物用独立 `target/` 或按角色命名的
+  `CARGO_TARGET_DIR`（详见「worktree 隔离」）。
 - 端到端自测**必须**使用临时 Label + 临时端口 + 临时配置，例如
   `codex-layer --label com.codex-layer.test.<任务名> -c <临时配置>` 监听 57341
   之类的非默认端口。
