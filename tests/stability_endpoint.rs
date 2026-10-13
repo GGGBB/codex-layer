@@ -310,3 +310,180 @@ enabled = true
     // 出站报文里也不能出现日志里那个具体的 id 值。
     assert!(!captured.contains(&open_id), "出站报文不得携带日志侧的 requestId 值");
 }
+
+/// 带响应头的 GET：返回 (状态, 小写头块, body)，供 Content-Type 等断言。
+async fn http_get_parts(port: u16, path: &str) -> (String, String, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.unwrap();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let status = head.split_whitespace().nth(1).unwrap_or("?").to_string();
+    (status, head.to_lowercase(), body.to_string())
+}
+
+/// `/stability/ui`（开启态）：200 + text/html + 关键挂载点齐备，
+/// 数据面标记为启用（false），且不得残留占位符。
+#[tokio::test]
+async fn stability_ui_enabled_returns_self_contained_page() {
+    let harness = spawn_proxy(&[], "\n[stability]\nenabled = true\n").await;
+    let (status, head, body) = http_get_parts(harness.proxy_port, "/stability/ui").await;
+    assert_eq!(status, "200", "/stability/ui 必须 200，body={body}");
+    assert!(
+        head.contains("content-type: text/html"),
+        "Content-Type 必须是 text/html，头块={head}"
+    );
+    assert!(body.contains(r#"data-plane-disabled="false""#), "开启态标记必须是 false");
+    assert!(!body.contains("__DATA_PLANE_DISABLED__"), "占位符不得残留");
+    for marker in [
+        r#"id="dashboard""#,
+        r#"id="timeline""#,
+        r#"id="divergence-table""#,
+        r#"id="turns-table""#,
+    ] {
+        assert!(body.contains(marker), "缺少挂载点 {marker}");
+    }
+    // 零外部依赖：页面不得引用任何网络资源。
+    assert!(!body.contains(r#"src="http"#), "页面不得引用外部脚本");
+    assert!(!body.contains(r#"href="http"#), "页面不得引用外部样式/资源");
+}
+
+/// 默认（数据面未启用）：`/stability/ui` 仍是 200 的可读禁用页
+/// （`data-plane-disabled="true"`），而不是报错；同进程 `/stability` 保持 404。
+#[tokio::test]
+async fn stability_ui_shows_readable_disabled_page_by_default() {
+    let harness = spawn_proxy(&[], "").await;
+    let (status, _, body) = http_get_parts(harness.proxy_port, "/stability/ui").await;
+    assert_eq!(status, "200", "禁用页也必须 200，body={body}");
+    assert!(body.contains(r#"data-plane-disabled="true""#), "默认必须是禁用标记");
+    assert!(body.contains(r#"id="disabled-page""#), "禁用页挂载点必须存在");
+    let (api_status, _) = http_get_ok(harness.proxy_port, "/stability").await;
+    assert_eq!(api_status, "404", "禁用时数据面仍是显式 404");
+}
+
+/// 合成日志四态 + 界面红线：完成/失败/未收口/终态-only 与分叉各归其账；
+/// recentTurns 明细（含压缩轮、outcome=null 的未收口行）与 unpaired 计数
+/// 正确；提示词内容（snip）默认既不进 `/stability` JSON，也不进页面 HTML。
+#[tokio::test]
+async fn synthesized_log_covers_all_turn_states_and_page_never_carries_snips() {
+    let secret = "合成日志里的提示词内容-绝不进响应";
+    let seed = vec![
+        // 完整压缩轮：开流 r1（compaction）+ 收口 r1。
+        json!({"timestamp_ms": 1000, "pid": 4242, "event": "codex_layer.stream_open",
+               "detail": {"path": "/v1/responses", "requestId": "r1", "compaction": true}}),
+        json!({"timestamp_ms": 1200, "pid": 4242, "event": "codex_layer.stream_completed",
+               "detail": {"model": "m", "requestId": "r1"}}),
+        // 失败轮：开流 r2 + stream_failed r2。
+        json!({"timestamp_ms": 2000, "pid": 4242, "event": "codex_layer.stream_open",
+               "detail": {"path": "/v1/responses", "requestId": "r2"}}),
+        json!({"timestamp_ms": 2300, "pid": 4242, "event": "codex_layer.stream_failed",
+               "detail": {"requestId": "r2"}}),
+        // 未收口轮：开流 r3，窗口内没有收口。
+        json!({"timestamp_ms": 3000, "pid": 4242, "event": "codex_layer.stream_open",
+               "detail": {"path": "/v1/responses", "requestId": "r3"}}),
+        // 终态-only：收口 r4 没有对应开流（日志裁剪/窗口截断形态）。
+        json!({"timestamp_ms": 4000, "pid": 4242, "event": "codex_layer.stream_completed",
+               "detail": {"model": "m", "requestId": "r4"}}),
+        // 一次前缀分叉（snip 携带敏感内容，默认必须只报长度与位置）。
+        json!({"timestamp_ms": 4500, "pid": 4242,
+               "event": "protocol_proxy.prefix_stabilizer_prefix_divergence",
+               "detail": {"oldLen": 12, "newLen": 24, "firstDiff": 5,
+                          "oldSnip": secret, "newSnip": "b"}}),
+    ];
+    let harness = spawn_proxy(&seed, "\n[stability]\nenabled = true\n").await;
+
+    let (status, body) = http_get_ok(harness.proxy_port, "/stability").await;
+    assert_eq!(status, "200", "body={body}");
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+
+    assert_eq!(snapshot["turns"]["total"], json!(3), "开流 3 条 = 3 轮");
+    assert_eq!(snapshot["turns"]["compaction"], json!(1), "压缩轮 1 条");
+    assert_eq!(snapshot["turns"]["completed"], json!(2), "completed 事件含终态-only 的 r4");
+    assert_eq!(snapshot["turns"]["failed"], json!(1));
+    assert_eq!(snapshot["durationsMs"]["unpaired"]["openWithoutTerminal"], json!(1), "r3 未收口");
+    assert_eq!(snapshot["durationsMs"]["unpaired"]["terminalWithoutOpen"], json!(1), "r4 无开流");
+    assert_eq!(snapshot["stability"]["divergence"], json!(1));
+
+    // recentTurns：新→旧；分叉事件不占轮次行（轮次行只来自开流/收口/拒绝/上游错误）。
+    let turns = snapshot["recentTurns"].as_array().unwrap();
+    assert_eq!(turns.len(), 4, "轮次行 = r1/r2/r3 开流行 + r4 终态-only 行");
+    assert_eq!(turns[0]["requestId"], json!("r4"));
+    assert_eq!(turns[0]["outcome"], json!("completed"), "终态-only 行照实入表");
+    let r3_row = turns.iter().find(|row| row["requestId"] == json!("r3")).unwrap();
+    assert!(r3_row["outcome"].is_null(), "未收口行 outcome=null，由界面渲染成「开着未收口」");
+    let r1_row = turns.iter().find(|row| row["requestId"] == json!("r1")).unwrap();
+    assert_eq!(r1_row["compaction"], json!(true), "压缩轮标记要能在明细里看出来");
+    assert_eq!(r1_row["outcome"], json!("completed"));
+    assert_eq!(r1_row["durationMs"], json!(200));
+
+    // 红线：snip 内容绝不进 JSON，也绝不进页面 HTML。
+    assert!(!body.contains(secret), "snip 默认绝不进 /stability 响应");
+    let (ui_status, _, ui_body) = http_get_parts(harness.proxy_port, "/stability/ui").await;
+    assert_eq!(ui_status, "200");
+    assert!(!ui_body.contains(secret), "snip 绝不进监看页 HTML");
+
+    // 空窗口形态：没有分叉时 divergence=0、比率未定义而不是 0（不给假安全读数）。
+    let empty_harness = spawn_proxy(&[], "\n[stability]\nenabled = true\n").await;
+    let (_, empty_body) = http_get_ok(empty_harness.proxy_port, "/stability").await;
+    let empty: Value = serde_json::from_str(&empty_body).unwrap();
+    assert_eq!(empty["stability"]["divergence"], json!(0));
+    assert!(empty["stability"]["divergencePerTurn"].is_null(), "0 轮时比率是未定义而非 0");
+    let (_, _, empty_ui) = http_get_parts(empty_harness.proxy_port, "/stability/ui").await;
+    assert!(empty_ui.contains(r#"id="timeline-empty""#), "空窗口要显式呈现「窗口内无数据」挂载点");
+}
+
+/// `?window_bytes` 覆盖：合法值生效（放大到全量解析、缩小被钳到下限），
+/// 非法值（非数字、0）结构化 400——fail-loud，不静默。
+#[tokio::test]
+async fn window_bytes_query_override_takes_effect_and_rejects_garbage() {
+    // 60 行填充事件 ≈ 8 KB：小窗口截断只读尾部，大窗口全量解析。
+    let filler = |index: usize| {
+        json!({"timestamp_ms": 10_000 + index as u64, "pid": 4242,
+               "event": "noise.filler_event", "detail": {"pad": "x", "index": index}})
+    };
+    let mut seed: Vec<Value> = (0..60).map(filler).collect();
+    // 真实轮次放在尾部：小窗口也必须能看见它们。
+    seed.push(json!({"timestamp_ms": 90_000, "pid": 4242, "event": "codex_layer.stream_open",
+                     "detail": {"path": "/v1/responses", "requestId": "w1"}}));
+    seed.push(json!({"timestamp_ms": 91_000, "pid": 4242, "event": "codex_layer.stream_completed",
+                     "detail": {"model": "m", "requestId": "w1"}}));
+    let harness = spawn_proxy(&seed, "\n[stability]\nenabled = true\nwindow_bytes = 1024\n").await;
+
+    // 配置小窗口：窗口口径如实回报，且必然截断。
+    let (status, body) = http_get_ok(harness.proxy_port, "/stability").await;
+    assert_eq!(status, "200", "body={body}");
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["window"]["windowBytes"], json!(1024));
+    assert_eq!(snapshot["window"]["truncated"], json!(true));
+
+    // 查询覆盖放大到 64 MB：全量解析，seed 的轮次必须进快照。
+    let (status, body) =
+        http_get_ok(harness.proxy_port, "/stability?window_bytes=67108864").await;
+    assert_eq!(status, "200", "body={body}");
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["window"]["windowBytes"], json!(67108864), "覆盖值必须回显");
+    assert_eq!(snapshot["window"]["truncated"], json!(false));
+    assert_eq!(snapshot["turns"]["total"], json!(1), "seed 的 w1 轮必须被全量窗口看见");
+
+    // 低于下限的合法数字：钳到 1024 而不是报错。
+    let (status, body) = http_get_ok(harness.proxy_port, "/stability?window_bytes=512").await;
+    assert_eq!(status, "200", "body={body}");
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["window"]["windowBytes"], json!(1024), "512 应被钳到下限 1024");
+
+    // 非法值：结构化 400。
+    for bad in ["abc", "0"] {
+        let (status, body) =
+            http_get_ok(harness.proxy_port, &format!("/stability?window_bytes={bad}")).await;
+        assert_eq!(status, "400", "非法值 {bad:?} 必须 400，body={body}");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["status"], json!("failed"));
+        assert!(
+            parsed["message"].as_str().unwrap().contains("window_bytes"),
+            "错误消息必须点名 window_bytes，body={body}"
+        );
+    }
+}

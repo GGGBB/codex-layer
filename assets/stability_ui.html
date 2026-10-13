@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-plane-disabled="__DATA_PLANE_DISABLED__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>codex-layer 稳定性监看</title>
+<style>
+:root {
+  --bg: #f7f8f7;
+  --panel: #ffffff;
+  --ink: #1c211f;
+  --muted: #61696500;
+  --muted: #616965;
+  --line: #d9ddd9;
+  --ok: #3f7d64;
+  --ok-bg: #e6efe9;
+  --warn: #b45309;
+  --warn-bg: #f7ead8;
+  --bad: #b3261e;
+  --bad-bg: #f6e0de;
+  --chip: #eceee9;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #171a18;
+    --panel: #1f2321;
+    --ink: #e4e8e4;
+    --muted: #9aa39d;
+    --line: #363c38;
+    --ok: #7fb99d;
+    --ok-bg: #24332c;
+    --warn: #e0a34e;
+    --warn-bg: #3a2d1a;
+    --bad: #f08a82;
+    --bad-bg: #3c2422;
+    --chip: #2a2f2b;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 13px/1.5 var(--sans);
+}
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+header h1 { font-size: 15px; margin: 0; letter-spacing: 0; }
+header .controls {
+  margin-left: auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+select, input[type="checkbox"] { accent-color: var(--ok); }
+select {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font: inherit;
+  padding: 2px 4px;
+}
+main { max-width: 1080px; margin: 0 auto; padding: 12px 16px 32px; }
+section { margin-bottom: 18px; }
+h2 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 0 0 6px;
+  text-transform: uppercase;
+}
+.statusbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chip {
+  background: var(--chip);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.chip b { font-family: var(--mono); font-weight: 600; }
+.chip.warn { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
+.chip.bad { background: var(--bad-bg); color: var(--bad); border-color: transparent; }
+.chip.noise { color: var(--muted); }
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.metric { background: var(--panel); padding: 8px 12px; min-width: 0; }
+.metric .label { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.metric .value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 22px; line-height: 1.2; }
+.metric .sub { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.metric.hot .value { color: var(--warn); }
+.metric.dead .value { color: var(--bad); }
+#timeline-wrap { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+#timeline-wrap svg { display: block; width: 100%; height: auto; }
+#timeline-note { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td {
+  padding: 5px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+th { color: var(--muted); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+td.num, th.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+td.snip { white-space: normal; min-width: 160px; max-width: 420px; overflow-wrap: anywhere; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+col.c-time { width: 92px; } col.c-num { width: 84px; } col.c-flag { width: 64px; }
+col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px; }
+.badge { border-radius: 4px; padding: 1px 6px; font-size: 11px; }
+.badge.ok { background: var(--ok-bg); color: var(--ok); }
+.badge.warn { background: var(--warn-bg); color: var(--warn); }
+.badge.bad { background: var(--bad-bg); color: var(--bad); }
+.badge.idle { background: var(--chip); color: var(--muted); }
+.empty-note { color: var(--muted); padding: 10px; }
+#disabled-page { padding: 48px 16px; text-align: center; color: var(--muted); }
+#disabled-page code { font-family: var(--mono); background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+.loopback-note { font-size: 12px; color: var(--muted); }
+[hidden] { display: none !important; }
+@media (max-width: 640px) {
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric .value { font-size: 18px; }
+  header { padding: 8px 12px; }
+  main { padding: 10px 12px 24px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>codex-layer 稳定性监看</h1>
+  <div class="controls" id="controls" hidden>
+    <label>窗口
+      <select id="window-select" title="读取诊断日志的尾部窗口大小">
+        <option value="2097152">2 MiB</option>
+        <option value="8388608" selected>8 MiB</option>
+        <option value="33554432">32 MiB</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="refresh-toggle" checked> 自动刷新</label>
+    <label>间隔
+      <select id="refresh-interval">
+        <option value="2000">2s</option>
+        <option value="5000" selected>5s</option>
+        <option value="15000">15s</option>
+      </select>
+    </label>
+    <span id="fetch-state" class="chip" title="最近一次拉取 /stability 的结果">–</span>
+  </div>
+</header>
+
+<div id="disabled-page" hidden>
+  <p>数据面未启用：本页无数据可读。</p>
+  <p>在 <code>~/.codex-layer/codex-layer.toml</code> 的 <code>[stability]</code> 段设
+     <code>enabled = true</code> 后重启 codex-layer。</p>
+</div>
+
+<main id="dashboard" hidden>
+  <section>
+    <div class="statusbar" id="statusbar"></div>
+  </section>
+
+  <section>
+    <h2>核心指标 <span class="loopback-note">· 仅本机访问</span></h2>
+    <div class="metrics" id="metrics"></div>
+  </section>
+
+  <section>
+    <h2>轮次与分叉时间轴 <span id="timeline-range" class="loopback-note"></span></h2>
+    <div id="timeline-wrap">
+      <div class="empty-note" id="timeline-empty" hidden>窗口内无数据</div>
+      <svg id="timeline" viewBox="0 0 1000 96" preserveAspectRatio="none" hidden
+           role="img" aria-label="轮次与 divergence 时间轴"></svg>
+    </div>
+    <div id="timeline-note"></div>
+  </section>
+
+  <section>
+    <h2>divergence 明细</h2>
+    <div class="tablewrap">
+      <table id="divergence-table">
+        <colgroup><col class="c-time"><col class="c-num"><col class="c-num"><col class="c-num"><col></colgroup>
+        <thead><tr><th>时间</th><th class="num">firstDiff</th><th class="num">oldLen</th><th class="num">newLen</th><th>snip</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>最近轮次</h2>
+    <div class="tablewrap">
+      <table id="turns-table">
+        <colgroup><col class="c-time"><col class="c-flag"><col class="c-dur"><col class="c-out"><col class="c-req"><col></colgroup>
+        <thead><tr><th>时间</th><th class="num">压缩轮</th><th class="num">耗时</th><th>收口</th><th>requestId</th><th>path</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+(function () {
+  var DATA_PLANE_DISABLED = document.documentElement.dataset.planeDisabled === "true";
+  var dashboard = document.getElementById("dashboard");
+  var disabledPage = document.getElementById("disabled-page");
+  var controls = document.getElementById("controls");
+  var fetchState = document.getElementById("fetch-state");
+  var windowSelect = document.getElementById("window-select");
+  var refreshToggle = document.getElementById("refresh-toggle");
+  var refreshInterval = document.getElementById("refresh-interval");
+  var timer = null;
+
+  if (DATA_PLANE_DISABLED) {
+    disabledPage.hidden = false;
+    return;
+  }
+  dashboard.hidden = false;
+  controls.hidden = false;
+
+  function el(name, attrs, children) {
+    var node = document.createElement(name);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (key) {
+        if (key === "text") { node.textContent = attrs[key]; }
+        else if (key === "title") { node.setAttribute("title", attrs[key]); }
+        else { node.setAttribute(key, attrs[key]); }
+      });
+    }
+    (children || []).forEach(function (child) { node.appendChild(child); });
+    return node;
+  }
+
+  function svgEl(name, attrs) {
+    var node = document.createElementNS("http://www.w3.org/2000/svg", name);
+    Object.keys(attrs || {}).forEach(function (key) { node.setAttribute(key, attrs[key]); });
+    return node;
+  }
+
+  function pad(n) { return n < 10 ? "0" + n : "" + n; }
+  function fmtTime(ms) {
+    var d = new Date(ms);
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+  function fmtDur(ms) {
+    if (ms === null || ms === undefined) { return "—"; }
+    if (ms < 1000) { return ms + "ms"; }
+    return (ms / 1000).toFixed(1) + "s";
+  }
+
+  function outcomeBadge(turn) {
+    var value = turn.outcome;
+    if (value === "completed") { return el("span", { "class": "badge ok", text: "completed" }); }
+    if (value === "failed") { return el("span", { "class": "badge bad", text: "failed" }); }
+    if (value === "rejected") { return el("span", { "class": "badge bad", text: "rejected", title: "本层显式拒绝（fail-loud）" }); }
+    if (value === "upstream_error") { return el("span", { "class": "badge bad", text: "upstream_error", title: "上游侧故障" }); }
+    // outcome 为空 = 窗口内开着没收到收口（还在跑，或收口被窗口边界截掉）。
+    return el("span", { "class": "badge idle", text: "开着未收口", title: "窗口内没有对应收口事件：仍在进行，或收口落在窗口外/被日志裁剪" });
+  }
+
+  function metric(label, value, opts) {
+    opts = opts || {};
+    var box = el("div", { "class": "metric" + (opts.hot ? " hot" : "") + (opts.dead ? " dead" : "") });
+    if (opts.title) { box.setAttribute("title", opts.title); }
+    box.appendChild(el("div", { "class": "label", text: label }));
+    box.appendChild(el("div", { "class": "value", text: value }));
+    if (opts.sub) { box.appendChild(el("div", { "class": "sub", text: opts.sub })); }
+    return box;
+  }
+
+  function renderStatus(s) {
+    var bar = document.getElementById("statusbar");
+    bar.textContent = "";
+    var started = s.session && s.session.started && s.session.started.detail;
+    function chip(label, value, cls, title) {
+      var chip = el("span", { "class": "chip" + (cls ? " " + cls : ""), title: title });
+      chip.appendChild(document.createTextNode(label + " "));
+      chip.appendChild(el("b", { text: value }));
+      bar.appendChild(chip);
+      return chip;
+    }
+    if (s.session && s.session.started) {
+      chip("pid", String(s.session.started.pid));
+    }
+    if (started) {
+      chip("上游", String(started.upstream || "—"));
+      chip("协议", String(started.protocol || "—"));
+      chip("前缀钉定", started.stabilizePromptPrefix ? "开" : "关",
+        started.stabilizePromptPrefix ? null : "warn",
+        started.stabilizePromptPrefix ? null : "稳定层关闭时前缀不受保护");
+      var listen = String(started.listen || "");
+      var host = listen.replace(/:\d+$/, "");
+      var loopback = !host || host === "127.0.0.1" || host === "::1" || host === "localhost";
+      if (!loopback) {
+        chip("监听", listen, "warn", "监听地址非回环：/stability 与本页无鉴权，暴露到局域网前请自行加防护");
+      }
+    }
+    if (s.session && s.session.firstTimestampMs && s.session.lastTimestampMs) {
+      chip("日志窗口", fmtTime(s.session.firstTimestampMs) + " → " + fmtTime(s.session.lastTimestampMs));
+    }
+    var unpaired = (s.durationsMs && s.durationsMs.unpaired) || {};
+    var openLoose = unpaired.openWithoutTerminal || 0;
+    var termLoose = unpaired.terminalWithoutOpen || 0;
+    if (openLoose || termLoose) {
+      // 有意用中性色：它是窗口截断/重启边界的统计噪声，不是故障（#19 口径）。
+      chip("配对不完整", openLoose + " 开 / " + termLoose + " 收", "noise",
+        "统计不完整的噪声提示：日志窗口边界或进程重启截断了一半事件，耗时统计因此偏少；不是请求失败");
+    }
+    if (s.window && s.window.parseFailures) {
+      chip("坏行", String(s.window.parseFailures), "noise", "日志窗口内解析失败的行数（计数后跳过）");
+    }
+  }
+
+  function renderMetrics(s) {
+    var grid = document.getElementById("metrics");
+    grid.textContent = "";
+    var st = s.stability || {};
+    var turns = s.turns || {};
+    var dur = s.durationsMs || {};
+    var divergence = st.divergence || 0;
+    var ratio = st.divergencePerTurn;
+    var dead = (turns.failed || 0) + (turns.conversionRejected || 0) + (turns.upstreamError || 0);
+    grid.appendChild(metric("divergence", String(divergence), {
+      hot: divergence > 0,
+      title: "前缀字节突变次数：每次意味着该轮深缓存冷算风险"
+    }));
+    grid.appendChild(metric("分叉率", ratio === null || ratio === undefined ? "未定义" : (ratio * 100).toFixed(1) + "%", {
+      hot: (ratio || 0) > 0,
+      sub: "比率 = divergence / 窗口内轮次；0 轮时未定义",
+      title: "比率 = divergence / 窗口内轮次（窗口由 window_bytes 决定）"
+    }));
+    grid.appendChild(metric("失败 / 拒绝", String(dead), {
+      dead: dead > 0,
+      sub: "failed " + (turns.failed || 0) + " · rejected " + (turns.conversionRejected || 0) + " · 上游 " + (turns.upstreamError || 0),
+      title: "failed=流以 response.failed 收口；rejected=本层显式拒绝；upstream=上游错误"
+    }));
+    grid.appendChild(metric("单轮耗时 p50 / p95", (dur.samples ? fmtDur(dur.p50) : "—") + " / " + (dur.samples ? fmtDur(dur.p95) : "—"), {
+      sub: "样本 " + (dur.samples || 0) + " · max " + fmtDur(dur["max"]),
+      title: "耗时 = stream_open → 收口事件；压缩轮记在 payload 下发之时（服务端侧口径，系统性偏小）"
+    }));
+    grid.appendChild(metric("轮次", String(turns.total || 0), {
+      sub: "压缩 " + (turns.compaction || 0) + " · baseline " + (st.baseline || 0),
+      title: "窗口内 stream_open 计数；baseline=前缀基线登记次数"
+    }));
+  }
+
+  function renderTimeline(s) {
+    var svg = document.getElementById("timeline");
+    var empty = document.getElementById("timeline-empty");
+    var note = document.getElementById("timeline-note");
+    var rangeLabel = document.getElementById("timeline-range");
+    while (svg.firstChild) { svg.removeChild(svg.firstChild); }
+    var turns = (s.recentTurns || []).slice();
+    var divs = (s.stability && s.stability.recentDivergences) || [];
+    var stamps = [];
+    turns.forEach(function (t) { stamps.push(t.timestampMs); });
+    divs.forEach(function (d) { stamps.push(d.timestampMs); });
+    if (s.session) {
+      if (s.session.firstTimestampMs) { stamps.push(s.session.firstTimestampMs); }
+      if (s.session.lastTimestampMs) { stamps.push(s.session.lastTimestampMs); }
+    }
+    if (!stamps.length) {
+      // SVGElement 不反射 hidden IDL 属性（HTMLElement 才有），必须直接操作属性，
+      // 否则 [hidden]{display:none!important} 永远生效、时间轴塔成 0×0。
+      svg.setAttribute("hidden", "");
+      empty.hidden = false;
+      note.textContent = "";
+      rangeLabel.textContent = "";
+      return;
+    }
+    var lo = Math.min.apply(null, stamps);
+    var hi = Math.max.apply(null, stamps);
+    if (hi === lo) { hi = lo + 1; }
+    svg.removeAttribute("hidden");
+    empty.hidden = true;
+    rangeLabel.textContent = fmtTime(lo) + " → " + fmtTime(hi);
+    var X = function (ms) { return 10 + ((ms - lo) / (hi - lo)) * 980; };
+
+    // 轴线
+    svg.appendChild(svgEl("line", { x1: 10, y1: 84, x2: 990, y2: 84, stroke: "currentColor", opacity: "0.25" }));
+    [lo, (lo + hi) / 2, hi].forEach(function (ms, i) {
+      var label = svgEl("text", {
+        x: i === 0 ? 10 : (i === 2 ? 990 : 500),
+        y: 95, "font-size": "10", fill: "currentColor", opacity: "0.5",
+        "text-anchor": i === 0 ? "start" : (i === 2 ? "end" : "middle"),
+      });
+      label.textContent = fmtTime(Math.round(ms));
+      svg.appendChild(label);
+    });
+
+    // 轮次：淡色柱（开流时刻起、耗时为宽度；未收口画细刻度）
+    turns.forEach(function (t) {
+      var x = X(t.timestampMs);
+      var outcome = t.outcome;
+      var fill = outcome === "failed" || outcome === "rejected" || outcome === "upstream_error"
+        ? "var(--bad)"
+        : (outcome === "completed" ? "var(--ok)" : "currentColor");
+      var opacity = outcome === "completed" ? "0.35" : (outcome ? "0.6" : "0.25");
+      var width = t.durationMs ? Math.max(2, ((t.durationMs) / (hi - lo)) * 980) : 2;
+      var bar = svgEl("rect", {
+        x: x, y: 52, width: Math.min(width, 990 - x), height: 26, fill: fill, opacity: opacity,
+      });
+      var tip = fmtTime(t.timestampMs) + " · " + (t.path || "—") +
+        (t.compaction ? " · 压缩轮" : "") +
+        " · " + (outcome || "开着未收口") +
+        " · 耗时 " + fmtDur(t.durationMs) +
+        (t.compaction ? "（压缩轮为服务端下发口径，系统性偏小）" : "") +
+        (t.durationMs === null && !outcome ? "（收口落在窗口外或被日志裁剪时，此项为统计噪声）" : "");
+      var title = svgEl("title", {});
+      title.textContent = tip;
+      bar.appendChild(title);
+      svg.appendChild(bar);
+    });
+
+    // divergence：琥珀竖标，醒目置顶
+    divs.forEach(function (d) {
+      var x = X(d.timestampMs);
+      var tick = svgEl("line", { x1: x, y1: 14, x2: x, y2: 80, stroke: "var(--warn)", "stroke-width": "2" });
+      var title = svgEl("title", {});
+      title.textContent = fmtTime(d.timestampMs) + " · 前缀分叉 firstDiff=" + d.firstDiff +
+        " oldLen=" + d.oldLen + " newLen=" + d.newLen + " · 该轮起深缓存冷算";
+      tick.appendChild(title);
+      svg.appendChild(tick);
+    });
+
+    if (!divs.length && (s.stability ? (s.stability.divergence || 0) === 0 : true)) {
+      note.textContent = "窗口内无分叉";
+      note.style.color = "var(--muted)";
+    } else if (divs.length) {
+      note.textContent = "共 " + s.stability.divergence + " 次分叉" +
+        (divs.length < s.stability.divergence ? "（图中仅显示最近 " + divs.length + " 条）" : "");
+      note.style.color = "var(--warn)";
+    } else {
+      note.textContent = "";
+    }
+  }
+
+  function renderDivergenceTable(s) {
+    var tbody = document.querySelector("#divergence-table tbody");
+    tbody.textContent = "";
+    var st = s.stability || {};
+    var rows = st.recentDivergences || [];
+    if (!rows.length) {
+      var tr = el("tr");
+      tr.appendChild(el("td", { colspan: "5", "class": "empty-note", text: "窗口内无分叉" }));
+      tbody.appendChild(tr);
+      return;
+    }
+    var showSnips = st.snippets === "truncated";
+    rows.forEach(function (d) {
+      var tr = el("tr");
+      tr.appendChild(el("td", { text: fmtTime(d.timestampMs) }));
+      tr.appendChild(el("td", { "class": "num", text: d.firstDiff === null ? "—" : String(d.firstDiff) }));
+      tr.appendChild(el("td", { "class": "num", text: String(d.oldLen) }));
+      tr.appendChild(el("td", { "class": "num", text: String(d.newLen) }));
+      var snipCell;
+      if (!showSnips || (!d.oldSnip && !d.newSnip)) {
+        snipCell = el("td", {
+          "class": "snip",
+          text: "被策略隐藏",
+          title: "oldSnip/newSnip 可能含用户提示词：show_prompt_snippets=false 时不外传",
+        });
+      } else {
+        var clip = function (value) { value = String(value || ""); return value.length > 60 ? value.slice(0, 60) + "…" : value; };
+        snipCell = el("td", { "class": "snip", text: "旧 " + clip(d.oldSnip) + " ∥ 新 " + clip(d.newSnip), title: "已截断至 120 字符（服务端侧）" });
+      }
+      tr.appendChild(snipCell);
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderTurnsTable(s) {
+    var tbody = document.querySelector("#turns-table tbody");
+    tbody.textContent = "";
+    var turns = s.recentTurns || [];
+    if (!turns.length) {
+      var tr = el("tr");
+      tr.appendChild(el("td", { colspan: "6", "class": "empty-note", text: "窗口内无轮次" }));
+      tbody.appendChild(tr);
+      return;
+    }
+    turns.forEach(function (t) {
+      var row = el("tr");
+      row.appendChild(el("td", { text: fmtTime(t.timestampMs) }));
+      row.appendChild(el("td", { "class": "num", text: t.compaction ? "是" : "—" }));
+      var durCell = el("td", { "class": "num", text: fmtDur(t.durationMs) });
+      if (t.compaction && t.durationMs !== null && t.durationMs !== undefined) {
+        durCell.setAttribute("title", "压缩轮耗时为服务端下发口径，系统性偏小");
+      }
+      row.appendChild(durCell);
+      var outCell = el("td");
+      outCell.appendChild(outcomeBadge(t));
+      row.appendChild(outCell);
+      row.appendChild(el("td", { text: t.requestId || "—", title: t.requestId || "开流缺 requestId（旧日志形态）" }));
+      row.appendChild(el("td", { text: t.path || "—" }));
+      tbody.appendChild(row);
+    });
+  }
+
+  function render(snapshot) {
+    renderStatus(snapshot);
+    renderMetrics(snapshot);
+    renderTimeline(snapshot);
+    renderDivergenceTable(snapshot);
+    renderTurnsTable(snapshot);
+  }
+
+  function url() {
+    return "/stability?window_bytes=" + encodeURIComponent(windowSelect.value);
+  }
+
+  function fetchStateChip(text, cls) {
+    fetchState.textContent = text;
+    fetchState.className = "chip" + (cls ? " " + cls : "");
+  }
+
+  var lastError = false;
+  function refresh() {
+    if (document.hidden) { return; }
+    fetch(url(), { cache: "no-store" })
+      .then(function (response) {
+        if (!response.ok) { throw new Error("HTTP " + response.status); }
+        return response.json();
+      })
+      .then(function (snapshot) {
+        render(snapshot);
+        lastError = false;
+        fetchStateChip("已更新 " + fmtTime(Date.now()));
+      })
+      .catch(function (error) {
+        // 拉取失败是真实故障信号：红色。
+        fetchStateChip("拉取失败：" + error.message, "bad");
+      });
+  }
+
+  function restartTimer() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (refreshToggle.checked) {
+      timer = setInterval(refresh, parseInt(refreshInterval.value, 10));
+    }
+  }
+
+  windowSelect.addEventListener("change", refresh);
+  refreshToggle.addEventListener("change", restartTimer);
+  refreshInterval.addEventListener("change", restartTimer);
+  restartTimer();
+  refresh();
+})();
+</script>
+</body>
+</html>

@@ -14,6 +14,7 @@
 //! 上游失败一律走 `responses_error_from_upstream`，把各家错误整成 Responses 错误信封，
 //! 失败原因同时落进诊断日志——否则现场只能看到「502 Unknown error」。
 
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::io::Read;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
+use axum::extract::Query;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
@@ -45,6 +47,7 @@ use codex_layer::protocol_proxy::{
     upstream_conversion_error_response,
 };
 use codex_layer::stability::{self, StabilityAggregateOptions};
+use codex_layer::stability_ui;
 
 /// 请求体上限（含解压后）：32 MB。
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -105,6 +108,7 @@ fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> 
     let app = Router::new()
         .route("/healthz", any(healthz))
         .route("/stability", any(stability_endpoint))
+        .route("/stability/ui", any(stability_ui_endpoint))
         .with_state(stability_state)
         .fallback(any(dispatch));
 
@@ -218,7 +222,10 @@ struct StabilityState {
 
 /// `GET /stability`：惰性读诊断日志尾部窗口，返回稳定性快照（只读，issue #19）。
 /// 聚合是纯函数；时钟与文件窗口形态等装配层字段在这里补上。
-async fn stability_endpoint(State(state): State<Arc<StabilityState>>) -> Response {
+async fn stability_endpoint(
+    State(state): State<Arc<StabilityState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     if !state.enabled {
         return json_response(
             StatusCode::NOT_FOUND,
@@ -228,12 +235,24 @@ async fn stability_endpoint(State(state): State<Arc<StabilityState>>) -> Respons
             }),
         );
     }
+    let window_bytes = match parse_window_bytes_override(&params, state.window_bytes) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            let _ = log_event(
+                "codex_layer.stability_bad_request",
+                json!({ "message": message }),
+            );
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"status": "failed", "message": message}),
+            );
+        }
+    };
     let options = StabilityAggregateOptions {
         show_prompt_snippets: state.show_prompt_snippets,
         ..StabilityAggregateOptions::default()
     };
     let path = diagnostic_log::diagnostic_log_path();
-    let window_bytes = state.window_bytes;
     let read = tokio::task::spawn_blocking(move || read_log_tail(&path, window_bytes)).await;
     let tail = match read {
         Ok(Ok(tail)) => tail,
@@ -261,6 +280,48 @@ async fn stability_endpoint(State(state): State<Arc<StabilityState>>) -> Respons
     snapshot["window"]["windowBytes"] = json!(window_bytes);
     snapshot["window"]["truncated"] = json!(tail.truncated);
     json_response(StatusCode::OK, snapshot)
+}
+
+/// `/stability` 查询参数 `window_bytes` 覆盖的上下界：下限 1 KB 防空转，
+/// 上限 64 MB 防监看页误读整本日志。
+const MIN_WINDOW_BYTES_OVERRIDE: u64 = 1_024;
+const MAX_WINDOW_BYTES_OVERRIDE: u64 = 67_108_864;
+
+/// 解析查询串里的 `window_bytes` 覆盖：缺省用配置默认值；非数字或 0 明确
+/// 报 400（fail-loud：界面传错窗口要让它看见，静默吞掉会让监看页拿到
+/// 口径不符的快照而不自知）；其余钳进上下界。
+fn parse_window_bytes_override(
+    params: &HashMap<String, String>,
+    default_bytes: u64,
+) -> Result<u64, String> {
+    let Some(raw) = params.get("window_bytes") else {
+        return Ok(default_bytes);
+    };
+    let parsed: u64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("window_bytes 必须是字节数正整数（收到 {raw:?}）"))?;
+    if parsed == 0 {
+        return Err("window_bytes 不能为 0".to_string());
+    }
+    Ok(parsed.clamp(MIN_WINDOW_BYTES_OVERRIDE, MAX_WINDOW_BYTES_OVERRIDE))
+}
+
+/// `GET /stability/ui` 监看页（issue #20）：自包含 HTML，零外部依赖，
+/// 始终 200——数据面未启用时渲染可读的禁用页而不是报错页。
+async fn stability_ui_endpoint(State(state): State<Arc<StabilityState>>) -> Response {
+    let html = stability_ui::render(!state.enabled);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(html))
+        .unwrap_or_else(|error| {
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"status": "failed", "message": format!("构建页面响应失败：{error}")}),
+            )
+        })
 }
 
 struct LogTail {
@@ -901,4 +962,52 @@ fn sse_response(stream: impl futures_util::Stream<Item = StreamItem> + Send + 's
         .unwrap_or_else(|error| {
             proxy_error("/v1/responses", StatusCode::BAD_GATEWAY, &error.to_string())
         })
+}
+
+#[cfg(test)]
+mod stability_endpoint_tests {
+    use super::{
+        MAX_WINDOW_BYTES_OVERRIDE, MIN_WINDOW_BYTES_OVERRIDE, parse_window_bytes_override,
+    };
+    use std::collections::HashMap;
+
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn window_bytes_override_absent_uses_config_default() {
+        let params = query(&[]);
+        assert_eq!(parse_window_bytes_override(&params, 8192), Ok(8192));
+    }
+
+    #[test]
+    fn window_bytes_override_clamps_to_bounds() {
+        let small = query(&[("window_bytes", "10")]);
+        assert_eq!(
+            parse_window_bytes_override(&small, 8192),
+            Ok(MIN_WINDOW_BYTES_OVERRIDE)
+        );
+        let big = query(&[("window_bytes", "999999999999")]);
+        assert_eq!(
+            parse_window_bytes_override(&big, 8192),
+            Ok(MAX_WINDOW_BYTES_OVERRIDE)
+        );
+        let mid = query(&[("window_bytes", " 65536 ")]);
+        assert_eq!(parse_window_bytes_override(&mid, 8192), Ok(65536));
+    }
+
+    #[test]
+    fn window_bytes_override_fails_loud_on_garbage() {
+        for bad in ["abc", "0", "-1", "12.5", ""] {
+            let params = query(&[("window_bytes", bad)]);
+            assert!(
+                parse_window_bytes_override(&params, 8192).is_err(),
+                "非法值 {bad:?} 必须 fail-loud 报 400，而不是静默钳位或吞掉"
+            );
+        }
+    }
 }
