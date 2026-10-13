@@ -709,4 +709,63 @@ mod tests {
         assert_eq!(recent[4]["timestampMs"], json!(1008));
         assert_eq!(snapshot["stability"]["divergence"], json!(12));
     }
+
+    /// 监看侧消费的每个事件名（与 `aggregate_stability_snapshot` 的 match 分支
+    /// 一一对应）。本模块两条测试共用它，避免"清单与期望数各自漂"。
+    const CONSUMED_EVENTS: &[&str] = &[
+        events::layer::STARTED,
+        events::layer::STREAM_OPEN,
+        events::layer::STREAM_COMPLETED,
+        events::layer::STREAM_FAILED,
+        events::layer::CONVERSION_REJECTED,
+        events::layer::UPSTREAM_ERROR,
+        events::proxy::STABILIZER_PREFIX_BASELINE,
+        events::proxy::STABILIZER_PREFIX_DIVERGENCE,
+        events::proxy::STABILIZER_COMPACTION_APPENDED,
+        events::proxy::STABILIZER_DEDUP_LAST_FOLDED,
+        events::proxy::STABILIZER_UNPAIRED_NOTICE_STRIPPED,
+    ];
+
+    /// #31 判据（正向）：监看侧消费的每个事件名都必须在事件名登记表在册。
+    /// 聚合与界面用 `events` 常量匹配，编译器保证拼写与可见性；但各族的
+    /// `ALL` 数组是手工维护的，"常量存在却没进 ALL"编译器管不着——一旦发生，
+    /// 按 ALL 枚举的外部消费者就会漏掉这一类统计。这条核对补的正是这个缺口。
+    #[test]
+    fn consumed_event_names_are_registered() {
+        let registered: std::collections::HashSet<&str> = events::layer::ALL
+            .iter()
+            .chain(events::proxy::ALL.iter())
+            .chain(events::misc::ALL.iter())
+            .copied()
+            .collect();
+        for name in CONSUMED_EVENTS {
+            assert!(registered.contains(name), "消费侧使用了未登记的事件名：{name}");
+        }
+    }
+
+    /// #31 判据（反向）：上面的清单必须与 match 分支一一对应。计数只认
+    /// "行首是 `events::`、且带 ` => `"的行"——这正是 match 分支的唯一书写形状，
+    /// 测试辅助代码不会长成这个形状。缺了这条反向核对，"加一个消费分支却忘了
+    /// 同步清单"会一路绿过去。
+    #[test]
+    fn consumed_event_list_covers_every_match_arm() {
+        let source = include_str!("stability.rs");
+        let production = match source.find("#[cfg(test)]") {
+            Some(pos) => &source[..pos],
+            None => source,
+        };
+        let arms = production
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("events::") && trimmed.contains(" => ")
+            })
+            .count();
+        assert_eq!(
+            arms,
+            CONSUMED_EVENTS.len(),
+            "match 分支数与清单不符：新增/删除消费分支后必须同步 CONSUMED_EVENTS"
+        );
+    }
+
 }
