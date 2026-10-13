@@ -1,6 +1,5 @@
-// 移植来源：CodexPlusPlus PR #2449 的 `crates/codex-plus-core/src/diagnostic_log.rs`，
-// commit f9be7cf。稳定层的全部事件都走这里（JSONL 追加 + 超限裁剪）。本项目只把
-// 默认落点从 `~/.codex-session-delete/codex-plus.log` 挪到 `~/.codex-layer/codex-layer.log`。
+// 稳定层的全部诊断事件都走这里：JSONL 追加 + 超限裁剪。
+// 默认落点 `~/.codex-layer/codex-layer.log`，可由配置里的诊断日志路径覆盖。
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
