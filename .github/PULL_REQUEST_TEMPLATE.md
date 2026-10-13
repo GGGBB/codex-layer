@@ -25,6 +25,7 @@ Closes #
 <!-- 是否触及核心转换 / 钉定模块（protocol_proxy.rs、compaction_*.rs、
      prefix_divergence.rs 及对应测试）：不改行为的搬运与接入改动是否真的
      未改行为；与行为演进是否已分开提交。 -->
+
 ## 自查清单
 
 - [ ] 已关联 issue，`type/*` 与 `P1`/`P2` 标签已打
