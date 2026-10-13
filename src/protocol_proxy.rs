@@ -7843,6 +7843,21 @@ mod response_compatibility_tests {
         assert!(!supports_reasoning_effort("glm-5.3"));
     }
 
+    /// 白名单是「已验证模型 ID」的精确匹配（上游 #2464 只验过裸 ID），
+    /// 带供应商前缀的常见写法 `google/gemini-3.8-flash` 会静默不命中。
+    /// 本条把现状钉成显式定义：不命中（与本函数 gpt 白名单同样不剥前缀的
+    /// 形态一致）；该写法的显式转发路径是严格 OpenAI 协议开关
+    /// （`contains("gemini")` 放行路），一并断言钉住，不留「未测试=未定义」。
+    #[test]
+    fn vendor_prefixed_whitelist_id_requires_strict_opt_in() {
+        assert!(!supports_reasoning_effort("google/gemini-3.8-flash"));
+        let body = responses_to_chat_completions_with_options(json!({
+            "model": "google/gemini-3.8-flash", "input": "hi", "reasoning": {"effort": "high"}
+        }), true, false)
+        .unwrap();
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
     /// 严格开关只额外放行 Gemini 系：非 Gemini 的 Default 方言模型（如 llama）
     /// 不得因开关打开而被多写 `reasoning_effort`——fail-closed 兜底，
     /// 固定住「白名单与 Gemini 子串之外的模型不受影响」这条验收标准。
