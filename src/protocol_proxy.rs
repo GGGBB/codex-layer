@@ -1,7 +1,3 @@
-// 移植来源：CodexPlusPlus PR #2449（prompt-prefix stabilizer）的
-// `crates/codex-plus-core/src/protocol_proxy.rs`，commit f9be7cf。本项目只改外围装配流
-// （单上游、无多渠道轮换与渠道限流、图片策略只留 send-as-is / strip），
-// 前缀钉定与协议转换的纯函数逐行未改。
 //! Codex Responses API 与 OpenAI Chat Completions 的本地协议转换。
 //!
 //! Codex Chat 与 Responses 协议之间的转换实现。
@@ -24,7 +20,7 @@ pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 ///
 /// Gemini 3 系在 functionCall 上要求回传 `thought_signature`（OpenAI 兼容层放在
 /// tool_call 的 `extra_content.google.thought_signature`），缺失时整轮 400
-/// （issue #332 / #1012）。这类字段由上游产生、本仓不理解其语义，因此不硬编码
+/// 这类字段由上游产生、本仓不理解其语义，因此不硬编码
 /// 任何字段名，而是把整个 `extra_content` 原样记住，下一轮构造请求时挂回对应
 /// tool_call。只做透传，解析失败/无该字段时行为与改动前完全一致。
 ///
@@ -117,7 +113,7 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
 /// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
 ///
 /// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
-/// 但少数机器（issue #2189）上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
+/// 但少数机器上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
 /// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
 /// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
 pub fn protocol_proxy_port() -> u16 {
@@ -151,7 +147,7 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
 const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
 
 /// 进程内上游配置载体。独立二进制的上游来自 TOML（见 `config.rs`），启动时注入一次；
-/// 未注入时按原路从设置文件读取——从 CodexPlusPlus 带过来的测试依赖这条路径，
+/// 未注入时按原路从设置文件读取——既有测试依赖这条路径，
 /// 它们用 `paths::set_settings_path_for_tests` 把设置文件指到临时目录。
 static RUNTIME_SETTINGS: OnceLock<Mutex<Option<BackendSettings>>> = OnceLock::new();
 
@@ -176,7 +172,7 @@ fn load_request_settings() -> BackendSettings {
 }
 
 /// 模型列表 / 语音 / 图片这几条旁路取上游：本项目单上游，直接取激活项。
-/// （CodexPlusPlus 在这里做多渠道探活与轮换选择，独立项目没有渠道池概念。）
+/// （多渠道探活与轮换选择属聚合形态功能，本项目单上游，没有渠道池概念。）
 fn probe_relay(settings: &BackendSettings) -> anyhow::Result<crate::settings::RelayProfile> {
     Ok(settings.active_relay_profile())
 }
@@ -271,7 +267,7 @@ struct CodexToolContext {
     function_tools: BTreeMap<String, CodexFunctionToolSpec>,
     /// 客户端自己声明过的上行工具名（function / custom / tool_search / 命名空间子项），
     /// 与上面两张表一起登记，但原生声明不得污染它。用于「客户端声明优先」的归一
-    /// 判据（issue #13 残余 2，本仓库自研，参照树无对应实现）。
+    /// 判据（issue #13 残余 2）。
     client_tool_names: BTreeSet<String>,
     has_custom_tools: bool,
     has_namespace_tools: bool,
@@ -338,11 +334,11 @@ impl CodexToolContext {
 
     /// 上游把 codex 的原生 `web_search` 工具当成普通自定义工具回传时，中转层
     /// 此前一律产出 `custom_tool_call`，而客户端只认 `web_search_call`
-    /// （issue #1209 / #586：web_search 被错译成 custom_tool_call 后，客户端
+    /// （实测：web_search 被错译成 custom_tool_call 后，客户端
     /// 拿不到搜索结果，表现为「工具调用后无反应」或上游报 tool 名不识别）。
     ///
-    /// 归一优先级（issue #13 残余 2，本仓库自研：参照树 `build_codex_tool_context`
-    /// 只靠声明遍历的先后顺序决定同一名字归谁）：同名判定键是「Chat 上行工具名
+    /// 归一优先级（issue #13 残余 2）：此前同一上行名归谁只取决于声明遍历
+    /// 的先后顺序。同名判定键是「Chat 上行工具名
     /// `name`」，即上面两张表的键（回程就是拿 `tool_calls[].function.name` 查这些键），
     /// 不看声明的 `type`；命名空间子项按展平后的上行名登记。同名冲突时客户端声明
     /// 优先：名字出现在 `client_tool_names` 里（客户端执行侧声明过）就不再当作原生搜索
@@ -402,7 +398,7 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
-/// Chat 转换遇到无法表达的加密 agent 内容时的结构化错误（GAP_ANALYSIS P0-3）：
+/// Chat 转换遇到无法表达的加密 agent 内容时的结构化错误：
 /// 不能静默跳过空片段后继续发一个被抽空任务内容的请求。
 #[derive(Debug)]
 pub struct UnsupportedEncryptedAgentContent;
@@ -430,11 +426,9 @@ impl UnsupportedEncryptedAgentContent {
 }
 
 /// Chat 路由不执行服务端原生搜索：请求里声明了顶层 `web_search` 类原生工具，
-/// 或 `tool_choice` 强制原生搜索时的结构化错误（issue #3 / GAP_ANALYSIS P1-3）。
+/// 或 `tool_choice` 强制原生搜索时的结构化错误（issue #3）。
 /// 剥掉声明之后上游不会再被邀请「假调用」；强制原生搜索无法降级，只能显式拒绝。
 
-/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`
-/// （fix: reject unsupported native search in chat relay）。
 #[derive(Debug)]
 pub struct UnsupportedNativeWebSearch;
 
@@ -497,8 +491,8 @@ fn has_client_executed_tool_named(tools: &[Value], name: &str, depth: usize) -> 
 /// 返回是否发生了剥离。
 /// 只删「被本层剥空」的命名空间：客户端本来就声明成空的命名空间原样保留。
 ///
-/// 本仓库自研（issue #13 残余 1）：参照树的 `remove_unsupported_native_search`
-/// （commit `5eaa66c`）只看顶层 `type`，对命名空间子项内的声明无处理。
+/// 本仓库自研（issue #13 残余 1）：`remove_unsupported_native_search` 此前只看
+/// 顶层 `type`，对命名空间子项内的声明无处理。
 fn strip_native_search_tools(tools: &mut Vec<Value>, depth: usize) -> bool {
     let before = tools.len();
     tools.retain(|tool| {
@@ -539,8 +533,6 @@ fn strip_native_search_tools(tools: &mut Vec<Value>, depth: usize) -> bool {
 /// 从 Chat 请求里剥掉 `web_search` 类原生工具声明（含 `namespace` 子项内的）：
 /// 留着声明等于邀请模型回一个「没有真正执行」的搜索调用（谎报 completed 的源头）。
 /// 同名 function/custom 和命名空间、tool_search 工具由客户端执行，必须保留。
-///
-/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`。
 fn remove_unsupported_native_search(body: &mut Value) -> anyhow::Result<()> {
     let choice = body.get("tool_choice");
     if choice
@@ -581,7 +573,7 @@ fn remove_unsupported_native_search(body: &mut Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 历史里的原生压缩状态无法转成文本摘要时的结构化错误（GAP_ANALYSIS P0-3）：
+/// 历史里的原生压缩状态无法转成文本摘要时的结构化错误：
 /// 错误体给可行动文案（换 Responses 上游或新开会话），不假装能转换。
 #[derive(Debug)]
 pub struct NativeCompactionUnsupported {
@@ -642,7 +634,7 @@ pub fn responses_to_chat_completions_with_options(
     remove_unsupported_native_search(&mut body)?;
 
     // 本地摘要先就地展开（只认命名空间内的项），剩下的 `compaction` 项
-    // 都是上游原生状态，不得当明文回放（GAP_ANALYSIS P0-2/P0-3）。
+    // 都是上游原生状态，不得当明文回放。
     expand_local_compaction_history(&mut body);
     // fail-loud 闸门：没被展开的 `compaction` 项就是原生 opaque 状态，
     // 明确报错而不是静默抽空任务内容后继续发请求。
@@ -1174,7 +1166,7 @@ impl CompactionSseConverter {
         let compaction_item = json!({
             "id": self.compaction_id,
             "type": COMPACTION_OUTPUT_TYPE,
-            // GAP_ANALYSIS P0-2：本地摘要必须带命名空间，否则回放时无法与
+            // 本地摘要必须带命名空间，否则回放时无法与
             // 上游原生 opaque 状态区分，会被当成明文重复展开。
             "encrypted_content": format!("{LOCAL_COMPACTION_PREFIX}{}", json!(self.summary))
         });
@@ -1278,7 +1270,7 @@ fn extract_summary_text_from_response_item(item: &Value) -> String {
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
-        // GAP_ANALYSIS P0-2：上游 `compaction` 项携带的是原生 opaque 状态，
+        // 上游 `compaction` 项携带的是原生 opaque 状态，
         // 不是本层可读的摘要文本；取不到文本就会走「空摘要→failed」。
         _ => String::new(),
     }
@@ -1298,7 +1290,7 @@ fn extract_summary_text_from_chat(response: &Value) -> String {
 }
 
 /// 历史回放：把 codex 历史里的 `compaction` item 展开成明文 user 消息。
-/// 展开只认本项目命名空间内、可解码的摘要（GAP_ANALYSIS P0-2）：
+/// 展开只认本项目命名空间内、可解码的摘要：
 /// 未标记或解码失败的项一律不展开，留给调用方按原生状态处理，
 /// 绝不把 opaque 密文的 base64 整段当用户文本喂给上游。
 fn expand_compaction_item(item: &Value) -> Option<Value> {
@@ -1724,8 +1716,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     {
         request_json["model"] = Value::String(route.upstream_model.clone());
     }
-    // 单上游形态：命中模型路由就用路由目标上游，否则用激活上游。CodexPlusPlus 在这里
-    // 做多渠道轮换、故障转移与冷却重试；独立项目没有渠道池，整块属于上游专有功能。
+    // 单上游形态：命中模型路由就用路由目标上游，否则用激活上游。多渠道轮换、故障转移
+    // 与冷却重试属聚合形态功能，本项目没有渠道池，整块不携带。
     let relay = match &model_route {
         Some(route) => route.relay.clone(),
         None => settings.active_relay_profile(),
@@ -1815,7 +1807,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
     Ok(UpstreamProxyResponse {
         status_code,
-        // GAP_ANALYSIS P0-6：请求了 SSE 的兼容上游也可能直接返回 JSON 摘要
+        // 请求了 SSE 的兼容上游也可能直接返回 JSON 摘要
         // （部分网关无视 stream 直接回 application/json）。若仍按请求侧 stream
         // 标记，main.rs 会把 JSON 摘要丢进 SSE 解析路径，提出 0 段文本后
         // 只能给出 failed 压缩响应。这里改由响应侧 content-type 决断，
@@ -2199,7 +2191,7 @@ async fn upstream_request_parts(
             }
         }
     } else if relay.stabilize_prompt_prefix {
-        // 514-msg 流式压缩路径（codex++ 自动压缩）：既不走 /responses/compact
+        // 514-msg 流式压缩路径（客户端自动压缩形态）：既不走 /responses/compact
         // 也不带 compaction_trigger，compact 判定落空；由前缀对齐按指令签名检出，
         // 做「末尾唯一 user 指令 + tools 字节回填」。检出即跳过 remember_tools，
         // 杜绝把压缩轮的 tools=[] 毒化进回填缓存；未检出才是普通轮，照常记录。
@@ -2268,8 +2260,8 @@ async fn upstream_request_parts(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    // 图片策略（逐模型）：原样发送 / 剥离。上游的第三档 VLM 描述管线依赖它自己的
-    // 缓存与配置，属 CodexPlusPlus 增值功能，独立项目不携带。
+    // 图片策略（逐模型）：原样发送 / 剥离。第三档 VLM 描述管线需要额外的模型
+    // 配置与图片缓存体系，超出稳定层职责，本层不携带。
     if !model.is_empty()
         && crate::vision::image_handling_mode(&model, &relay.model_vlm) == crate::vision::ImageHandling::Strip
     {
@@ -2667,7 +2659,7 @@ pub fn response_id_from_chat_id(id: Option<&str>) -> String {
 }
 
 /// `resp_xxx` → `xxx`。message item 的 id 必须以 `msg_` 开头，
-/// 直接拼在 `response_id` 后面会得到上游拒收的 `resp_xxx_msg`（#1431）。
+/// 直接拼在 `response_id` 后面会得到上游拒收的 `resp_xxx_msg`。
 fn response_id_body(response_id: &str) -> &str {
     response_id
         .strip_prefix("resp_")
@@ -3063,7 +3055,7 @@ impl ChatSseState {
                 state.call_id = id;
             }
             // 流式场景下 thought_signature/extra_content 通常随首个分片到达，
-            // 此时 call_id 已就位；按 call_id 记住，供下一轮回传（issue #332/#1012）。
+            // 此时 call_id 已就位；按 call_id 记住，供下一轮回传。
             if !state.call_id.is_empty() {
                 remember_tool_call_extra_content(&state.call_id, tool_call);
             }
@@ -3340,7 +3332,7 @@ impl ChatSseState {
 
     /// 失败收口：只发 `response.failed`，**不补 `data: [DONE]`**（issue #13 残余 3 定档）。
     /// 口径依据两条实证，不靠猜：
-    /// 1. 参照树同位置的 `failed_into` 也不补 `[DONE]`，移植区保持与来源逐行可比；
+    /// 1. 只有正常完成的终态才在事件后补 `[DONE]`，失败路径从未带过它；
     /// 2. 本仓库流泵里已经写着「必须显式补一个 failed 事件，否则客户端会永远等下去」——
     ///    终态由 `response.failed` 事件本身表达，HTTP body 随后 EOF 收尾；`[DONE]`
     ///    只跟在正常完成的终态后面。
@@ -3566,7 +3558,7 @@ fn truncate_error_preview(input: &str) -> String {
 /// Responses 协议要求每个 input item 的 `id` 前缀与它的 `type` 对应，
 /// 例如 `message` 必须是 `msg_`、`function_call` 必须是 `fc_`。
 /// 前缀不匹配时上游直接以 `[ApiIdParam] [input[N].id] [invalid_id_prefix]` 拒绝**整份**请求，
-/// 于是这段历史被反复重放、会话永久不可用（#1431 / #1781 / #1796）。
+/// 于是这段历史被反复重放、会话永久不可用。
 ///
 /// 前缀表取自 Codex 自己的 rollout 记录（`~/.codex/sessions/**/rollout-*.jsonl`），
 /// 不是猜测：`message`/`reasoning`/`custom_tool_call`/`custom_tool_call_output`/
@@ -3627,9 +3619,9 @@ fn normalize_responses_item_id(item: &mut Value) {
     // 剥掉 id 上现有的前缀再换新的。取**最长**匹配：`fc_` 是 `fco_` 的前缀，
     // 先撞上短的会把 `fco_call_a` 剥成 `call_a` 再换成 `fc_call_a`，
     // 把 function_call_output 错改成 function_call。
-    // `item_` 是历史版本 Codex++ 自己造的前缀；`cp_` 来自压缩项错误使用
+    // `item_` 是历史版本客户端自己造的前缀；`cp_` 来自压缩项错误使用
     // `cp_{response_id}` 的版本；`resp_` 来自历史版本把 message item 命名成
-    // `{response_id}_msg`（#1431 / #1781），都要一并剥掉。
+    // `{response_id}_msg`，都要一并剥掉。
     let suffix = ["item_", "cp_", "resp_"]
         .into_iter()
         .chain(RESPONSES_ITEM_ID_PREFIXES.iter().map(|(_, known)| *known))
@@ -3941,11 +3933,11 @@ fn append_responses_item(
         }
         Some(COMPACTION_OUTPUT_TYPE) => {
             // 本地摘要已在入口处展开；能走到这里的都是上游原生状态，
-            // 不得伪造成明文；入口闸门已经拦住（GAP_ANALYSIS P0-2/P0-3）。
+            // 不得伪造成明文；入口闸门已经拦住。
         }
         Some("encrypted_content") => {
             // 顶层独立 encrypted_content item：content 为 null 时旧实现会落到兜底
-            // 分支被静默丢弃，等于静默发出一个被抽空任务内容的请求（P0-3）。
+            // 分支被静默丢弃，等于静默发出一个被抽空任务内容的请求。
             return Err(UnsupportedEncryptedAgentContent.into());
         }
         Some(COMPACTION_TRIGGER_TYPE) => {
@@ -4005,7 +3997,7 @@ fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
 /// 这里把没有配对 output 的 tool_call 从消息里摘掉，降级成文本保留在历史中，
 /// 避免丢失「模型曾试图调用某工具」这一信息。
 /// 把插在「连续 tool 结果」之间的非 tool 消息整体搬到该 tool 区之后
-/// （issue #2275 / #2257）。
+/// 。
 ///
 /// 上游 codex 会把 `<image_resize_notice>` 这类提示以 developer（映射成 system）
 /// 或 user 消息的形式插在两条 tool 结果之间，形成夹心结构：
@@ -4075,7 +4067,7 @@ fn relocate_interleaved_non_tool_messages(messages: &mut Vec<Value>) {
     }
 }
 
-/// 把没有前置 `tool_calls` 的 tool 消息降级成 user（issue #2275 / #2257 的防线）。
+/// 把没有前置 `tool_calls` 的 tool 消息降级成 user（回归防线）。
 ///
 /// `enforce_tool_call_pairing` 目前只清理 assistant 侧（把 orphaned 的 tool_call
 /// 从 `tool_calls` 摘掉），被摘掉的那些 tool 消息本身仍留在原位，上游会直接
@@ -4340,7 +4332,7 @@ fn normalize_chat_messages(messages: &mut [Value]) {
 ///
 /// 之前只处理 content 是字符串的 system 消息：数组形态（content parts）与 null
 /// 的会原样留在**原位**，于是出现「system 不在最前」——MiniMax 这类上游会直接
-/// 拒绝（issue #1394 / #410）；空内容的 system 也照样发出去。
+/// 拒绝；空内容的 system 也照样发出去。
 /// 现在无论 content 是什么形态都统一收拢，空的直接丢弃。
 /// 取出 system 消息的纯文本：字符串直接返回，content parts 数组把 text 段拼起来，
 /// 其余形态（null / 对象）按空处理。
@@ -4993,7 +4985,7 @@ fn mark_current_user_turn(messages: &mut Vec<Value>) {
             unwrap_current_turn_mark(message);
         }
     }
-    // 只在请求确实以 user 输入收尾时才钉标记（GAP_ANALYSIS P0-1，维护者 P1）：
+    // 只在请求确实以 user 输入收尾时才钉标记（维护者 P1）：
     // 等待工具结果后的继续请求末尾是 tool/assistant 角色，此时最后一条 user
     // 是历史旧问题，钉上会把历史问题误导成「当前问题」。
     // 非 user 收尾：解包已完成，直接返回。
@@ -5165,7 +5157,7 @@ fn flush_tool_calls(
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
-            // 合并路径同样要消费 pending_reasoning（issue #2210）。
+            // 合并路径同样要消费 pending_reasoning。
             // 触发时序：reasoning item → 不带 tool_calls 的 assistant 文本消息
             // （pending_tool_calls 为空，reasoning 被附加到该文本消息并 take）→
             // function_call。此时最后一条已是 assistant，走本分支提前 return，
@@ -5336,7 +5328,7 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> anyhow::Re
                     .or_else(|| part.get("text"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                // 空片段同样不得静默跳过（#2474 语义）；错误文本不回显原文。
+                // 空片段同样不得静默跳过；错误文本不回显原文。
                 if value.is_empty() || encrypted_content_value_is_opaque(value) {
                     return Err(UnsupportedEncryptedAgentContent.into());
                 }
@@ -5790,7 +5782,7 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
         .is_some_and(|object| object.len() == 1 && object.contains_key("$ref"));
     if !is_bare_ref {
         // `type: null` 与缺失等价：严格供应商（如 deepseek）会以
-        // `got 'type: null'` 拒绝整个请求（issue #2247）。
+        // `got 'type: null'` 拒绝整个请求。
         if normalized.get("type").is_none_or(Value::is_null) {
             normalized["type"] = json!("object");
         }
@@ -5802,14 +5794,14 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
         }
     }
     let normalized = inline_ref_siblings(&normalized);
-    // 必须先内联再摊平：合并分支时 $defs 已摊开才拿得到真实属性（issue #2367）。
+    // 必须先内联再摊平：合并分支时 $defs 已摊开才拿得到真实属性。
     flatten_top_level_combinators(normalized)
 }
 
 /// JSON Schema 的顶层组合器（`oneOf` / `anyOf` / `allOf`）。
 const SCHEMA_COMBINATOR_KEYS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
 
-/// 摊平工具 schema **顶层**的组合器（issue #2367）。
+/// 摊平工具 schema **顶层**的组合器。
 ///
 /// zod-to-json-schema 会生成形如
 /// `{type:"object", properties:{}, oneOf:[{$ref:"#/$defs/__schema0"},…], $defs:{…}}`
@@ -6545,7 +6537,7 @@ fn chat_tool_call_to_response_item(
     let name = function.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = responses_arguments_to_chat(function.get("arguments").unwrap_or(&json!({})));
     // 记住供应商在本轮工具调用上附带的透传数据（Gemini thought_signature 等），
-    // 下一轮构造请求时挂回，否则整轮 400（issue #332 / #1012）。
+    // 下一轮构造请求时挂回，否则整轮 400。
     remember_tool_call_extra_content(&call_id, tool_call);
     response_tool_call_item(&call_id, name, &arguments, tool_context)
 }
@@ -6575,7 +6567,7 @@ fn tool_call_added_item(
 ) -> Value {
     if tool_context.is_builtin_web_search_proxy(&state.name) {
         // 客户端只认 web_search_call；用 custom_tool_call 会被当作未知工具丢弃，
-        // 上游那轮的搜索结果就再也回不到会话里（issue #1209 / #586）。
+        // 上游那轮的搜索结果就再也回不到会话里。
         return json!({
             "type": "response.output_item.added",
             "output_index": output_index,
@@ -6839,8 +6831,6 @@ fn web_search_action_from_arguments(arguments: &str) -> Value {
 /// action 里是否真的带了可追溯的检索目标（query / queries / url）。
 /// 客户端剩下只有 `{"type":"search"}` 时，回放文案要说「没留下查询词」，
 /// 不能含糊地讲成「搜过了、结果没存下来」。
-///
-/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`。
 fn web_search_action_has_target(action: &Value) -> bool {
     action
         .get("query")
@@ -6865,8 +6855,6 @@ fn web_search_action_has_target(action: &Value) -> bool {
 /// 是否为「本层产出的原生搜索项」。Chat 路由下的 `web_search_call` 只可能来自
 /// 上游伪造的 function 调用（真正的原生搜索走 Responses 上游，不经这里），
 /// 因此只要出现就是谎报源，整响应必须 failed（issue #3）。
-///
-/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`。
 fn invalid_web_search_output_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("web_search_call")
 }
@@ -7188,7 +7176,7 @@ fn response_output_text(value: &Value) -> String {
 const IMAGE_DATA_URL_PREFIX: &str = "data:image/";
 
 /// 这些上游只接受**纯 base64**，不认 `data:image/png;base64,` 前缀，收到就 400
-/// （issue #2031：GLM-5.3-Flash 的本地图片被拒）。只对这类供应商剥离前缀，
+/// （实测：GLM-5.3-Flash 的本地图片被拒）。只对这类供应商剥离前缀，
 /// 标准 data URL 上游（OpenAI 等）保持原样，免得把能用的改坏。
 fn upstream_needs_bare_base64(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
@@ -7956,7 +7944,7 @@ fn supports_reasoning_effort(model: &str) -> bool {
             .is_some_and(|ch| ch.is_ascii_digit() && ch >= '5')
         || infer_chat_reasoning_style(model) == ChatReasoningStyle::DeepSeek
         || infer_chat_reasoning_style(model) == ChatReasoningStyle::LowHigh
-        // #2464 已验证的网关模型；其它 Gemini 由供应商的标准协议开关显式启用。
+        // 已验证的网关模型；其它 Gemini 由供应商的标准协议开关显式启用。
         || model.eq_ignore_ascii_case("gemini-3.8-flash")
 }
 
@@ -7971,10 +7959,7 @@ fn is_openai_o_series(model: &str) -> bool {
 
 /// 与各家 Chat 网关的兼容性对拍（含 Gemini 系 `reasoning_effort` 转发闸门，issue #4）。
 ///
-/// 移植来源：BigPizzaV3/CodexPlusPlus commit `943d814`（fix: harden Gemini reasoning
-/// and web search conversion）经 commit `5eaa66c` 收敛后的最终形态（上游 issue
-/// #2464）；断言逐字保留。参照侧该模块另有的 web_search 谎报对拍已随本仓库
-/// issue #3 的移植落地在 `native_search_guard_tests`，不重复搬运。
+/// web_search 谎报对拍不在本模块重复：它已落在 `native_search_guard_tests`。
 #[cfg(test)]
 mod response_compatibility_tests {
     use super::*;
@@ -7999,7 +7984,7 @@ mod response_compatibility_tests {
         assert!(!supports_reasoning_effort("glm-5.3"));
     }
 
-    /// 白名单是「已验证模型 ID」的精确匹配（上游 #2464 只验过裸 ID），
+    /// 白名单是「已验证模型 ID」的精确匹配（验证时只验过裸 ID），
     /// 带供应商前缀的常见写法 `google/gemini-3.8-flash` 会静默不命中。
     /// 本条把现状钉成显式定义：不命中（与本函数 gpt 白名单同样不剥前缀的
     /// 形态一致）；该写法的显式转发路径是严格 OpenAI 协议开关
@@ -8027,7 +8012,7 @@ mod response_compatibility_tests {
     }
 }
 
-/// 供应商自定义请求头必须真正写进发往上游的请求（issue #1685）。
+/// 供应商自定义请求头必须真正写进发往上游的请求。
 #[cfg(test)]
 mod relay_custom_header_tests {
     use super::*;
@@ -8260,10 +8245,7 @@ mod prefix_stabilizer_tests {
 
 }
 
-/// Chat 路由「不执行服务端原生搜索」守卫链（issue #3 / GAP_ANALYSIS P1-3）。
-///
-/// 移植来源：BigPizzaV3/CodexPlusPlus commit `5eaa66c`
-/// （fix: reject unsupported native search in chat relay）。
+/// Chat 路由「不执行服务端原生搜索」守卫链（issue #3）。
 #[cfg(test)]
 mod native_search_guard_tests {
     use super::*;
@@ -8420,7 +8402,7 @@ mod native_search_guard_tests {
 
     /// 命名空间子项内的原生声明同规则剥掉；剥空的命名空间整项去掉；
     /// `tool_choice` 强制到被剥掉的项时按既有口径 400。
-    /// 本仓库自研（issue #13 残余 1）：参照树只看顶层 `type`。
+    /// 本仓库自研（issue #13 残余 1）：此前只按顶层 `type` 判定。
     #[test]
     fn native_search_declarations_strip_recursively_from_namespaces() {
         // 命名空间里还有客户端工具：只剥原生子项，命名空间本身保留。
