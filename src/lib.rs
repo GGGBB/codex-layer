@@ -20,5 +20,6 @@ pub mod prefix_divergence;
 pub mod protocol_proxy;
 pub mod relay_config;
 pub mod relay_headers;
+pub mod stability;
 pub mod settings;
 pub mod vision;
