@@ -36,7 +36,7 @@ codex 客户端每一轮都重放整段历史。重放出来的 prompt 带有**�
 - **前缀分叉探针。** 按 `prompt_cache_key` 逐轮记录「转换后 system 块序列 + tools」的指纹，
   字节突变即 dump 分叉点的新旧对比，用来取证「这一轮为什么冷算」。
 
-对具体推理服务器没有硬编码依赖，对 CodexPlusPlus 本身也没有依赖。
+对具体推理服务器与任何特定上游实现都没有硬编码依赖。
 
 ## 构建
 
@@ -106,7 +106,8 @@ env_key = "CODEX_LAYER_KEY"
 ```
 
 然后 `codex-layer --config codex-layer.toml`，正常用 codex 即可。要同时接多个上游时用
-`[[model_route]]` 按模型改路由；本项目**不做**多渠道轮换与限流，那属于 CodexPlusPlus。
+`[[model_route]]` 按模型改路由；本项目**不做**多渠道轮换与限流，属多渠道产品
+形态，不在本项目范围。
 
 ## 诊断
 
@@ -144,13 +145,16 @@ python3 scripts/smoke/streaming.py
 
 脚本默认在临时目录工作，可用 `CODEX_LAYER_BIN` 指定二进制、`SMOKE_WORK` 指定工作目录。
 
-## 由来
+## 项目定位
 
-从 [CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus) 的 prompt 前缀稳定层中继
-（[PR #2449](https://github.com/BigPizzaV3/CodexPlusPlus/pull/2449)）中抽出。移植提交与
-重构提交严格分开：`chore(port)` 保留逐字节原样与来源注释，`feat` 才做解耦，方便逐 commit
-审查。多渠道轮换（relay_rotation）、渠道限流（channel_protection）、聚合模式、VLM 三态
-等 CodexPlusPlus 专有功能不进入本项目，已剥离。
+这一层夹在 codex 客户端与任意 OpenAI 兼容后端之间，只解决一件事：多轮重放里
+的表层字节抖动反复打断前缀缓存，让会话越深、每轮冷预填充越贵。问题机制与
+能力清单见上文，这里只说过程纪律与边界：
+
+- 移植 commit 与行为 commit 严格分开：`chore(port)` 保留逐字节原样与文件头
+  来源注释，`feat` / `fix` 才做解耦与行为演进，方便逐 commit 审查。
+- 多渠道产品形态的能力（多渠道轮换、渠道限流、聚合供应商、VLM 三态等）
+  不进入本项目，相关能力留在各自的上游参照实现。
 
 ## License
 

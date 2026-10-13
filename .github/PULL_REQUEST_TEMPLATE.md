@@ -21,9 +21,10 @@ Closes #
 
 ## 与上游 diff 可比性
 
-<!-- 是否触及移植自 CodexPlusPlus PR #2449 的区域（protocol_proxy.rs、
-     compaction_*.rs、prefix_divergence.rs 及对应测试）；改动是否破坏与来源
-     的逐行 diff 可比性；移植 commit 与行为 commit 是否已分开。 -->
+<!-- 是否触及移植区（protocol_proxy.rs、compaction_*.rs、
+     prefix_divergence.rs 及对应测试）：改动要与文件头 `移植来源：…` 注释
+     保持可对齐、不破坏与上游的逐行 diff 可比性；移植 commit 与行为
+     commit 是否已分开。 -->
 
 ## 自查清单
 

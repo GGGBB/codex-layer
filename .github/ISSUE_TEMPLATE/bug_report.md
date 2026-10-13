@@ -17,7 +17,7 @@ labels: ["type/bug"]
 
 ## 期望行为
 
-<!-- 按 README / docs/GAP_ANALYSIS.md 的契约，本应发生什么。 -->
+<!-- 按 README 的契约，本应发生什么。 -->
 
 ## 实际行为
 

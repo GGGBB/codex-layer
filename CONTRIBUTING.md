@@ -51,8 +51,8 @@ git -c user.name="codex-layer-<角色>" \
 
 ## 流程
 
-1. **issue 先行**：每个变更先有对应 issue。已有 backlog（见 `docs/GAP_ANALYSIS.md`
-   与已开的 issues）优先认领，不重复立项。
+1. **issue 先行**：每个变更先有对应 issue。已开的 issues 优先认领，
+   不重复立项。
 2. **分支**：从 main 切出，命名 `agent/<issue号>-<slug>`，
    例如 `agent/3-web-search-guard`；在自己的 worktree 内创建
    （见「worktree 隔离」）。
