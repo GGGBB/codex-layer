@@ -125,6 +125,23 @@ env_key = "CODEX_LAYER_KEY"
 再看 snip 定位是哪一个块变的。主会话与子 Agent 共用 `prompt_cache_key`（线程 id），
 多个 system 形态在同键上交替是常态，探针按「已见指纹集」判定，不误报。
 
+### 请求关联 id 与 `/stability` 数据面
+
+`/v1/responses` 的每一轮会在 `codex_layer.stream_open` 与收口事件
+（`stream_completed` / `stream_failed`，含压缩轮）的 `detail.requestId` 里带
+同一个进程内 UUID，并发下可把开流与收口精确配对、算出单轮耗时。
+**requestId 只进诊断日志**：发往上游的请求体与请求头逐字节不含它
+（出站体每轮多一个随机字段等于前缀每轮都变，深缓存全废），集成测试
+`tests/stability_endpoint.rs` 钉住了这条红线。
+
+开启 `[stability] enabled = true` 后新增只读端点 `GET /stability`：惰性读诊断
+日志尾部窗口（默认最近 8MB），返回聚合快照——轮次计数、baseline/divergence
+及比率、钉定器生效次数、按 requestId 配对的单轮耗时 p50/p95/max（配不上的
+显式计入 `unpaired`，不静默丢）。隐私：`oldSnip`/`newSnip` 可能含用户提示词，
+默认只给长度与位置；`show_prompt_snippets = true` 才输出截断到 120 字符的
+片段并在响应里带警示字段。响应不含 API key、配置全文。默认关时该端点
+返回 404「未启用」。
+
 ## 测试
 
 ```bash
