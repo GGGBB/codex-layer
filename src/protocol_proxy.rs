@@ -1032,6 +1032,266 @@ pub struct ChatSseToResponsesConverter {
     failed: bool,
 }
 
+/// 原生 Responses 上游的旁路终止守卫：只观察 SSE 里的终止事件，不改写任何响应字节，
+/// 也不保存诊断正文。只保留每个事件的有限前缀，避免图片等大 payload 令诊断缓冲无界增长。
+#[derive(Default)]
+pub struct NativeResponsesSseObserver {
+    event_prefix: Vec<u8>,
+    event_tail: [u8; 4],
+    event_too_large: bool,
+    unclassified_large_event: bool,
+    completed: bool,
+    failure: Option<&'static str>,
+}
+
+/// 单个事件保留的前缀上限：超过即认为该事件不可归类，缓冲不再增长。
+const NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT: usize = 64 * 1024;
+
+impl NativeResponsesSseObserver {
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if self.event_prefix.len() < NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT {
+                self.event_prefix.push(*byte);
+            } else {
+                self.event_too_large = true;
+            }
+            self.event_tail.rotate_left(1);
+            self.event_tail[3] = *byte;
+            if self.event_tail.ends_with(b"\n\n") || self.event_tail == *b"\r\n\r\n" {
+                self.observe_event();
+                self.event_prefix.clear();
+                self.event_tail = [0; 4];
+                self.event_too_large = false;
+            }
+        }
+    }
+
+    fn observe_event(&mut self) {
+        let prefix = String::from_utf8_lossy(&self.event_prefix);
+        let event_name = prefix.lines().find_map(|line| strip_sse_field(line, "event"));
+        let data = prefix
+            .lines()
+            .filter_map(|line| strip_sse_field(line, "data"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 只观察已完整解析的顶层 type；后续大 payload 超过前缀上限时，
+        // 忽略其解析错误，保留此前读到的类型。它不是原生响应的有效性校验器。
+        struct EventType<'a>(&'a mut Option<String>);
+        impl<'de> serde::de::Visitor<'de> for EventType<'_> {
+            type Value = ();
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an SSE event object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "type" {
+                        *self.0 = Some(map.next_value::<String>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(&data);
+        let mut event_type = None;
+        let _ = serde::Deserializer::deserialize_map(&mut deserializer, EventType(&mut event_type));
+        match event_type.as_deref().or(event_name.map(str::trim)) {
+            Some("response.completed") => self.completed = true,
+            Some("response.failed") => {
+                self.failure = Some("原生 Responses 上游返回 response.failed")
+            }
+            Some("response.incomplete") => {
+                self.failure = Some("原生 Responses 上游返回 response.incomplete")
+            }
+            Some("error") => self.failure = Some("原生 Responses 上游返回 error 事件"),
+            None if self.event_too_large => self.unclassified_large_event = true,
+            _ => {}
+        }
+    }
+
+    /// 上游是否已自带终止失败事件（failed / incomplete / error）。
+    /// 装配点用它判定「还要不要向客户端补一帧」：上游自己已经宣告失败的流，客户端手里
+    /// 已有显式终止信号，再补一帧只是重复噪音；而什么都没发过的流必须由本层补，
+    /// 否则客户端无法区分「正常结束」与「半途而废」。
+    pub fn saw_terminal_failure(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    /// 收口判定：返回 `Some(原因)` 表示这一轮不能算「成功完成」。
+    /// failed/incomplete 优先于 completed；`[DONE]` 或 HTTP EOF 都不能证明成功。
+    pub fn finish(self) -> Option<String> {
+        self.failure.or_else(|| {
+            if self.completed {
+                None
+            } else if self.unclassified_large_event {
+                Some("原生 Responses 流终止状态未知（诊断事件超限），未观察到完成事件")
+            } else {
+                Some("原生 Responses 上游在完成事件前结束了响应流")
+            }
+        })
+        .map(str::to_string)
+    }
+}
+
+/// 原生透传流的显式失败收口帧。口径与转换层的失败收口一致：只发 `response.failed`，
+/// **不补 `data: [DONE]`**——终态由事件本身表达，HTTP body 随后 EOF 收尾。
+/// 透传支路不解析上游 response 对象，因此这里不伪造 id/model/usage，只带错误本体。
+pub fn native_stream_failure_frame(message: &str, error_type: &str) -> String {
+    let mut output = String::new();
+    push_sse(
+        &mut output,
+        "response.failed",
+        json!({
+            "type": "response.failed",
+            "response": {
+                "object": "response",
+                "status": "failed",
+                "error": { "message": message, "type": error_type },
+            },
+        }),
+    );
+    output
+}
+
+#[cfg(test)]
+mod native_responses_observer_tests {
+    use super::{NativeResponsesSseObserver, NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT};
+
+    #[test]
+    fn fragmented_crlf_and_data_only_terminal_events_are_observed() {
+        for payload in [
+            "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"text\":\"摘要\"}\r\n\r\n",
+            "data: {\"response\":{},\"type\":\"response.completed\"}\n\n",
+        ] {
+            let mut observer = NativeResponsesSseObserver::default();
+            for byte in payload.as_bytes().chunks(1) {
+                observer.push_bytes(byte);
+            }
+            assert!(observer.finish().is_none());
+        }
+    }
+
+    #[test]
+    fn large_payloads_keep_diagnostic_memory_bounded_and_allow_terminal_observation() {
+        for prefix in [
+            "event: response.completed\ndata: {\"output\":\"",
+            "data: {\"type\":\"response.completed\",\"output\":\"",
+        ] {
+            let mut observer = NativeResponsesSseObserver::default();
+            observer.push_bytes(prefix.as_bytes());
+            observer.push_bytes(&vec![b'x'; NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT * 2]);
+            assert!(observer.event_prefix.len() <= NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT);
+            observer.push_bytes(b"\"}\n\n");
+            assert!(observer.finish().is_none());
+        }
+    }
+
+    #[test]
+    fn failed_event_after_completed_still_reports_fixed_failure_without_payload() {
+        let mut observer = NativeResponsesSseObserver::default();
+        observer.push_bytes(b"data: {\"type\":\"response.completed\"}\n\ndata: {\"type\":\"response.failed\",\"error\":\"private-payload\"}\n\n");
+        assert_eq!(
+            observer.finish().as_deref(),
+            Some("原生 Responses 上游返回 response.failed")
+        );
+    }
+
+    #[test]
+    fn unclassified_large_event_reports_unknown_state_without_payload() {
+        let mut observer = NativeResponsesSseObserver::default();
+        observer.push_bytes(b"data: {\"output\":\"");
+        observer.push_bytes(&vec![b'x'; NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT * 2]);
+        observer.push_bytes(b"\",\"type\":\"response.completed\"}\n\n");
+        assert!(observer.finish().unwrap().contains("状态未知"));
+    }
+
+    /// `[DONE]` 与 EOF 都不能证明成功：未观察到终止事件时一律「未证明」，
+    /// 而且上游没自己发过终止失败事件，所以装配点必须补帧。
+    #[test]
+    fn done_marker_and_eof_alone_never_prove_success() {
+        for payload in [
+            "",
+            "data: [DONE]\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"He\"}\n\ndata: [DONE]\n\n",
+        ] {
+            let mut observer = NativeResponsesSseObserver::default();
+            observer.push_bytes(payload.as_bytes());
+            // 上游未自己宣告终止失败 → 装配点必须替它补一帧。
+            assert!(!observer.saw_terminal_failure(), "{payload:?} 不得被当成上游自报失败");
+            let reason = observer.finish().expect("无终止事件不得算作成功");
+            assert!(
+                reason.contains("在完成事件前结束了响应流") || reason.contains("状态未知"),
+                "原因必须说清是哪一类未证明：{reason}"
+            );
+        }
+    }
+
+    /// 三种终止失败事件全部识别，且「上游已自带显式终止信号」被标记出来：
+    /// 这情况不再补帧，只记诊断。
+    #[test]
+    fn terminal_failure_events_are_observed_without_needing_an_appended_frame() {
+        for (payload, expected) in [
+            (
+                "data: {\"type\":\"response.failed\"}\n\n",
+                "原生 Responses 上游返回 response.failed",
+            ),
+            (
+                "event: response.incomplete\ndata: {\"type\":\"response.incomplete\"}\n\n",
+                "原生 Responses 上游返回 response.incomplete",
+            ),
+            ("event: error\ndata: {}\n\n", "原生 Responses 上游返回 error 事件"),
+        ] {
+            let mut observer = NativeResponsesSseObserver::default();
+            observer.push_bytes(payload.as_bytes());
+            assert!(observer.saw_terminal_failure(), "上游终止失败必须识别");
+            assert_eq!(observer.finish().as_deref(), Some(expected));
+        }
+    }
+
+    /// 正常完成的流不标记终止失败：它走的是「补帧也不记」那条路。
+    #[test]
+    fn completed_stream_needs_no_frame_and_no_diagnostic() {
+        let mut observer = NativeResponsesSseObserver::default();
+        observer.push_bytes(b"data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n");
+        assert!(!observer.saw_terminal_failure());
+        assert!(observer.finish().is_none());
+    }
+
+    /// 补的失败帧：只发 `response.failed`、不补 `[DONE]`，错误本体带 message 与 type。
+    #[test]
+    fn failure_frame_is_terminal_only_and_carries_the_error_body() {
+        let frame = super::native_stream_failure_frame("上游在完成事件前结束了响应流", "stream_incomplete");
+        assert!(frame.starts_with("event: response.failed\ndata: "));
+        assert!(frame.ends_with("\n\n"));
+        assert!(!frame.contains("[DONE]"), "失败收口不得补 DONE");
+        let data = frame
+            .lines()
+            .find_map(|line| super::strip_sse_field(line, "data"))
+            .expect("帧必须有 data 行");
+        let parsed: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(parsed.get("type").and_then(|v| v.as_str()), Some("response.failed"));
+        assert_eq!(
+            parsed
+                .get("response")
+                .and_then(|r| r.get("status"))
+                .and_then(|v| v.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            parsed
+                .get("response")
+                .and_then(|r| r.get("error"))
+                .and_then(|e| e.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("stream_incomplete")
+        );
+    }
+}
+
 /// codex v2 远程压缩的响应包装器：把上游摘要文本（无论 Responses 还是
 /// Chat 上游、流式还是非流式）封装成「恰好一个 `compaction` 输出项」的
 /// Responses SSE 流。输出项通过 output_item.done 显式交付给客户端，
