@@ -39,6 +39,7 @@ use codex_layer::http_client;
 use codex_layer::protocol_proxy::{
     self, ChatSseToResponsesConverter, CompactionSseConverter, ProxySessionHeaders, UpstreamWireApi,
     UpstreamProxyResponse, chat_completion_to_response, chat_completion_to_response_with_request,
+    NativeResponsesSseObserver, native_stream_failure_frame,
     is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_image_edits_proxy_path,
     is_image_generations_proxy_path, is_models_proxy_path, is_responses_proxy_path,
     open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
@@ -874,10 +875,48 @@ fn stream_from_upstream(
             return;
         }
         if wire_api == UpstreamWireApi::Responses {
+            // 原生 Responses 透传支路：字节原样转发，观察者只旁路读，不产出任何字节。
+            // 守卫要解决的是「上游在完成事件前断流」：原样转发时客户端只看到连接关闭，
+            // 分不清正常结束还是半途而废，所以收口时由本层补一帧显式 response.failed。
+            let mut observer = NativeResponsesSseObserver::default();
             while let Some(chunk) = chunks.next().await {
-                let item = chunk.map_err(|error| -> Box<dyn StdError + Send + Sync> { error.into() });
-                if tx.send(item).is_err() {
-                    return;
+                match chunk {
+                    Ok(bytes) => {
+                        observer.push_bytes(&bytes);
+                        if tx.send(Ok(bytes)).is_err() {
+                            // 客户端已经断开：没有接收方，补帧无意义，直接收工。
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        // 读流错误：先补帧，再按既有行为把错误交给 HTTP 层中止 body；
+                        // 这个顺序保证客户端至少还能拿到一个显式终止信号。
+                        let reason = close_native_responses_stream(observer, "stream_error", &tx);
+                        let _ = log_event(
+                            "codex_layer.stream_failed",
+                            json!({ "reason": reason.unwrap_or_else(|| "原生 Responses 上游已自报终止失败".to_string()), "requestId": request_id }),
+                        );
+                        let item: StreamItem =
+                            Err(Box::new(error) as Box<dyn StdError + Send + Sync>);
+                        let _ = tx.send(item);
+                        return;
+                    }
+                }
+            }
+            // HTTP EOF 不是 Responses 协议的完成事件，`[DONE]` 也不算：
+            // 没观察到完成事件就一律补失败帧（与 Chat 泵的收口口径一致）。
+            match close_native_responses_stream(observer, "stream_incomplete", &tx) {
+                Some(reason) => {
+                    let _ = log_event(
+                        "codex_layer.stream_failed",
+                        json!({ "reason": reason, "requestId": request_id }),
+                    );
+                }
+                None => {
+                    let _ = log_event(
+                        "codex_layer.stream_completed",
+                        json!({ "model": model, "requestId": request_id }),
+                    );
                 }
             }
             return;
@@ -952,6 +991,27 @@ fn stream_from_upstream(
     futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
     })
+}
+
+/// 原生透传支路的收口。守卫未证明成功时，向客户端补一帧显式 `response.failed`
+///（口径同转换层：只发 failed 事件、不补 `[DONE]`，见 `native_stream_failure_frame`）。
+/// 上游自己已经宣告过终止失败（failed / incomplete / error）时**不补帧**：客户端手里
+/// 已有显式终止信号，再补只是重复噪音；但这一轮仍算失败，所以照样返回原因。
+/// 返回 `Some(原因)` 表示这一轮诊断应记 `stream_failed`，`None` 表示观察到了完成事件。
+fn close_native_responses_stream(
+    observer: NativeResponsesSseObserver,
+    error_type: &str,
+    tx: &tokio::sync::mpsc::UnboundedSender<StreamItem>,
+) -> Option<String> {
+    let saw_terminal_failure = observer.saw_terminal_failure();
+    let reason = observer.finish()?;
+    if !saw_terminal_failure {
+        let _ = tx.send(Ok(Bytes::from(native_stream_failure_frame(
+            &reason,
+            error_type,
+        ))));
+    }
+    Some(reason)
 }
 
 fn sse_response(stream: impl futures_util::Stream<Item = StreamItem> + Send + 'static) -> Response {
