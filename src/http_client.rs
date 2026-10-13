@@ -1,7 +1,6 @@
 //! 出站 HTTP client。
 //!
-//! 移植自 CodexPlusPlus PR #2449 的 `crates/codex-plus-core/src/http_client.rs`
-//! （commit f9be7cf）。原名 `proxied_client` 保留（转换层按这个名字调用），
+//! 函数名 `proxied_client` 保留（转换层按这个名字调用），
 //! 实际语义是「带 User-Agent 与连接超时的 client」。
 //! 连接超时可由 TOML 配置 `[timeouts] connect-seconds` 覆盖，进程内设置一次。
 
