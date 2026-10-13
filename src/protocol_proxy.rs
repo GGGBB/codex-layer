@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -110,20 +111,112 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
 }
 
 /// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
-/// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
+/// 可用环境变量 [`PROXY_PORT_ENV`] 覆盖；旧名 [`LEGACY_PROXY_PORT_ENV`] 继续兼容，
+/// 见 [`resolve_proxy_port`]。
 ///
 /// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
 /// 但少数机器上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
 /// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
 /// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
-pub fn protocol_proxy_port() -> u16 {
-    std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+/// 端口覆盖的首选环境变量名。
+pub const PROXY_PORT_ENV: &str = "CODEX_LAYER_PROXY_PORT";
+
+/// 旧端口覆盖变量名：仍然被读取，但属于弃用入口（见 [`resolve_proxy_port`]）。
+pub const LEGACY_PROXY_PORT_ENV: &str = "CODEX_PLUS_PROTOCOL_PROXY_PORT";
+
+/// 端口覆盖的解析结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyPortResolution {
+    /// 实际生效端口。
+    pub port: u16,
+    /// 生效值是否跟旧变量名有关（旧名单独生效，或新旧同时设置）。
+    pub legacy_source: bool,
+    /// 新旧同时设为不同值：旧值被忽略，供诊断里区分「冗余设置」与「冲突设置」。
+    pub legacy_conflict: bool,
 }
-pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
+
+/// 把变量取值解析成端口：非数字与 0 一律当作「未设置」。
+fn parse_proxy_port(value: Option<&str>) -> Option<u16> {
+    value?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+}
+
+/// 双名兼容的端口解析（纯函数：不读环境变量、不打日志，测试直接调）。
+///
+/// 规则：新名优先；未设新名时回落旧名，保持改名前的行为一字不变；两者都设且
+/// 取值不同以新名为准。只要旧名以有效值参与，结果就带上 `legacy_source`，由
+/// 调用方发一次弃用诊断。不设任何环境变量的用户走的是「两者都未设置 →
+/// 默认端口」这条完全不变的路径。
+pub fn resolve_proxy_port(
+    preferred: Option<&str>,
+    legacy: Option<&str>,
+) -> ProxyPortResolution {
+    let preferred_port = parse_proxy_port(preferred);
+    let legacy_port = parse_proxy_port(legacy);
+    if let Some(port) = preferred_port {
+        return ProxyPortResolution {
+            port,
+            legacy_source: legacy_port.is_some(),
+            legacy_conflict: legacy_port.is_some_and(|legacy| legacy != port),
+        };
+    }
+    match legacy_port {
+        Some(port) => ProxyPortResolution {
+            port,
+            legacy_source: true,
+            legacy_conflict: false,
+        },
+        None => ProxyPortResolution {
+            port: DEFAULT_PROTOCOL_PROXY_PORT,
+            legacy_source: false,
+            legacy_conflict: false,
+        },
+    }
+}
+
+/// 弃用诊断的事件名。
+pub const DEPRECATED_ENV_EVENT: &str = "codex_layer.deprecated_env";
+
+/// 由解析结果构造弃用诊断的 detail；无需告警时返回 None（纯函数，便于断言）。
+pub fn deprecated_env_detail(resolution: &ProxyPortResolution) -> Option<Value> {
+    if !resolution.legacy_source {
+        return None;
+    }
+    Some(json!({
+        "name": LEGACY_PROXY_PORT_ENV,
+        "replacement": PROXY_PORT_ENV,
+        "effectivePort": resolution.port,
+        "conflict": resolution.legacy_conflict,
+        "message": if resolution.legacy_conflict {
+            "新旧端口变量同时设为不同值，已以新名为准；请删除旧名"
+        } else {
+            "端口覆盖仍使用旧变量名，请改用新名"
+        },
+    }))
+}
+
+/// 同一进程只发一次弃用诊断：端口解析在请求路径上会被反复调用，每次都写
+/// 日志等于刷屏。
+fn deprecated_env_already_reported() -> bool {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    REPORTED.swap(true, Ordering::Relaxed)
+}
+
+pub fn protocol_proxy_port() -> u16 {
+    let resolution = resolve_proxy_port(
+        std::env::var(PROXY_PORT_ENV).ok().as_deref(),
+        std::env::var(LEGACY_PROXY_PORT_ENV).ok().as_deref(),
+    );
+    if let Some(detail) = deprecated_env_detail(&resolution) {
+        if !deprecated_env_already_reported() {
+            let _ = crate::diagnostic_log::append_diagnostic_log(DEPRECATED_ENV_EVENT, detail);
+        }
+    }
+    resolution.port
+}
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
