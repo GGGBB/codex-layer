@@ -156,7 +156,9 @@ mod tests {
     #[test]
     fn upstream_base_url_wins() {
         let profile = RelayProfile {
-            base_url: "http://127.0.0.1:57321/v1".to_string(),
+            // 这里填的是「代理自身对外的 base_url」，跟默认端口同步；
+            // 断言语义不变：只要 upstream_base_url 非空，它就赢。
+            base_url: "http://127.0.0.1:12333/v1".to_string(),
             upstream_base_url: "http://127.0.0.1:11234/v1".to_string(),
             ..RelayProfile::default()
         };
