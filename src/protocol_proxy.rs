@@ -16,7 +16,16 @@ use serde_json::{Map, Value, json};
 
 use crate::settings::{BackendSettings, RelayProtocol, SettingsStore};
 
-pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
+/// 代理默认端口的单一真源：`[server] port` 的默认监听口（见 `config::DEFAULT_LISTEN_PORT`）、
+/// 端口解析回落、回环守卫的默认识别形态都由本常量派生，不允许「监听用 A、守卫用 B」的分裂。
+/// 旧默认 57321 → `12333` 的改号理由：与 mlx-serve 常用端口 `11234` 拉开两位差异降低误配，
+/// 同时避开 Windows/Hyper-V 动态与保留端口区间。
+pub const DEFAULT_PROXY_PORT: u16 = 12333;
+
+/// 旧默认端口。不再作为任何默认值，仅留在回环守卫的识别集里：把图片上游配成旧默认的用户
+/// 改号后仍须被守卫拦下并明确报错，不得退化成真实请求回环（fail-loud 不退化）。
+/// 见 [`is_local_protocol_proxy_base_url`]。
+pub const LEGACY_DEFAULT_PROXY_PORT: u16 = 57321;
 
 /// 工具调用上需要跨 turn 原样带回的供应商附带数据，按 `call_id` 索引。
 ///
@@ -111,12 +120,12 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
         .and_then(|cache| cache.recall(call_id))
 }
 
-/// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
+/// 协议代理的实际生效端口，默认 [`DEFAULT_PROXY_PORT`]，
 /// 可用环境变量 [`PROXY_PORT_ENV`] 覆盖；旧名 [`LEGACY_PROXY_PORT_ENV`] 继续兼容，
 /// 见 [`resolve_proxy_port`]。
 ///
 /// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
-/// 但少数机器上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
+/// 但少数机器上旧默认 57321 曾被 Hyper-V/WSL 开机划进 Windows
 /// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
 /// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
 /// 端口覆盖的首选环境变量名。
@@ -171,7 +180,7 @@ pub fn resolve_proxy_port(
             legacy_conflict: false,
         },
         None => ProxyPortResolution {
-            port: DEFAULT_PROTOCOL_PROXY_PORT,
+            port: DEFAULT_PROXY_PORT,
             legacy_source: false,
             legacy_conflict: false,
         },
@@ -2908,16 +2917,30 @@ fn image_endpoint_url(base_url: &str, endpoint: &str) -> String {
 }
 
 fn is_local_protocol_proxy_base_url(base_url: &str) -> bool {
+    is_local_protocol_proxy_base_url_with(base_url, protocol_proxy_port())
+}
+
+/// 纯函数形态（不读环境变量、不打日志，测试直接调）：判定 base_url 是否指回本地协议代理。
+///
+/// 识别集 = {当前生效端口（含环境变量显式端口）, 新默认 [`DEFAULT_PROXY_PORT`],
+/// 旧默认 [`LEGACY_DEFAULT_PROXY_PORT`]}。旧默认留在识别集是改号的行为叠加：
+/// 把图片上游配成旧默认的用户改号后仍须被拦下并明确报错，不得退化成真实请求回环。
+/// 守卫只放宽「识别范围」，其它判定一字不变——scheme 仍必须 http、host 仍必须回环形态。
+fn is_local_protocol_proxy_base_url_with(base_url: &str, effective_port: u16) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
         return false;
     };
-    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(protocol_proxy_port()) {
+    if !url.scheme().eq_ignore_ascii_case("http") {
         return false;
     }
-    matches!(
-        url.host_str(),
-        Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
-    )
+    let recognized = url.port().is_some_and(|port| {
+        port == effective_port || port == DEFAULT_PROXY_PORT || port == LEGACY_DEFAULT_PROXY_PORT
+    });
+    recognized
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+        )
 }
 
 #[cfg(test)]
@@ -8936,7 +8959,7 @@ mod proxy_port_env_tests {
             let resolution = resolve_proxy_port(preferred, legacy);
             assert_eq!(
                 resolution.port,
-                DEFAULT_PROTOCOL_PROXY_PORT,
+                DEFAULT_PROXY_PORT,
                 "非法取值不得改变端口：preferred={preferred:?} legacy={legacy:?}"
             );
             assert!(!resolution.legacy_source);
