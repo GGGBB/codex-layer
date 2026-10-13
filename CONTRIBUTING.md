@@ -56,8 +56,9 @@ git -c user.name="codex-layer-<角色>" \
 2. **分支**：从 main 切出，命名 `agent/<issue号>-<slug>`，
    例如 `agent/3-web-search-guard`；在自己的 worktree 内创建
    （见「worktree 隔离」）。
-3. **commit 纪律**：机械移植改动与行为改动严格分开。机械改动保留逐字节
-   内容、不改行为；行为改动 commit 正文说明动机、行为影响面与测试证据。
+3. **commit 纪律**：不改行为的搬运 / 接入 commit 与行为演进 commit 严格分开。前者
+   保持既有内容逐字节原样、不改行为；后者的 commit 正文说明动机、行为影响面
+   与测试证据。
 4. **PR**：push 分支后开 PR，标题中文，正文按
    [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) 填写，
    用 `Closes #<issue号>` 关联 issue，打上 `type/*` 与 `P1`/`P2` 标签。
@@ -99,9 +100,9 @@ git -c user.name="codex-layer-<角色>" \
 
 ## 安全红线
 
-- **禁**全仓 `cargo fmt`：移植代码须与来源 PR 保持逐行 diff 可比性
-  （现状有 115 处 fmt 差异，CI 因此不跑 `fmt --check`，也不跑 `clippy -D warnings`）。
-  新写文件按 rustfmt 默认风格即可，不要为「fmt 干净」重排移植代码。
+- **禁**全仓 `cargo fmt`：既有代码保持现状——全仓格式化会一次性产生上百处无关差异，
+  淹没真实改动，CI 因此不跑 `fmt --check`，也不跑 `clippy -D warnings`。
+  新写文件按 rustfmt 默认风格即可，不要为「fmt 干净」重排既有代码。
 - **禁**批量删除文件；删除必须单文件逐个进行并在 PR 中说明理由。
 - **禁** sudo、**禁** `curl | bash` 类管道安装。
 - **禁**提交任何真实密钥：API key、`.env`、`auth.json`、config.toml 凭据；
@@ -113,7 +114,6 @@ git -c user.name="codex-layer-<角色>" \
 
 - 合并前基线：lib 单元测试 + `tests/protocol_proxy.rs` 集成测试 + 两条冒烟脚本
   全绿；测试数量**只增不减**（除非对应行为被本 PR 移除，需在 PR 中说明）。
-- 上游移植过来的测试整体保留，不删不改断言；因接口适配的机械改动须在 commit
-  正文说明。
+- 既有测试整体保留，不删不改断言；因接口适配的机械改动须在 commit 正文说明。
 - 转换 / 钉定核心的新逻辑必须有直接调用纯函数的单元测试，不允许只靠 HTTP 层
   集成测试兜底。
