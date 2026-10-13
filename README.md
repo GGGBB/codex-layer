@@ -87,7 +87,7 @@ prompt_prefix = true
 完整字段见 [`codex-layer.toml.example`](codex-layer.toml.example)。未知字段会**直接报错**——
 配置写错要立刻炸，不要静默按默认值跑。
 
-默认只监听 `127.0.0.1:57321`：本进程持有上游密钥，不该默认暴露到局域网。本层不校验入站
+默认只监听 `127.0.0.1:12333`：本进程持有上游密钥，不该默认暴露到局域网。本层不校验入站
 `Authorization`（回环地址上不必加这一层）；若 codex 要求 `env_key`，填任意值即可。
 
 ## 接入 codex
@@ -100,7 +100,7 @@ model_provider = "layer"
 
 [model_providers.layer]
 name = "codex-layer"
-base_url = "http://127.0.0.1:57321/v1"
+base_url = "http://127.0.0.1:12333/v1"
 wire_api = "responses"
 env_key = "CODEX_LAYER_KEY"
 ```

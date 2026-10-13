@@ -32,6 +32,6 @@ Closes #
 - [ ] `cargo test` 全绿，测试只增不减
 - [ ] 两条冒烟脚本全绿
 - [ ] 端到端自测仅用临时 Label + 临时端口 + 临时配置，未触碰本机
-      `com.codex-layer.proxy`:57331 与 `com.user.mlx-ssm-env`
+      常驻 `com.codex-layer.proxy` 与 `com.user.mlx-ssm-env`
 - [ ] 无真实密钥入库，配置示例用占位符
 - [ ] 未做全仓 `cargo fmt`，不改行为的改动与行为改动分开提交

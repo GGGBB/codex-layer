@@ -4,7 +4,7 @@
 [server]
 # 默认只监听回环：本进程会持有上游密钥，不要默认暴露到局域网。
 host = "127.0.0.1"
-port = 57321
+port = 12333
 
 [upstream]
 # 任意 OpenAI 兼容后端：mlx-serve、llama.cpp、vLLM、或云端 API。

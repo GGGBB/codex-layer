@@ -91,9 +91,9 @@ git -c user.name="codex-layer-<角色>" \
 - 端到端自测**必须**使用临时 Label + 临时端口 + 临时配置，例如
   `codex-layer --label com.codex-layer.test.<任务名> -c <临时配置>` 监听 57341
   之类的非默认端口。
-- **严禁** stop / restart / kill 本机真实运行的 `com.codex-layer.proxy`（57331，
-  维护者正在使用的推理链路），严禁改动 `com.user.mlx-ssm-env` LaunchAgent，
-  严禁把 codex 客户端配置临时指向别处。
+- **严禁** stop / restart / kill 本机真实运行的 `com.codex-layer.proxy`（维护者
+  正在使用的推理链路；其监听口以 `codex-layer status` 为准，不要靠记端口号定位），
+  严禁改动 `com.user.mlx-ssm-env` LaunchAgent，严禁把 codex 客户端配置临时指向别处。
 - `cargo test` 与 `scripts/smoke/*.py` 可直接在仓库内运行（冒烟脚本自带临时目录
   与独立假上游）。
 - 一次性 LaunchAgent 用完即 `launchctl bootout`，不留残余注册。
