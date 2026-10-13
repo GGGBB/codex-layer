@@ -5506,6 +5506,7 @@ fn relocate_deferred_tools_notice_blocks(messages: &mut Vec<Value>) {
         .unwrap_or(1)
         .max(1);
     messages.splice(insert_at..insert_at, block_messages);
+}
 
 const CURRENT_TURN_OPEN: &str = "<current_user_turn>";
 const CURRENT_TURN_CLOSE: &str = "</current_user_turn>";
