@@ -2,7 +2,7 @@
 #
 # 不跑 `cargo fmt --check`：全仓格式化被仓库纪律禁止——既有代码保持现状，
 # 一次性重排会产生上百处无关差异并淹没真实改动，本地实测差异上百处，放进 CI 会红。
-# 新写文件按默认风格即可。
+# 新增文件的格式约束改由 gates job 的 new_file_fmt_gate.py 承担（只判增量）。
 # 不跑 `cargo clippy -- -D warnings`：同理无法保证现状通过，保持 CI 全绿起步。
 name: CI
 
@@ -47,3 +47,28 @@ jobs:
         run: python3 scripts/smoke/pinning.py
       - name: 冒烟：流式转发
         run: python3 scripts/smoke/streaming.py
+
+  # 流程门禁：提交作者角色身份 + 新增 Rust 文件格式。两个判据各带 --self-test
+  # 正反对照，先自证判据可用，再判真实区间。
+  gates:
+    name: gates (commit author / new file fmt)
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0：门禁要按基线取待入库区间，浅克隆会让区间解析不出来
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 安装 Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: 判据自测：提交作者
+        run: python3 scripts/ci/commit_author_gate.py --self-test
+      - name: 判据自测：新增文件格式
+        run: python3 scripts/ci/new_file_fmt_gate.py --self-test
+      - name: 提交作者角色门禁
+        env:
+          GATE_PUSH_BEFORE: ${{ github.event.before }}
+        run: python3 scripts/ci/commit_author_gate.py
+      - name: 新增 Rust 文件格式门禁
+        env:
+          GATE_PUSH_BEFORE: ${{ github.event.before }}
+        run: python3 scripts/ci/new_file_fmt_gate.py
