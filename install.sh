@@ -160,7 +160,13 @@ try_download() {
     fi
     echo "==> sha256 校验通过：${got}"
     member="${BIN_NAME}-${tag}-${triple}/${BIN_NAME}"
-    if ! tar -tzf "$tmpdir/$pkg" | grep -qx "$member"; then
+    # 先取清单再判，绝不写 `tar | grep -q`：grep -q 命中即退并关闭管道，
+    # tar 余下的写入拿到 EPIPE 后非零退出（GNU tar 报 stdout: write error），
+    # set -o pipefail 把「已经匹配」判成整条管道失败——成员明明在包里也会被判成
+    # 「产物里没有预期成员」而静默回落。发布链路的 release.yml 踩过同一条（CI 实测），
+    # 这里不解包、只查成员，同一条判据必须同一种写法。
+    members="$(tar -tzf "$tmpdir/$pkg" 2>/dev/null || true)"
+    if ! printf '%s\n' "$members" | grep -x "$member" >/dev/null; then
         echo "==> 产物里没有预期成员 $member，回落源码构建"
         cleanup
         return 1

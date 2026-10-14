@@ -69,17 +69,23 @@ jobs:
           # 形态判据先自测再判真值：正则一旦写窄（例如三元组段数写死），
           # 会把合规产物判死；写宽则恒绿。用一正一负两条对照钉住判据本身。
           NAME_RE='^codex-layer-v[0-9][0-9A-Za-z.-]*(-[a-z0-9_]+){2,}\.tar\.gz$'
-          printf '%s\n' "codex-layer-v0.0.0-x86_64-unknown-linux-gnu.tar.gz" \
-            | grep -Eq "$NAME_RE" \
+          # 判据一律「先取数据、再判」，不写 `产生者 | grep -q`：grep -q 命中即退出
+          # 并关闭管道，产生者收到 SIGPIPE 后非零退出，set -o pipefail 会把「已经匹配」
+          # 判成整条管道失败。首跑就是这条把正确的包判死的（tar: stdout: write error）。
+          selftest_ok="$(printf '%s\n' "codex-layer-v0.0.0-x86_64-unknown-linux-gnu.tar.gz")"
+          selftest_bad="$(printf '%s\n' "codex-layer-vmain-aarch64-apple-darwin.tar.gz")"
+          printf '%s\n' "$selftest_ok" | grep -E "$NAME_RE" >/dev/null \
             || { echo "判据自测失败：合规形态被正则判死" >&2; exit 1; }
-          printf '%s\n' "codex-layer-vmain-aarch64-apple-darwin.tar.gz" \
-            | grep -Eq "$NAME_RE" \
-            && { echo "判据自测失败：分支命名的包未被正则判死，判据恒绿" >&2; exit 1; }
+          if printf '%s\n' "$selftest_bad" | grep -E "$NAME_RE" >/dev/null; then
+            echo "判据自测失败：分支命名的包未被正则判死，判据恒绿" >&2
+            exit 1
+          fi
           echo "判据自测通过（正/负各一条）"
-          echo "$PKG" | grep -Eq "$NAME_RE" \
+          printf '%s\n' "$PKG" | grep -E "$NAME_RE" >/dev/null \
             || { echo "产物名 $PKG 不匹配下载侧命名约定" >&2; exit 1; }
-          tar -tzf "dist/$PKG" \
-            | grep -qx "codex-layer-${VERSION}-${{ matrix.target }}/codex-layer" \
+          MEMBERS="$(tar -tzf "dist/$PKG")"
+          printf '%s\n' "$MEMBERS" \
+            | grep -x "codex-layer-${VERSION}-${{ matrix.target }}/codex-layer" >/dev/null \
             || { echo "包内成员名与下载侧 member 判据不一致" >&2; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
