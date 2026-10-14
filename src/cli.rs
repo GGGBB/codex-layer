@@ -321,6 +321,148 @@ pub fn classify_listen_probe(result: &std::io::Result<std::net::TcpStream>) -> L
     }
 }
 
+/// 监听口就绪等待窗口（秒，issue #34 期望行为 3）。restart 期间要覆盖
+/// 「旧实例有界排空（≤ drain_seconds）+ 进程硬上界宽限 + 新实例 bind 重试
+/// 余量」；固定 3 秒的旧窗口比排空上界短一个数量级，必然在未就绪时提前
+/// 收工——那行的「未就绪」因此几乎总是误报。
+pub fn listen_ready_window_seconds(drain_seconds: u64) -> u64 {
+    let covering = drain_seconds + crate::drain::FORCE_EXIT_GRACE.as_secs() + 5;
+    covering.max(5)
+}
+
+/// restart 就绪等待收口时的证据包（探测侧采集，判定全在纯函数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartWaitEvidence {
+    /// 窗口内最后一次探测结果。
+    pub last_probe: ListenProbe,
+    /// bootout 前记录的旧实例 pid（start 没有）。
+    pub old_pid: Option<u32>,
+    pub old_alive: bool,
+    /// 当前 launchd 注册视图里的 pid。
+    pub new_pid: Option<u32>,
+    /// 正在监听该端口的进程 pid（lsof 采集）。
+    pub listener_pids: Vec<u32>,
+    pub drain_seconds: u64,
+}
+
+/// 「没能在窗口内确认新实例接管」的三分类判定（issue #34 期望行为 4）。
+/// 只报告有证据支撑的结论；判定不了就是判定不了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartWaitOutcome {
+    /// 新实例已在监听（窗口耗尽前一瞬才接管）。
+    ReadyFresh,
+    /// 端口有人监听，但还是旧实例在服务（它在排空上界内会退出并交接）。
+    ReadyServedByOld { old_pid: u32, drain_seconds: u64 },
+    /// 端口空着、旧进程还活着：旧实例在排空，新实例还没抢到端口。
+    OldInstanceDraining { old_pid: u32, drain_seconds: u64 },
+    /// 端口被与本次操作无关的进程占着。
+    ForeignListener { pids: Vec<u32> },
+    /// 新进程已注册（launchd 有 pid）但端口没人听：多半启动即失败。
+    NewProcessNotListening,
+    /// 三条线索都对不上：如实承认判定不了，给核对命令。
+    Indeterminate,
+}
+
+/// 判定优先级：外来占用 > 旧实例相关态 > 新进程失败 > 判定不了。
+/// 「端口被占」必须先于其他判定——外来占用时旧实例的一切行为都不相干。
+pub fn classify_restart_wait(evidence: &RestartWaitEvidence) -> RestartWaitOutcome {
+    let foreign: Vec<u32> = evidence
+        .listener_pids
+        .iter()
+        .copied()
+        .filter(|pid| Some(*pid) != evidence.old_pid && Some(*pid) != evidence.new_pid)
+        .collect();
+    if !foreign.is_empty() {
+        return RestartWaitOutcome::ForeignListener { pids: foreign };
+    }
+    if evidence.last_probe == ListenProbe::Ready {
+        if let Some(old_pid) = evidence.old_pid {
+            if evidence.old_alive && evidence.new_pid == Some(old_pid) {
+                return RestartWaitOutcome::ReadyServedByOld {
+                    old_pid,
+                    drain_seconds: evidence.drain_seconds,
+                };
+            }
+        }
+        return RestartWaitOutcome::ReadyFresh;
+    }
+    if let Some(old_pid) = evidence.old_pid {
+        if evidence.old_alive {
+            return RestartWaitOutcome::OldInstanceDraining {
+                old_pid,
+                drain_seconds: evidence.drain_seconds,
+            };
+        }
+    }
+    if evidence.new_pid.is_some() && evidence.listener_pids.is_empty() {
+        return RestartWaitOutcome::NewProcessNotListening;
+    }
+    RestartWaitOutcome::Indeterminate
+}
+
+/// 各判定态的终端话术。红线（issue #34 期望行为 4）：不许把猜测写成结论；
+/// 「仍在排空」不许说成「服务挂了」；就绪但接管者是旧实例时不许报「未就绪」。
+pub fn format_restart_wait(
+    outcome: &RestartWaitOutcome,
+    host: &str,
+    port: u16,
+    waited_secs: f64,
+    label: &str,
+) -> String {
+    let waited = format!("{waited_secs:.1}");
+    match outcome {
+        RestartWaitOutcome::ReadyFresh => {
+            format!("监听口:   {host}:{port} 已就绪（等待 {waited}s）")
+        }
+        RestartWaitOutcome::ReadyServedByOld {
+            old_pid,
+            drain_seconds,
+        } => format!(
+            "监听口:   {host}:{port} 已就绪，但接管者仍是旧实例（pid={old_pid}）——\
+             它在排空上界 {drain_seconds}s 内退出后端口即交接给新实例；\
+             稍后用 `codex-layer status --label {label}` 复核 PID 已更换"
+        ),
+        RestartWaitOutcome::OldInstanceDraining {
+            old_pid,
+            drain_seconds,
+        } => format!(
+            "监听口:   {host}:{port} 尚未交接（已等待 {waited}s）——有证据指向：\
+             旧实例（pid={old_pid}）仍在排空在途请求（上界 {drain_seconds}s，\
+             空窗以此为界）；稍后用 `codex-layer status --label {label}` 复核"
+        ),
+        RestartWaitOutcome::ForeignListener { pids } => {
+            let pids = pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "监听口:   {host}:{port} 未就绪（已等待 {waited}s）——有证据指向：\
+                 端口被其它进程占用（pid: {pids}）；核对：\
+                 lsof -nP -iTCP:{port} -sTCP:LISTEN"
+            )
+        }
+        RestartWaitOutcome::NewProcessNotListening => format!(
+            "监听口:   {host}:{port} 未就绪（已等待 {waited}s）——有证据指向：\
+             新进程已注册但未监听，疑似启动即失败；看 launchd stderr 重定向日志\
+             （{label}.err.log）里的报错"
+        ),
+        RestartWaitOutcome::Indeterminate => format!(
+            "监听口:   {host}:{port} 未就绪（已等待 {waited}s）——判定不了原因，逐条核对：\
+             1) 旧实例排空中（launchctl print 看 PID 与 state）；\
+             2) 端口被占（lsof -nP -iTCP:{port} -sTCP:LISTEN）；\
+             3) 新进程启动失败（launchd stderr 重定向日志 {label}.err.log）"
+        ),
+    }
+}
+
+/// `status` 对「未注册」的过渡期提示（issue #34 期望行为 5）：
+/// restart 的新旧交替窗口里 launchctl print 同样查无此项，终判口吻会误导。
+pub fn status_unregistered_hint() -> &'static str {
+    "未注册（若刚执行过 restart，这可能只是新旧交替窗口：旧实例排空后才交接；\
+     稍后重跑 status 复核）"
+}
+
 /// 「已在注册」终态的下一步建议（#15 次要缺陷 3）。不再指向 restart：
 /// restart 内部是 bootout+bootstrap，正是会卸服务的路径（#15 事故主体），
 /// 建议回路不压在上面；给 status 复核与 stop → start 两段式安全路径。
@@ -341,32 +483,58 @@ const BOOTSTRAP_RETRY_MAX_ATTEMPTS: usize = 10;
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// 监听口就绪等待参数（#15 次要缺陷 1）。本机实测：serve 绑定监听口在
-/// 百毫秒量级（2026-10，临时 Label 实测），窗口足够宽且等待有界。
-#[cfg(target_os = "macos")]
-const LISTEN_READY_MAX_ATTEMPTS: usize = 10;
+/// 探测节奏沿用 #15 的实测参数量级；窗口长度改由
+/// `listen_ready_window_seconds` 按排空上界推导（issue #34）。
 #[cfg(target_os = "macos")]
 const LISTEN_READY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// 有界等待监听口就绪；就绪返回 true（含耗时），未就绪返回 false
-/// （调用方打印排查提示；未就绪不作为失败退出）。
+/// 就绪探测的一次采样。
 #[cfg(target_os = "macos")]
-fn wait_listen_ready(host: &str, port: u16) -> (bool, std::time::Duration) {
-    use std::time::Instant;
-    let started = Instant::now();
-    for attempt in 1..=LISTEN_READY_MAX_ATTEMPTS {
-        let probe = format!("{host}:{port}")
-            .parse::<std::net::SocketAddr>()
-            .map_err(std::io::Error::other)
-            .and_then(std::net::TcpStream::connect);
-        if classify_listen_probe(&probe) == ListenProbe::Ready {
-            return (true, started.elapsed());
-        }
-        if attempt < LISTEN_READY_MAX_ATTEMPTS {
-            std::thread::sleep(LISTEN_READY_INTERVAL);
-        }
+fn probe_listen(host: &str, port: u16) -> ListenProbe {
+    let probe = format!("{host}:{port}")
+        .parse::<std::net::SocketAddr>()
+        .map_err(std::io::Error::other)
+        .and_then(std::net::TcpStream::connect);
+    classify_listen_probe(&probe)
+}
+
+/// 进程存活探测（`ps -p`）。pid 为 None 恒 false。
+#[cfg(target_os = "macos")]
+fn process_alive(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    std::process::Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// 正在监听该端口的进程 pid 集合（lsof `-t` 只吐 pid）。
+#[cfg(target_os = "macos")]
+fn listener_pids_on_port(port: u16) -> Vec<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-iTCP", &format!(":{port}"), "-sTCP:LISTEN", "-t"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// launchd 注册视图里的当前 pid。
+#[cfg(target_os = "macos")]
+fn launchd_pid(target: &str) -> Option<u32> {
+    let output = run_launchctl(&["print", target]);
+    if !output.status.success() {
+        return None;
     }
-    (false, started.elapsed())
+    parse_launchd_status(&String::from_utf8_lossy(&output.stdout)).pid
 }
 
 /// bootstrap 带卸除窗口重试（#15 期望行为 1）：耗尽或遇确定性错误时返回
@@ -389,6 +557,58 @@ fn bootstrap_with_retry(bootout_ran: bool, domain: &str, plist_path: &Path) -> R
         }
     }
     Err(last_error)
+}
+
+/// 有界等待监听口就绪并如实报告（issue #34 期望行为 2/3/4）。
+/// 就绪判据加了「接管者必须不是旧实例」：旧实例排空期间端口照常可连，
+/// 只看 connect 会把「旧实例还在服务」报成 restart 完成。
+#[cfg(target_os = "macos")]
+fn wait_listen_ready_and_report(
+    host: &str,
+    port: u16,
+    drain_seconds: u64,
+    old_pid: Option<u32>,
+    launchd_target: &str,
+    label: &str,
+) {
+    use std::time::Instant;
+    let window =
+        std::time::Duration::from_secs(listen_ready_window_seconds(drain_seconds));
+    let started = Instant::now();
+    // 循环首轮必然赋值后才可能 break/return，无「未初始化读取」路径。
+    let mut last_probe;
+    loop {
+        last_probe = probe_listen(host, port);
+        if last_probe == ListenProbe::Ready {
+            let current = launchd_pid(launchd_target);
+            let stale = old_pid.is_some() && current == old_pid && process_alive(old_pid);
+            if !stale {
+                println!(
+                    "监听口:   {host}:{port} 已就绪（等待 {:.1}s）",
+                    started.elapsed().as_secs_f64()
+                );
+                return;
+            }
+            // 旧实例仍在服务端口：继续等它按上界退出，直到窗口耗尽。
+        }
+        if started.elapsed() >= window {
+            break;
+        }
+        std::thread::sleep(LISTEN_READY_INTERVAL);
+    }
+    let evidence = RestartWaitEvidence {
+        last_probe,
+        old_pid,
+        old_alive: process_alive(old_pid),
+        new_pid: launchd_pid(launchd_target),
+        listener_pids: listener_pids_on_port(port),
+        drain_seconds,
+    };
+    let outcome = classify_restart_wait(&evidence);
+    println!(
+        "{}",
+        format_restart_wait(&outcome, host, port, started.elapsed().as_secs_f64(), label)
+    );
 }
 
 /// 常驻命令总入口（start/stop/restart/status）。`config_lookup` 注入
@@ -480,11 +700,21 @@ fn run_launchd_macos(
     std::fs::write(&plist_path, launch_agent_plist(&spec))
         .with_context(|| format!("无法写入 plist {}", plist_path.display()))?;
 
+    // bootout 之前先记下旧实例 pid：随后「谁在监听/谁还活着」的归因全靠它
+    // 区分新旧（issue #34）。start 没有旧实例，保持 None。
+    let old_pid = if kind == "restart" {
+        launchd_pid(&target)
+    } else {
+        None
+    };
     if kind == "restart" {
         // 旧注册先摘掉；不存在也算成功（restart 等价 start）。
         // 注意 bootout 成功与否决定随后 bootstrap 是否可重试（#15：
         // bootout 异步，卸除窗口内 bootstrap 只给 error 5）。
         let _ = run_launchctl(&["bootout", &target]);
+        if let Some(pid) = old_pid {
+            println!("旧实例:  pid={pid} 已收到退出信号；若有在途流，按排空上界有界收口后退出");
+        }
     }
     let bootout_ran = kind == "restart";
     let bootstrap_error = bootstrap_with_retry(bootout_ran, &domain, &plist_path).err();
@@ -515,24 +745,15 @@ fn run_launchd_macos(
         println!("  plist:  {}", plist_path.display());
         println!("  配置:   {}", config_path.display());
     }
-    // 注册成功 / 终判已生效后：有界等待监听口就绪（#15 次要缺陷 1）。
-    // 未就绪不作为失败退出，但给明确排查方向（端口被占、上游不可达）。
+    // 注册成功 / 终判已生效后：有界等待监听口就绪（#15 次要缺陷 1；
+    // 窗口按排空上界推导、未就绪归因讲证据，issue #34）。
+    // 未就绪不作为失败退出，但只报告有证据支撑的原因。
     match crate::config::Config::load(&config_path) {
         Ok(config) => {
-            let (host, port) = (config.server.host.as_str(), config.server.port);
-            let (ready, waited) = wait_listen_ready(host, port);
-            if ready {
-                println!(
-                    "监听口:   {host}:{port} 已就绪（等待 {:.1}s）",
-                    waited.as_secs_f64()
-                );
-            } else {
-                println!(
-                    "监听口:   {host}:{port} 未就绪（已等待 {:.1}s）——排查：端口被占、\
-                     上游不可达致启动失败；看 launchd stderr 重定向日志（{label}.err.log）",
-                    waited.as_secs_f64()
-                );
-            }
+            let host = config.server.host.clone();
+            let port = config.server.port;
+            let drain_seconds = config.server.drain_seconds;
+            wait_listen_ready_and_report(&host, port, drain_seconds, old_pid, &target, label);
         }
         Err(error) => println!("监听口:   未知（配置读取失败：{error}）"),
     }
@@ -599,7 +820,9 @@ fn print_status(
     println!("Label:    {label}");
     println!("域:       {domain}");
     if !registered {
-        println!("注册:     未注册");
+        // 「未注册」在 restart 的新旧交替窗口里同样是瞬时形态，
+        // 终判口吻会误导（issue #34 期望行为 5）。
+        println!("注册:     {}", status_unregistered_hint());
     } else {
         let state = status.state.as_deref().unwrap_or("unknown");
         println!("注册:     已注册（state={state}）");
@@ -968,6 +1191,145 @@ mod tests {
             std::path::Path::new("/tmp/cfg.toml"),
         );
         assert!(!cmd.contains('\n'), "{cmd:?}");
+    }
+
+    #[test]
+    fn listen_ready_window_covers_drain_bound() {
+        // 排空上界 45s 时窗口必须 ≥ 45 + 宽限（10）+ 余量（5）。
+        let window = listen_ready_window_seconds(45);
+        assert!(
+            window >= 45 + crate::drain::FORCE_EXIT_GRACE.as_secs() + 5,
+            "窗口 {window}s 盖不住排空上界"
+        );
+        // drain=0 也要留出 bind 余量；任何取值都必须严格大于排空上界。
+        assert!(listen_ready_window_seconds(0) > 0);
+        assert!(listen_ready_window_seconds(0) >= 15);
+        for drain in [0u64, 1, 45, 600] {
+            assert!(listen_ready_window_seconds(drain) > drain);
+        }
+    }
+
+    fn evidence(last_probe: ListenProbe, listeners: Vec<u32>) -> RestartWaitEvidence {
+        RestartWaitEvidence {
+            last_probe,
+            old_pid: Some(100),
+            old_alive: true,
+            new_pid: Some(200),
+            listener_pids: listeners,
+            drain_seconds: 45,
+        }
+    }
+
+    #[test]
+    fn restart_wait_attribution_three_way_split() {
+        // 类 1：旧实例仍在排空（端口空着、旧进程活着、launchd 已是新 pid）。
+        let outcome = classify_restart_wait(&evidence(ListenProbe::Refused, vec![]));
+        assert_eq!(
+            outcome,
+            RestartWaitOutcome::OldInstanceDraining {
+                old_pid: 100,
+                drain_seconds: 45
+            }
+        );
+        // 类 2：端口被无关进程占着——外来占用优先级最高，
+        // 即便旧实例还活着也不能把锅排给排空。
+        // 旧实例 pid 出现在监听列表里不算「外来占用」，必须被滤掉；
+        // 真正的外来者（777）单独成立。
+        let mut foreign = evidence(ListenProbe::Refused, vec![777]);
+        foreign.listener_pids.push(100);
+        assert_eq!(
+            classify_restart_wait(&foreign),
+            RestartWaitOutcome::ForeignListener { pids: vec![777] }
+        );
+        // 类 3：新进程注册了但端口没人听，且旧进程已经死了。
+        let mut dead_old = evidence(ListenProbe::Refused, vec![]);
+        dead_old.old_alive = false;
+        assert_eq!(
+            classify_restart_wait(&dead_old),
+            RestartWaitOutcome::NewProcessNotListening
+        );
+        // 端口连得上、注册视图里还是旧 pid、旧进程活着：旧实例仍在服务。
+        let mut serving = evidence(ListenProbe::Ready, vec![100]);
+        serving.new_pid = Some(100);
+        assert_eq!(
+            classify_restart_wait(&serving),
+            RestartWaitOutcome::ReadyServedByOld {
+                old_pid: 100,
+                drain_seconds: 45
+            }
+        );
+        // 端口连得上且接管者已换新 pid：就绪。
+        let fresh = evidence(ListenProbe::Ready, vec![200]);
+        assert_eq!(classify_restart_wait(&fresh), RestartWaitOutcome::ReadyFresh);
+        // 全部线索落空：如实判定不了（start 场景无旧 pid、无注册、无监听）。
+        let mut blank = evidence(ListenProbe::Unreachable, vec![]);
+        blank.old_pid = None;
+        blank.old_alive = false;
+        blank.new_pid = None;
+        assert_eq!(
+            classify_restart_wait(&blank),
+            RestartWaitOutcome::Indeterminate
+        );
+    }
+
+    #[test]
+    fn restart_wait_wording_reports_evidence_not_guesses() {
+        // 旧实例排空态：话术必须说「排空」并给出上界，不得出现「未就绪」
+        // 或旧文案里写死的「端口被占、上游不可达」。
+        let text = format_restart_wait(
+            &RestartWaitOutcome::OldInstanceDraining {
+                old_pid: 100,
+                drain_seconds: 45,
+            },
+            "127.0.0.1",
+            12333,
+            60.2,
+            "com.codex-layer.proxy",
+        );
+        assert!(text.contains("排空"), "{text}");
+        assert!(text.contains("45"), "{text}");
+        assert!(!text.contains("未就绪"), "{text}");
+        assert!(!text.contains("上游不可达"), "{text}");
+        // 「旧实例仍在服务」同样不得报「未就绪」。
+        let text = format_restart_wait(
+            &RestartWaitOutcome::ReadyServedByOld {
+                old_pid: 100,
+                drain_seconds: 45,
+            },
+            "127.0.0.1",
+            12333,
+            60.0,
+            "l",
+        );
+        assert!(!text.contains("未就绪"), "{text}");
+        // 判定不了必须明说判定不了并给核对命令，不许把猜测写成结论。
+        let text = format_restart_wait(
+            &RestartWaitOutcome::Indeterminate,
+            "127.0.0.1",
+            12333,
+            9.0,
+            "l",
+        );
+        assert!(text.contains("判定不了"), "{text}");
+        assert!(text.contains("lsof"), "{text}");
+        // 端口占用态给出 pid 与 lsof 命令。
+        let text = format_restart_wait(
+            &RestartWaitOutcome::ForeignListener { pids: vec![7, 8] },
+            "127.0.0.1",
+            12333,
+            9.0,
+            "l",
+        );
+        assert!(text.contains("7, 8"), "{text}");
+        assert!(text.contains("-iTCP:12333"), "{text}");
+    }
+
+    #[test]
+    fn status_unregistered_hint_marks_transition_window() {
+        let hint = status_unregistered_hint();
+        assert!(hint.contains("restart"), "{hint}");
+        assert!(hint.contains("排空"), "{hint}");
+        assert!(!hint.contains('\n'), "{hint:?}");
     }
 
     #[test]
