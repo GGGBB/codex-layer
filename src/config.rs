@@ -68,6 +68,12 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// 关停排空上界（秒）。收到退出信号后停止接收新请求，在途流最多再跑
+    /// 这么久：到点仍未自然结束的分支补可判定的终止事件后收口，进程整体
+    /// 退出时间有界（重启不再出现「旧的不去、新的不来」的长空窗）。
+    /// 设 0 = 不等待：信号一到就按终止语义收口在途流。
+    #[serde(default = "default_drain_seconds")]
+    pub drain_seconds: u64,
 }
 
 impl Default for ServerConfig {
@@ -75,6 +81,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            drain_seconds: default_drain_seconds(),
         }
     }
 }
@@ -85,6 +92,13 @@ fn default_host() -> String {
 
 fn default_port() -> u16 {
     DEFAULT_LISTEN_PORT
+}
+
+/// 排空上界默认 45 秒：issue #34 建议的 30~60 秒量级取中。聊天 agent 一轮
+/// 流式响应常见数分钟，取小值牺牲在途流、取大值拉长重启停顿，45 秒是折中；
+/// 在意「重启即刻可用」的部署可调小，在意「回合不被重启腰斩」的调大。
+fn default_drain_seconds() -> u64 {
+    45
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -455,6 +469,46 @@ api_key = "sk-test"
         .unwrap();
         assert_eq!(config.server.port, DEFAULT_PROXY_PORT);
         assert_eq!(config.server.port, 12333);
+    }
+
+    /// 排空上界：不写走默认；显式值原样生效（含 0 = 立即收口的极端配置）。
+    #[test]
+    fn drain_seconds_defaults_and_parses_small_values() {
+        let config: Config = toml::from_str(
+            r#"
+[upstream]
+base_url = "http://127.0.0.1:11234/v1"
+api_key = "sk-test"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.drain_seconds, 45);
+
+        let config: Config = toml::from_str(
+            r#"
+[server]
+drain_seconds = 3
+
+[upstream]
+base_url = "http://127.0.0.1:11234/v1"
+api_key = "sk-test"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.drain_seconds, 3);
+
+        let config: Config = toml::from_str(
+            r#"
+[server]
+drain_seconds = 0
+
+[upstream]
+base_url = "http://127.0.0.1:11234/v1"
+api_key = "sk-test"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.drain_seconds, 0);
     }
 
     #[test]
