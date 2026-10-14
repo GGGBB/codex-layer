@@ -489,6 +489,29 @@ pub enum RestartWaitOutcome {
     Indeterminate,
 }
 
+/// 「新实例已接管监听口」的正判据（issue #47）：监听者里必须出现本次注册
+/// 视图里的 pid，且旧实例已经放手。只要求「不是旧实例在监听」是不够的——
+/// 外来进程占着端口时那样判会直接把 restart 报成就绪（取证实测踩过）。
+/// 注册 pid 取不到时一律不算接管：宁可继续等，也不把别人的监户认成自己的。
+pub fn is_taken_over_by_new(
+    old_pid: Option<u32>,
+    new_pid: Option<u32>,
+    listener_pids: &[u32],
+) -> bool {
+    let Some(new_pid) = new_pid else {
+        return false;
+    };
+    if !listener_pids.contains(&new_pid) {
+        return false;
+    }
+    if let Some(old) = old_pid {
+        if listener_pids.contains(&old) {
+            return false;
+        }
+    }
+    true
+}
+
 /// 判定优先级：外来占用 > 旧实例相关态 > 新进程失败 > 判定不了。
 /// 「端口被占」必须先于其他判定——外来占用时旧实例的一切行为都不相干。
 pub fn classify_restart_wait(evidence: &RestartWaitEvidence) -> RestartWaitOutcome {
@@ -510,7 +533,11 @@ pub fn classify_restart_wait(evidence: &RestartWaitEvidence) -> RestartWaitOutco
                 };
             }
         }
-        return RestartWaitOutcome::ReadyFresh;
+        // 就绪也要有身份：监户者里得是本次注册的那个 pid。
+        if is_taken_over_by_new(evidence.old_pid, evidence.new_pid, &evidence.listener_pids) {
+            return RestartWaitOutcome::ReadyFresh;
+        }
+        // 连得上但认不出是我们自己在听：落到下面的归因分支，不报就绪。
     }
     if let Some(old_pid) = evidence.old_pid {
         if evidence.old_alive {
@@ -644,11 +671,26 @@ fn process_alive(pid: Option<u32>) -> bool {
         .unwrap_or(false)
 }
 
+/// `lsof` 的端口监听查询参数。`-i` 的规格必须与选项**同词**（`-iTCP:8080`）：
+/// 拆成 `-iTCP` `:8080` 两个参数时，lsof 会把 `:8080` 当成**文件名**去 stat，
+/// 直接 usage 报错、stdout 全空（本机 4.91 实测），调用方看到的就是
+/// 「永远没有监听者」。纯函数便于把这条形态钉死在单测里。
+pub fn lsof_listen_args(port: u16) -> Vec<String> {
+    vec![
+        "-nP".to_string(),
+        format!("-iTCP:{port}"),
+        "-sTCP:LISTEN".to_string(),
+        "-t".to_string(),
+    ]
+}
+
 /// 正在监听该端口的进程 pid 集合（lsof `-t` 只吐 pid）。
+/// lsof 查无匹配时以非 0 退出且 stdout 为空，这是正常的「没人监听」，
+/// 因此不看退出码、只解析 stdout。
 #[cfg(target_os = "macos")]
 fn listener_pids_on_port(port: u16) -> Vec<u32> {
     let output = std::process::Command::new("lsof")
-        .args(["-nP", "-iTCP", &format!(":{port}"), "-sTCP:LISTEN", "-t"])
+        .args(lsof_listen_args(port))
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -750,13 +792,12 @@ fn wait_listen_ready_and_report(
     loop {
         last_probe = probe_listen(host, port);
         if last_probe == ListenProbe::Ready {
-            // 真判据：端口上监听着的进程里不能还有旧实例。注册视图的 pid
+            // 真判据是双重的：端口上的监户者里得出现本次注册视图里的 pid
+            // （证明是我们自己在听），且旧实例确实放开了端口。注册视图的 pid
             // 会先于实际交接变化（新实例 bind 失败重试期间也是「新 pid」），
-            // 只有 lsof 能证明旧实例确实放开了端口。
-            let stale = old_pid
-                .map(|old| listener_pids_on_port(port).contains(&old))
-                .unwrap_or(false);
-            if !stale {
+            // 所以必须 lsof 与注册 pid 对上才算交接完成。
+            let listeners = listener_pids_on_port(port);
+            if is_taken_over_by_new(old_pid, launchd_pid(launchd_target), &listeners) {
                 println!(
                     "监听口:   {host}:{port} 已就绪（等待 {:.1}s）",
                     started.elapsed().as_secs_f64()
@@ -966,10 +1007,11 @@ fn run_launchd_macos(
         // 「未就绪不作为失败退出」让 CLI 在永久死口上返回 0，脚本无法判定。
         // start 维持旧口径：注册成功即成功，未就绪只如实报告（归 #34 语义）。
         if bootout_ran && restart_wait_is_failure(&outcome) {
+            // 证据行上一行已经打印过（含真实等待秒数），这里只给结论与出路，
+            // 不再重复一遍——重复行里的等待秒数只能是假的 0.0s。
             bail!(
-                "{}\n新实例未接管监听口。恢复走两段式：`codex-layer stop --label {label}`\
-                 确认输出「未注册」后，再 {recovery}",
-                format_restart_wait(&outcome, &host, port, 0.0, label),
+                "新实例未接管监听口（判定依据见上一行）。恢复走两段式：\
+                 `codex-layer stop --label {label}` 确认输出「未注册」后，再 {recovery}",
                 recovery = restart_unregistered_recovery(label, &config_path),
             );
         }
@@ -1561,6 +1603,61 @@ mod tests {
         );
         assert!(text.contains("不是本次要拉起的新实例"), "{text}");
         assert!(text.contains("codex-layer start --label com.x.y -c /tmp/c.toml"), "{text}");
+    }
+
+    #[test]
+    fn lsof_port_spec_stays_attached_to_the_flag() {
+        // 回归钉：`-iTCP` 与 `:port` 拆成两个参数时，lsof 会把端口当文件名
+        // 去 stat，usage 报错、stdout 恒空——监听者永远查不出来。
+        let args = lsof_listen_args(19972);
+        assert_eq!(
+            args,
+            ["-nP", "-iTCP:19972", "-sTCP:LISTEN", "-t"].map(str::to_string)
+        );
+        let joined = args.join(" ");
+        assert!(joined.contains("-iTCP:19972"), "{joined}");
+        assert!(!joined.contains("-iTCP :"), "端口规格被拆开会查不到：{joined}");
+    }
+
+    #[test]
+    fn takeover_requires_own_pid_listening_not_merely_not_old() {
+        // 外来进程占着端口：监听者里既没旧 pid 也没新 pid，不能算接管。
+        assert!(!is_taken_over_by_new(Some(100), Some(200), &[777]));
+        // 新实例在听、旧实例已放手：真接管。
+        assert!(is_taken_over_by_new(Some(100), Some(200), &[200]));
+        // 新旧同时在听（旧实例还没放口）：没交接完。
+        assert!(!is_taken_over_by_new(Some(100), Some(200), &[100, 200]));
+        // 只有旧实例在听：没交接。
+        assert!(!is_taken_over_by_new(Some(100), Some(200), &[100]));
+        // 注册 pid 取不到：认不出是谁在听，不算接管（继续等）。
+        assert!(!is_taken_over_by_new(Some(100), None, &[200]));
+        // start 语境没有旧 pid：新 pid 在听即接管。
+        assert!(is_taken_over_by_new(None, Some(200), &[200]));
+        // 监听集为空：连得上也只是竞态，不算接管。
+        assert!(!is_taken_over_by_new(Some(100), Some(200), &[]));
+    }
+
+    #[test]
+    fn ready_but_unidentified_listener_never_reports_fresh() {
+        // 端口连得上、监听者是外来进程：终判必须落到外来占用而不是就绪。
+        let foreign = evidence(ListenProbe::Ready, vec![777]);
+        assert_eq!(
+            classify_restart_wait(&foreign),
+            RestartWaitOutcome::ForeignListener { pids: vec![777] }
+        );
+        // 连得上、监听者是我们自己但注册 pid 拿不到：不许报就绪，
+        // 落到「新进程已注册但未监听/判定不了」一侧。
+        let mut unidentified = evidence(ListenProbe::Ready, vec![200]);
+        unidentified.new_pid = None;
+        assert_ne!(
+            classify_restart_wait(&unidentified),
+            RestartWaitOutcome::ReadyFresh
+        );
+        // 连得上且监听者就是注册里的新 pid：才是就绪。
+        assert_eq!(
+            classify_restart_wait(&evidence(ListenProbe::Ready, vec![200])),
+            RestartWaitOutcome::ReadyFresh
+        );
     }
 
     #[test]
