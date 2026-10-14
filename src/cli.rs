@@ -559,6 +559,19 @@ pub fn restart_wait_is_failure(outcome: &RestartWaitOutcome) -> bool {
     !matches!(outcome, RestartWaitOutcome::ReadyFresh)
 }
 
+/// `start` 的成败判据（issue #49）：与 restart 对齐——除「本次注册的实例
+/// 亲自监户」外一律算失败。旧口径「注册成功即返回 0、未就绪只打印提示」
+/// 让脚本化部署在端口被占、配置端口冲突、新进程起不来这三种形态下继续
+/// 往下走，问题延后到第一个真实请求才暴露。
+///
+/// 与 restart 唯一的语义差别：start 没有旧实例，`ReadyServedByOld` 在本路径
+/// 不可达；而 `Indeterminate` 在 start 下是**常见**形态（launchd 刚注册时
+/// `print` 里的 pid 可能还没落定），照样按失败处理——未就绪时报「判定不了」
+/// 比谎报成功有用，代价只是多跑一次 `status`。
+pub fn start_wait_is_failure(outcome: &RestartWaitOutcome) -> bool {
+    !matches!(outcome, RestartWaitOutcome::ReadyFresh)
+}
+
 /// 各判定态的终端话术。红线（issue #34 期望行为 4）：不许把猜测写成结论；
 /// 「仍在排空」不许说成「服务挂了」；就绪但接管者是旧实例时不许报「未就绪」。
 pub fn format_restart_wait(
@@ -567,8 +580,15 @@ pub fn format_restart_wait(
     port: u16,
     waited_secs: f64,
     label: &str,
+    is_restart: bool,
 ) -> String {
     let waited = format!("{waited_secs:.1}");
+    // start 语境下不得出现旧实例话术：本路径根本没有旧实例，说了是误导。
+    let drained = if is_restart {
+        "1) 上一个实例仍在排空（launchctl print 看 PID 与 state）；"
+    } else {
+        "1) 实例刚注册尚未起来（稍后重跑 status 复核）；"
+    };
     match outcome {
         RestartWaitOutcome::ReadyFresh => {
             format!("监听口:   {host}:{port} 已就绪（等待 {waited}s）")
@@ -603,14 +623,14 @@ pub fn format_restart_wait(
         }
         RestartWaitOutcome::NewProcessNotListening => format!(
             "监听口:   {host}:{port} 未就绪（已等待 {waited}s）——有证据指向：\
-             新进程已注册但未监听，疑似启动即失败；看 launchd stderr 重定向日志\
+             进程已注册但未监听，疑似启动即失败；看 launchd stderr 重定向日志\
              （{label}.err.log）里的报错"
         ),
         RestartWaitOutcome::Indeterminate => format!(
             "监听口:   {host}:{port} 未就绪（已等待 {waited}s）——判定不了原因，逐条核对：\
-             1) 旧实例排空中（launchctl print 看 PID 与 state）；\
+             {drained}\
              2) 端口被占（lsof -nP -iTCP:{port} -sTCP:LISTEN）；\
-             3) 新进程启动失败（launchd stderr 重定向日志 {label}.err.log）"
+             3) 进程启动失败（launchd stderr 重定向日志 {label}.err.log）"
         ),
     }
 }
@@ -827,7 +847,14 @@ fn wait_listen_ready_and_report(
     let outcome = classify_restart_wait(&evidence);
     println!(
         "{}",
-        format_restart_wait(&outcome, host, port, started.elapsed().as_secs_f64(), label)
+        format_restart_wait(
+            &outcome,
+            host,
+            port,
+            started.elapsed().as_secs_f64(),
+            label,
+            old_pid.is_some(),
+        )
     );
     outcome
 }
@@ -1002,17 +1029,39 @@ fn run_launchd_macos(
             label,
             budget_end,
         );
-        // restart 的成败以「新实例是否接管监听口」为准（issue #47 期望行为 3）：
-        // 除新实例亲自监户外一律非零退出，失败正文带恢复命令。旧口径里
-        // 「未就绪不作为失败退出」让 CLI 在永久死口上返回 0，脚本无法判定。
-        // start 维持旧口径：注册成功即成功，未就绪只如实报告（归 #34 语义）。
-        if bootout_ran && restart_wait_is_failure(&outcome) {
-            // 证据行上一行已经打印过（含真实等待秒数），这里只给结论与出路，
-            // 不再重复一遍——重复行里的等待秒数只能是假的 0.0s。
+        // 成败以「本次注册的实例是否亲自监户」为准：restart 的口径见 issue #47
+        // 期望行为 3，start 在 issue #49 里与它对齐——除 ReadyFresh 外一律非零退出。
+        // 旧口径「注册成功即成功、未就绪只如实报告」让脚本化部署在端口被占、
+        // 配置端口冲突、进程起不来时继续往下走，问题延后到第一个真实请求。
+        // 证据行上一行已经打印过（含真实等待秒数），这里只给结论与出路。
+        let failed = if bootout_ran {
+            restart_wait_is_failure(&outcome)
+        } else {
+            start_wait_is_failure(&outcome)
+        };
+        if failed {
+            if bootout_ran {
+                bail!(
+                    "新实例未接管监听口（判定依据见上一行）。恢复走两段式：\
+                     `codex-layer stop --label {label}` 确认输出「未注册」后，再 {recovery}",
+                    recovery = restart_unregistered_recovery(label, &config_path),
+                );
+            }
+            // start 的出路压在自己身上：先 stop 再 start。注册成功但未监户时
+            // 注册表里确实有这个 Label，直接再 start 会撞「已在注册」，
+            // 所以恢复命令必须先卸干净。
+            let (print_ok, view) = registration_view(&target);
             bail!(
-                "新实例未接管监听口（判定依据见上一行）。恢复走两段式：\
-                 `codex-layer stop --label {label}` 确认输出「未注册」后，再 {recovery}",
-                recovery = restart_unregistered_recovery(label, &config_path),
+                "start 未就绪：注册{registered}，但监听口 {host}:{port} 上没有本实例\
+                 （判定依据见上一行）。先 `codex-layer stop --label {label}` 卸掉本次注册，\
+                 核对上面三条证据后重新 `codex-layer start --label {label} -c {config}`；\
+                 若确认只是起得慢，`codex-layer status --label {label}` 复核 PID 与 state。",
+                registered = match (print_ok, view.pid) {
+                    (true, Some(pid)) => format!("成功（pid={pid}）"),
+                    (true, None) => "成功（但 launchd 未报 pid）".to_string(),
+                    (false, _) => "复核时已不可见".to_string(),
+                },
+                config = config_path.display(),
             );
         }
     } else {
@@ -1683,6 +1732,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn start_wait_failure_covers_every_non_fresh_outcome() {
+        // issue #49 期望行为：start 与 restart 对齐，除新实例亲自监户外一律失败。
+        // 判据独立于 restart 的那条，因为两者的可达形态集合不同（start 无旧实例）。
+        let cases = [
+            RestartWaitOutcome::ReadyServedByOld {
+                old_pid: 100,
+                drain_seconds: 45,
+            },
+            RestartWaitOutcome::OldInstanceDraining {
+                old_pid: 100,
+                drain_seconds: 45,
+            },
+            RestartWaitOutcome::ForeignListener { pids: vec![7] },
+            RestartWaitOutcome::NewProcessNotListening,
+            // start 场景里这一支最常见：注册刚写进去，launchd 的 pid 还没落定
+            RestartWaitOutcome::Indeterminate,
+        ];
+        for outcome in &cases {
+            assert!(start_wait_is_failure(outcome), "{outcome:?} 必须算失败");
+        }
+        assert!(
+            !start_wait_is_failure(&RestartWaitOutcome::ReadyFresh),
+            "本实例监户必须是成功"
+        );
+    }
+
+    #[test]
+    fn start_wait_wording_never_invents_an_old_instance() {
+        // start 语境下话术不得提旧实例/排空——本路径根本没有旧实例。
+        let text = format_restart_wait(
+            &RestartWaitOutcome::Indeterminate,
+            "127.0.0.1",
+            12333,
+            9.0,
+            "com.codex-layer.proxy",
+            false,
+        );
+        assert!(text.contains("未就绪"), "{text}");
+        assert!(text.contains("判定不了"), "{text}");
+        assert!(!text.contains("旧实例"), "{text}");
+        assert!(!text.contains("排空"), "{text}");
+        // 同一条证据在 restart 语境里必须提排空，证明语境开关不是摆设
+        let restart_text = format_restart_wait(
+            &RestartWaitOutcome::Indeterminate,
+            "127.0.0.1",
+            12333,
+            9.0,
+            "com.codex-layer.proxy",
+            true,
+        );
+        assert!(restart_text.contains("排空"), "{restart_text}");
+        // 进程已注册未监户：start 语境下不该出现「新进程」这种对比性说法
+        let text = format_restart_wait(
+            &RestartWaitOutcome::NewProcessNotListening,
+            "127.0.0.1",
+            12333,
+            9.0,
+            "l",
+            false,
+        );
+        assert!(text.contains("已注册但未监听"), "{text}");
+        assert!(!text.contains("新进程"), "{text}");
+    }
+
     fn evidence(last_probe: ListenProbe, listeners: Vec<u32>) -> RestartWaitEvidence {
         RestartWaitEvidence {
             last_probe,
@@ -1760,6 +1874,7 @@ mod tests {
             12333,
             60.2,
             "com.codex-layer.proxy",
+            true,
         );
         assert!(text.contains("排空"), "{text}");
         assert!(text.contains("45"), "{text}");
@@ -1775,6 +1890,7 @@ mod tests {
             12333,
             60.0,
             "l",
+            true,
         );
         assert!(!text.contains("未就绪"), "{text}");
         // 判定不了必须明说判定不了并给核对命令，不许把猜测写成结论。
@@ -1784,6 +1900,7 @@ mod tests {
             12333,
             9.0,
             "l",
+            true,
         );
         assert!(text.contains("判定不了"), "{text}");
         assert!(text.contains("lsof"), "{text}");
@@ -1794,6 +1911,7 @@ mod tests {
             12333,
             9.0,
             "l",
+            true,
         );
         assert!(text.contains("7, 8"), "{text}");
         assert!(text.contains("-iTCP:12333"), "{text}");
