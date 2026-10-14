@@ -7,3 +7,6 @@ target/
 
 # agent 工作规范只留本地，不入库
 AGENTS.md
+
+# scripts/ci 的门禁脚本被导入时产生的字节码缓存
+__pycache__/
