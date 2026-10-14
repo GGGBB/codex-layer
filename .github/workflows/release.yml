@@ -9,6 +9,15 @@ on:
   push:
     tags:
       - "v*"
+  # 手动触发用于验证产物构建：默认只跑 build、不 publish，避免为了试
+  # workflow 而先在仓库上留下一个真 release。要真挂产物，勾选 publish。
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 是否把产物挂到 release（默认只构建不发布）
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -59,6 +68,8 @@ jobs:
   publish:
     name: 挂到 release 并校验
     needs: build
+    # 手动触发且未勾选 publish 时不发布；tag 推送一律发布。
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
