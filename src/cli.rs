@@ -608,10 +608,10 @@ pub fn already_registered_guidance(label: &str, domain: &str) -> String {
 
 // ———— 运行面：真实 launchctl 调用（macOS），非 macOS 给不支持错误 ————
 
-/// 卸除窗口重试参数（#15 期望行为 1）。本机实测：bootout 卸除窗口亚秒级
-/// 排空（重启往返见 PR #16 实测记录）；上限按 issue 建议约 3s / 10 次量级。
-#[cfg(target_os = "macos")]
-const BOOTSTRAP_RETRY_MAX_ATTEMPTS: usize = 10;
+/// 卸除窗口内 bootstrap 的重试节奏（#15 期望行为 1）。预算不再用固定次数——
+/// 旧值 10 次 × 300ms ≈ 3s，比排空上界小一个数量级，重试必然在旧实例退场前
+/// 就耗尽（issue #47 的死口成因之一）；预算改由
+/// `restart_takeover_budget_seconds` 按排空上界推导。
 #[cfg(target_os = "macos")]
 const BOOTSTRAP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -659,41 +659,72 @@ fn listener_pids_on_port(port: u16) -> Vec<u32> {
         .collect()
 }
 
+/// 一次 `launchctl print` 同时取回「注册与否」与注册视图。重试循环里两者
+/// 都要用，分两次调用会白多一倍子进程。
+#[cfg(target_os = "macos")]
+fn registration_view(target: &str) -> (bool, LaunchdStatus) {
+    let output = run_launchctl(&["print", target]);
+    let print_ok = output.status.success();
+    (
+        print_ok,
+        parse_launchd_status(&String::from_utf8_lossy(&output.stdout)),
+    )
+}
+
 /// launchd 注册视图里的当前 pid。
 #[cfg(target_os = "macos")]
 fn launchd_pid(target: &str) -> Option<u32> {
-    let output = run_launchctl(&["print", target]);
-    if !output.status.success() {
-        return None;
-    }
-    parse_launchd_status(&String::from_utf8_lossy(&output.stdout)).pid
+    registration_view(target).1.pid
 }
 
-/// bootstrap 带卸除窗口重试（#15 期望行为 1）：耗尽或遇确定性错误时返回
-/// 最后一错；重试途中成功也算成功。
+/// bootstrap 带卸除窗口重试（#15 期望行为 1 + issue #47 期望行为 1）：旧实例
+/// 排空期间 bootstrap 必然失败，所以重试要做到旧注册真正消失或预算耗尽为止。
+/// 每轮都做一次注册身份判定：注册视图已是新实例即早停，预算耗尽才交终判。
+/// `Err(末次报错)` 由调用方带身份做终判。
 #[cfg(target_os = "macos")]
-fn bootstrap_with_retry(bootout_ran: bool, domain: &str, plist_path: &Path) -> Result<(), String> {
+fn bootstrap_with_retry(
+    bootout_ran: bool,
+    domain: &str,
+    plist_path: &Path,
+    budget_end: Option<std::time::Instant>,
+    launchd_target: &str,
+    old_pid: Option<u32>,
+) -> Result<(), String> {
     let plist_arg = plist_path.display().to_string();
-    let mut last_error = String::new();
-    for attempt in 1..=BOOTSTRAP_RETRY_MAX_ATTEMPTS {
+    // 每轮失败先赋值再决策，初值永远不会被读，故不预置空串。
+    let mut last_error;
+    let mut residue_notice = false;
+    loop {
         let output = run_launchctl(&["bootstrap", domain, &plist_arg]);
         if output.status.success() {
             return Ok(());
         }
         last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if !should_retry_bootstrap_after_bootout(bootout_ran, &last_error) {
-            break;
+        let transient = should_retry_bootstrap_after_bootout(bootout_ran, &last_error);
+        let (print_ok, view) = registration_view(launchd_target);
+        let identity = registration_identity(print_ok, view.pid, old_pid);
+        let over_budget = budget_end.is_some_and(|end| std::time::Instant::now() >= end);
+        match bootstrap_retry_policy(over_budget, transient, identity) {
+            BootstrapRetryPolicy::StopTakenOver | BootstrapRetryPolicy::StopGiveUp => {
+                return Err(last_error)
+            }
+            BootstrapRetryPolicy::Retry => {}
         }
-        if attempt < BOOTSTRAP_RETRY_MAX_ATTEMPTS {
-            std::thread::sleep(BOOTSTRAP_RETRY_INTERVAL);
+        // 残留形态只说一次：旧实例还在排空，此刻 bootstrap 失败是预期内的。
+        if identity == RegistrationIdentity::ResidueOld && !residue_notice {
+            residue_notice = true;
+            if let Some(pid) = old_pid {
+                println!("旧实例:  pid={pid} 仍在排空，等它退场后再接管（预算内持续重试）");
+            }
         }
+        std::thread::sleep(BOOTSTRAP_RETRY_INTERVAL);
     }
-    Err(last_error)
 }
 
 /// 有界等待监听口就绪并如实报告（issue #34 期望行为 2/3/4）。
 /// 就绪判据加了「接管者必须不是旧实例」：旧实例排空期间端口照常可连，
 /// 只看 connect 会把「旧实例还在服务」报成 restart 完成。
+/// 判据一并回传，由调用方定成败（issue #47 期望行为 3）。
 #[cfg(target_os = "macos")]
 fn wait_listen_ready_and_report(
     host: &str,
@@ -702,11 +733,18 @@ fn wait_listen_ready_and_report(
     old_pid: Option<u32>,
     launchd_target: &str,
     label: &str,
-) {
+    budget_end: Option<std::time::Instant>,
+) -> RestartWaitOutcome {
     use std::time::Instant;
-    let window =
-        std::time::Duration::from_secs(listen_ready_window_seconds(drain_seconds));
+    let window = std::time::Duration::from_secs(listen_ready_window_seconds(drain_seconds));
     let started = Instant::now();
+    // restart 的两阶段共享同一预算（issue #47）：bootstrap 已花掉的时间从这里
+    // 扣掉，总上界不翻倍；start 没有预算终点，沿用整窗。
+    let window = match budget_end {
+        Some(end) if end > started => window.min(end - started),
+        Some(_) => std::time::Duration::ZERO,
+        None => window,
+    };
     // 循环首轮必然赋值后才可能 break/return，无「未初始化读取」路径。
     let mut last_probe;
     loop {
@@ -723,7 +761,7 @@ fn wait_listen_ready_and_report(
                     "监听口:   {host}:{port} 已就绪（等待 {:.1}s）",
                     started.elapsed().as_secs_f64()
                 );
-                return;
+                return RestartWaitOutcome::ReadyFresh;
             }
             // 旧实例仍在服务端口：继续等它按上界退出，直到窗口耗尽。
         }
@@ -750,6 +788,7 @@ fn wait_listen_ready_and_report(
         "{}",
         format_restart_wait(&outcome, host, port, started.elapsed().as_secs_f64(), label)
     );
+    outcome
 }
 
 /// 常驻命令总入口（start/stop/restart/status）。`config_lookup` 注入
@@ -858,25 +897,47 @@ fn run_launchd_macos(
         }
     }
     let bootout_ran = kind == "restart";
-    let bootstrap_error = bootstrap_with_retry(bootout_ran, &domain, &plist_path).err();
+    // 配置在注册前已校验，这里取排空上界推导两阶段共享的预算（issue #47）。
+    let drain_seconds = crate::config::Config::load(&config_path)
+        .map(|config| config.server.drain_seconds)
+        .unwrap_or(0);
+    let budget_seconds = restart_takeover_budget_seconds(drain_seconds);
+    let budget_end = bootout_ran
+        .then(|| std::time::Instant::now() + std::time::Duration::from_secs(budget_seconds));
+    let bootstrap_error =
+        bootstrap_with_retry(bootout_ran, &domain, &plist_path, budget_end, &target, old_pid)
+            .err();
     if let Some(stderr) = &bootstrap_error {
-        // 重试耗尽或确定性失败：launchctl print 复核注册态作终判。
-        let print_ok = run_launchctl(&["print", &target]).status.success();
+        // 重试预算耗尽或确定性失败：launchctl print 复核注册态作终判。
+        let (print_ok, view) = registration_view(&target);
         if !bootout_ran && should_report_already_bootstrapped(stderr, print_ok) {
             // `start` 撞上已注册服务的典型场景：建议 status 复核 +
             // stop → start 两段式；不再把回路指向 restart
             // （#15 次要缺陷 3：restart 正是会卸服务的路径）。
             bail!("{}", already_registered_guidance(label, &domain));
         }
-        match bootstrap_terminal_outcome(print_ok) {
-            // bootstrap 的 I/O error 文本不带身份；print 复核为已注册即
-            // 视作在卸除窗口内已生效，给出复核指引即可
-            // （#15 期望行为 2「已注册」支）。
-            BootstrapTerminalOutcome::Registered => println!(
+        // 终判分两条路：restart 必须带 pid 身份，start 沿用注册与否。
+        let identity = registration_identity(print_ok, view.pid, old_pid);
+        match if bootout_ran {
+            restart_bootstrap_outcome(identity, old_pid)
+        } else {
+            match bootstrap_terminal_outcome(print_ok) {
+                BootstrapTerminalOutcome::Registered => RestartBootstrapOutcome::TakenOver,
+                BootstrapTerminalOutcome::Unregistered => RestartBootstrapOutcome::Unregistered,
+            }
+        } {
+            // 注册视图已是新实例：bootstrap 其实在卸除窗口内已生效。
+            RestartBootstrapOutcome::TakenOver => println!(
                 "已注册常驻服务：{label}（{domain}，末次 bootstrap 报错但 print 复核已生效）"
             ),
-            BootstrapTerminalOutcome::Unregistered => bail!(
-                "launchctl bootstrap 失败（重试 {BOOTSTRAP_RETRY_MAX_ATTEMPTS} 次耗尽）：{stderr}\n\
+            // 注册表里还是旧实例：这不是生效，是残留。旧实现把这一支当成
+            // 「已生效」放行，旧实例退场后就是永久死口（issue #47 主案）。
+            RestartBootstrapOutcome::OldResidue { .. } => bail!(
+                "{}",
+                restart_takeover_failure(stderr, old_pid, label, &config_path, budget_seconds)
+            ),
+            RestartBootstrapOutcome::Unregistered => bail!(
+                "launchctl bootstrap 失败（{budget_seconds}s 预算耗尽）：{stderr}\n\
                  服务当前未注册（已被本次 {kind} 卸载），恢复命令：{}",
                 restart_unregistered_recovery(label, &config_path)
             ),
@@ -886,17 +947,34 @@ fn run_launchd_macos(
         println!("  plist:  {}", plist_path.display());
         println!("  配置:   {}", config_path.display());
     }
-    // 注册成功 / 终判已生效后：有界等待监听口就绪（#15 次要缺陷 1；
-    // 窗口按排空上界推导、未就绪归因讲证据，issue #34）。
-    // 未就绪不作为失败退出，但只报告有证据支撑的原因。
-    match crate::config::Config::load(&config_path) {
-        Ok(config) => {
-            let host = config.server.host.clone();
-            let port = config.server.port;
-            let drain_seconds = config.server.drain_seconds;
-            wait_listen_ready_and_report(&host, port, drain_seconds, old_pid, &target, label);
+    // 注册成功 / 终判已生效后：有界等待监听口就绪（#15 次要缺陷 1；窗口按
+    // 排空上界推导、未就绪归因讲证据，issue #34；未接管即失败，issue #47）。
+    if let Ok(config) = crate::config::Config::load(&config_path) {
+        let host = config.server.host.clone();
+        let port = config.server.port;
+        let outcome = wait_listen_ready_and_report(
+            &host,
+            port,
+            drain_seconds,
+            old_pid,
+            &target,
+            label,
+            budget_end,
+        );
+        // restart 的成败以「新实例是否接管监听口」为准（issue #47 期望行为 3）：
+        // 除新实例亲自监户外一律非零退出，失败正文带恢复命令。旧口径里
+        // 「未就绪不作为失败退出」让 CLI 在永久死口上返回 0，脚本无法判定。
+        // start 维持旧口径：注册成功即成功，未就绪只如实报告（归 #34 语义）。
+        if bootout_ran && restart_wait_is_failure(&outcome) {
+            bail!(
+                "{}\n新实例未接管监听口。恢复走两段式：`codex-layer stop --label {label}`\
+                 确认输出「未注册」后，再 {recovery}",
+                format_restart_wait(&outcome, &host, port, 0.0, label),
+                recovery = restart_unregistered_recovery(label, &config_path),
+            );
         }
-        Err(error) => println!("监听口:   未知（配置读取失败：{error}）"),
+    } else {
+        println!("监听口:   未知（配置读取失败，无法推导端口）");
     }
     Ok(())
 }
@@ -1332,6 +1410,15 @@ mod tests {
             std::path::Path::new("/tmp/cfg.toml"),
         );
         assert!(!cmd.contains('\n'), "{cmd:?}");
+        let failure = restart_takeover_failure(
+            "Bootstrap failed: 5",
+            Some(1),
+            "com.codex-layer.proxy",
+            std::path::Path::new("/tmp/cfg.toml"),
+            60,
+        );
+        assert!(!failure.contains('\n'), "{failure:?}");
+        assert!(!failure.contains('\"'), "{failure:?}");
     }
 
     #[test]
@@ -1347,6 +1434,155 @@ mod tests {
         assert!(listen_ready_window_seconds(0) >= 15);
         for drain in [0u64, 1, 45, 600] {
             assert!(listen_ready_window_seconds(drain) > drain);
+        }
+    }
+
+    #[test]
+    fn registration_identity_requires_pid_match_not_mere_presence() {
+        // issue #47 主案：旧实例排空期间 print 查得到 Label、pid 就是旧 pid。
+        // 旧实现据此判「已生效」，把残留读成接管。
+        assert_eq!(
+            registration_identity(true, Some(100), Some(100)),
+            RegistrationIdentity::ResidueOld
+        );
+        // pid 换了才是接管。
+        assert_eq!(
+            registration_identity(true, Some(200), Some(100)),
+            RegistrationIdentity::Fresh
+        );
+        // print 查无此项：旧注册彻底消失，既不是残留也不是接管。
+        assert_eq!(
+            registration_identity(false, None, Some(100)),
+            RegistrationIdentity::Absent
+        );
+        // 刚注册还没 pid：不能当成旧实例残留。
+        assert_eq!(
+            registration_identity(true, None, Some(100)),
+            RegistrationIdentity::RegisteredNoPid
+        );
+        // start 语境没有旧 pid：有 pid 就是新注册。
+        assert_eq!(
+            registration_identity(true, Some(100), None),
+            RegistrationIdentity::Fresh
+        );
+    }
+
+    #[test]
+    fn restart_bootstrap_outcome_splits_residue_from_effective() {
+        // 「已注册」这一支必须再分身份：残留与接管的处理完全不同。
+        assert_eq!(
+            restart_bootstrap_outcome(RegistrationIdentity::ResidueOld, Some(100)),
+            RestartBootstrapOutcome::OldResidue { old_pid: Some(100) }
+        );
+        assert_eq!(
+            restart_bootstrap_outcome(RegistrationIdentity::Fresh, Some(100)),
+            RestartBootstrapOutcome::TakenOver
+        );
+        assert_eq!(
+            restart_bootstrap_outcome(RegistrationIdentity::RegisteredNoPid, Some(100)),
+            RestartBootstrapOutcome::TakenOver
+        );
+        assert_eq!(
+            restart_bootstrap_outcome(RegistrationIdentity::Absent, Some(100)),
+            RestartBootstrapOutcome::Unregistered
+        );
+    }
+
+    #[test]
+    fn bootstrap_retry_policy_waits_out_residue_but_stops_on_takeover() {
+        // 旧实例残留 + 瞬态错 + 预算未尽：继续等（旧实现在这里 3s 就放弃了）。
+        assert_eq!(
+            bootstrap_retry_policy(false, true, RegistrationIdentity::ResidueOld),
+            BootstrapRetryPolicy::Retry
+        );
+        // 注册视图已是新实例：立刻停手，预算还剩也不重试。
+        assert_eq!(
+            bootstrap_retry_policy(false, true, RegistrationIdentity::Fresh),
+            BootstrapRetryPolicy::StopTakenOver
+        );
+        // 预算耗尽：停手交终判，不许无限等。
+        assert_eq!(
+            bootstrap_retry_policy(true, true, RegistrationIdentity::ResidueOld),
+            BootstrapRetryPolicy::StopGiveUp
+        );
+        // 确定性失败（plist 不存在同形 error 5）：不占预算，直接停手。
+        assert_eq!(
+            bootstrap_retry_policy(false, false, RegistrationIdentity::Absent),
+            BootstrapRetryPolicy::StopGiveUp
+        );
+    }
+
+    #[test]
+    fn takeover_budget_is_shared_not_doubled() {
+        // 两阶段共享同一预算：restart 总上界 = 一个窗口，不是两个窗口之和。
+        for drain in [0u64, 3, 45, 600] {
+            assert_eq!(
+                restart_takeover_budget_seconds(drain),
+                listen_ready_window_seconds(drain)
+            );
+            assert!(restart_takeover_budget_seconds(drain) > drain);
+        }
+    }
+
+    #[test]
+    fn takeover_failure_names_residue_and_gives_copyable_recovery() {
+        // 未接管的失败正文：点名残留 pid + 两段式恢复命令，且命令可直接复制。
+        let text = restart_takeover_failure(
+            "Bootstrap failed: 5: Input/output error",
+            Some(14663),
+            "com.codex-layer.proxy",
+            std::path::Path::new("/tmp/cfg.toml"),
+            60,
+        );
+        assert!(text.contains("14663"), "{text}");
+        assert!(text.contains("从未接管"), "{text}");
+        assert!(text.contains("Bootstrap failed: 5"), "{text}");
+        assert!(text.contains("60s"), "{text}");
+        assert!(
+            text.contains("codex-layer stop --label com.codex-layer.proxy"),
+            "{text}"
+        );
+        assert!(
+            text.contains("codex-layer start --label com.codex-layer.proxy -c /tmp/cfg.toml"),
+            "{text}"
+        );
+        // 单行性：续行反斜杠若写错会留下裸换行，恢复命令就没法复制。
+        assert!(!text.contains('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn takeover_failure_without_old_pid_still_names_recovery() {
+        let text = restart_takeover_failure(
+            "Bootstrap failed: 5",
+            None,
+            "com.x.y",
+            std::path::Path::new("/tmp/c.toml"),
+            15,
+        );
+        assert!(text.contains("不是本次要拉起的新实例"), "{text}");
+        assert!(text.contains("codex-layer start --label com.x.y -c /tmp/c.toml"), "{text}");
+    }
+
+    #[test]
+    fn only_fresh_listener_counts_as_takeover() {
+        // issue #47 期望行为 3：除新实例亲自监户外，一律算失败（含判定不了）。
+        let cases = [
+            RestartWaitOutcome::ReadyFresh,
+            RestartWaitOutcome::ReadyServedByOld {
+                old_pid: 100,
+                drain_seconds: 45,
+            },
+            RestartWaitOutcome::OldInstanceDraining {
+                old_pid: 100,
+                drain_seconds: 45,
+            },
+            RestartWaitOutcome::ForeignListener { pids: vec![7] },
+            RestartWaitOutcome::NewProcessNotListening,
+            RestartWaitOutcome::Indeterminate,
+        ];
+        assert!(!restart_wait_is_failure(&cases[0]), "新实例监户必须是成功");
+        for outcome in &cases[1..] {
+            assert!(restart_wait_is_failure(outcome), "{outcome:?} 必须算失败");
         }
     }
 
