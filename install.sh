@@ -88,7 +88,7 @@ try_download() {
         echo "==> 缺少 curl 或 tar，回落源码构建"
         return 1
     fi
-    local triple tag url manifest tmpdir want got member
+    local triple tag pkg url manifest tmpdir want got member
     if ! triple="$(target_triple)"; then
         echo "==> 本机形态没有对应产物（只发 macOS arm64 与 Linux x86_64），回落源码构建"
         return 1
@@ -109,7 +109,11 @@ try_download() {
             "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
             | tr ',{}" ' '\n\n\n\n\n' | sed -n 's/^tag_name://p' | head -1 || true)"
     fi
-    [ -n "$tag" ] || { echo "==> 取不到版本号，回落源码构建"; return 1; }
+    if [ -z "$tag" ]; then
+        echo "==> 取不到版本号，回落源码构建"
+        cleanup
+        return 1
+    fi
     [ "${tag#v}" = "$tag" ] && tag="v$tag"
 
     pkg="${BIN_NAME}-${tag}-${triple}.tar.gz"
