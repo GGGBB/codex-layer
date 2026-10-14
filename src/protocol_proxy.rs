@@ -1045,6 +1045,299 @@ pub struct ChatSseToResponsesConverter {
     failed: bool,
 }
 
+/// 以下是 Responses 原生压缩轮（`compaction_trigger`）的探针判据。
+///
+/// 分工：这三个函数只**判定**，不做 IO、不读配置、不改请求体。接线在后续单——届时
+/// 上游成功返回原生 `compaction` 项就逐字节透传，仅当 `compaction_input_rejected`
+/// 判真才剥离 trigger 降级本地摘要，两者都不成立时把上游错误原样交给客户端。
+/// 现在无人调用属预期，所以每条判据都自带对拍测试（见 `native_compaction_probe_tests`），
+/// 避免「先接线再补测」把判据缺陷藏进装配流。
+
+/// 数出 SSE 文本里原生 `compaction` 结果项的**完成次数**：事件满足
+/// `type == "response.output_item.done"` 且其 `item.type == "compaction"`。
+///
+/// 为什么必须 SSE 感知而不是全文正则：
+/// - 一个事件的 payload 允许跨多条 `data:` 行（SSE 语义用 `\n` 拼接），按行计数会把
+///   同一项数成两项，「恰好一项」的判定随之失效；
+/// - 增量事件（`response.output_item.added` 与各 delta）会重复出现同一项的局部字段，
+///   只有 `.done` 表示该项定稿；
+/// - 非 JSON 的 `data:` 行（`[DONE]`、心跳注释）必须忽略，而不是算解析失败。
+///
+/// 坏 JSON 保守不计（返回偏小的值）：宁可让调用方认为「上游没给出原生项」而走降级
+/// 路径，也不能把畸形响应当成合法压缩结果透传给客户端。
+///
+/// 只覆盖流式形态；非流式 JSON 响应属后续接线单（那里需要先把原生项重组为 SSE），
+/// 本函数遇到非 SSE 文本会得到 0，同样落在保守侧。
+pub fn upstream_compaction_item_count(sse: &str) -> usize {
+    split_sse_events(sse)
+        .into_iter()
+        .filter(|event| {
+            let Some(payload) = parse_sse_event_data(event) else {
+                return false;
+            };
+            if payload.get("type").and_then(Value::as_str) != Some("response.output_item.done") {
+                return false;
+            }
+            payload
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                == Some(COMPACTION_OUTPUT_TYPE)
+        })
+        .count()
+}
+
+/// 上游 SSE 是否已自带**终止失败**事件（`response.failed` / `response.incomplete` /
+/// `error`）。口径与 `NativeResponsesSseObserver` 一致：事件类型优先取 payload 顶层
+/// `type`，缺失时回落到 `event:` 行。
+///
+/// 装配含义：上游自己宣告过失败的流，客户端手里已有显式终止信号，本层不必再补一帧
+/// `response.failed`（补了只是重复噪音）；反之什么都没发过的截断流必须由本层补帧。
+/// 含 `response.incomplete` 的理由与观测器相同——它同为终态失败，只是「上游认为自己
+/// 正常结束了」；当成成功会让客户端拿到半截压缩结果。
+pub fn upstream_has_terminal_failure(sse: &str) -> bool {
+    split_sse_events(sse)
+        .iter()
+        .map(String::as_str)
+        .any(|event| {
+            let payload_type = sse_event_type(event);
+            let event_type = sse_event_name(event).map(str::to_string);
+            matches!(
+                payload_type.as_deref().or(event_type.as_deref()),
+                Some("response.failed") | Some("response.incomplete") | Some("error")
+            )
+        })
+}
+
+/// 上游是否**显式拒绝**了 `compaction_trigger`（进而允许本层剥离 trigger、降级为
+/// 本地摘要）。判真必须同时满足两条：
+///
+/// 1. **HTTP 4xx**。5xx 是上游自身故障，据此降级会把可重试故障悄悄变成行为改变，
+///    客户端会拿到一份「本以为是原生压缩、其实是本地摘要」的结果而毫不知情；
+/// 2. 错误本体里**既有明确拒绝措辞**（`unsupported` / `does not support` /
+///    `invalid` / `rejected` 等，见 `is_rejection_wording`），**又点名了压缩输入**
+///    （`compact` / `trigger` 字样）。
+///
+/// 两条都要，缺一不可，理由是错误体是最容易**回显请求内容**的地方：
+/// `message` 里出现 `compaction_trigger` 常常只是上游把客户端发来的 item 原样打印出来
+/// （例如在报别的字段的错），那不是拒绝。所以 message 类字段在点名之前，先由
+/// `strip_json_fragments` 剥掉内嵌的 JSON 片段——请求内容基本都以 JSON 形态被回显。
+/// 结构化字段（`code` / `type` / `param` / `field`）不受此处理：上游用它们说明
+/// 「哪个参数、什么毛病」，`param: "input[7].compaction_trigger"` 加
+/// `type: "invalid_request_error"` 就是教科书式的拒绝。
+///
+/// 措辞与点名允许来自不同字段，但都限于错误本体内部；`scope` 词刻意不认裸 `input`，
+/// 否则「input 数组不得为空」这类无关错误也会触发降级，让本层无缘无故丢掉原生压缩能力。
+///
+/// 非 JSON 错误体（网关 HTML、纯文本）一律判假：读不出结构就无权推断上游的意图，
+/// 此时错误原样透传比降级更容易让人看清发生了什么。返回值是布尔，
+/// 错误体内容（可能含用户内容）不进任何下游文本。
+pub fn compaction_input_rejected(status: u16, error_body: &str) -> bool {
+    if !(400..500).contains(&status) {
+        return false;
+    }
+    let Ok(parsed) = serde_json::from_str::<Value>(error_body) else {
+        return false;
+    };
+    let error = parsed.get("error").unwrap_or(&parsed);
+    let structured: Vec<String> = structured_fields(error, &parsed).collect();
+    let messages: Vec<String> = message_fields(error, &parsed).collect();
+    if structured.is_empty() && messages.is_empty() {
+        return false;
+    }
+    let rejection_wording = structured
+        .iter()
+        .chain(messages.iter())
+        .any(|value| is_rejection_wording(value));
+    if !rejection_wording {
+        return false;
+    }
+    // 点名压缩输入：结构化字段直接算；message 要先剥掉内嵌的请求 JSON 片段再找。
+    structured
+        .iter()
+        .any(|value| mentions_compaction_input(value))
+        || messages
+            .iter()
+            .any(|value| mentions_compaction_input(&strip_json_fragments(value)))
+}
+/// 错误体里的结构化字段（`code` / `type` / `param` / `field`），统一小写。
+/// 字符串之外的值（`param: null`、`code: 3`）不参与判定——宁缺毋滥。
+fn structured_fields<'a>(
+    error: &'a Value,
+    parsed: &'a Value,
+) -> impl Iterator<Item = String> + 'a {
+    ["code", "type", "param", "field"]
+        .into_iter()
+        .filter_map(move |key| pick_string(error, parsed, key))
+}
+
+/// 错误体里的消息类字段，统一小写。
+fn message_fields<'a>(
+    error: &'a Value,
+    parsed: &'a Value,
+) -> impl Iterator<Item = String> + 'a {
+    ["message", "detail", "error_message"]
+        .into_iter()
+        .filter_map(move |key| pick_string(error, parsed, key))
+}
+
+fn pick_string(error: &Value, parsed: &Value, key: &str) -> Option<String> {
+    error
+        .get(key)
+        .or_else(|| parsed.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_lowercase)
+}
+
+/// 是否点名压缩输入。`compact` 一并覆盖 `compaction` / `compaction_trigger` /
+/// `compact_response` 等变体；刻意不含裸 `input`（理由见 `compaction_input_rejected`）。
+fn mentions_compaction_input(lowercased: &str) -> bool {
+    lowercased.contains("compact") || lowercased.contains("trigger")
+}
+
+/// 明确拒绝的措辞集合（小写子串）。`invalid` 必须保留：上游拒绝未知 item 类型的
+/// 惯用文案就是 `invalid_request_error` / 「invalid item type」。但它单独不足够，
+/// 仍要求同一处点名压缩输入。
+fn is_rejection_wording(lowercased: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "unsupported",
+        "not supported",
+        "support",
+        "unrecognized",
+        "unknown",
+        "unexpected",
+        "unhandled",
+        "invalid",
+        "not allowed",
+        "does not",
+        "cannot",
+        "can not",
+        "must not",
+        "rejected",
+        "unable to process",
+    ];
+    MARKERS.iter().any(|marker| lowercased.contains(marker))
+}
+
+/// 按 SSE 帧界（空行）把整段响应切成事件块。行尾 `\r` 就地剥掉，CRLF 与 LF 同构。
+///
+/// 只用于「已完整落地的响应文本」。流式增量观察走 `NativeResponsesSseObserver`，
+/// 它要边收边判且限制内存，两者形态不同，不共用。
+fn split_sse_events(sse: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut current = String::new();
+    for raw_line in sse.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            if !current.is_empty() {
+                events.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    // 末尾缺空行的残帧照样入列：上游截断时这里往往正是唯一能读到终止事件的块，
+    // 丢了它就把「已宣告失败」误判成「什么都没发」。
+    if !current.is_empty() {
+        events.push(current);
+    }
+    events
+}
+
+/// 一个事件块内全部 `data:` 行按 SSE 语义以 `\n` 拼接后解析。
+/// 解析失败（`[DONE]`、心跳、坏 JSON）返回 `None`，由调用方走保守分支。
+fn parse_sse_event_data(event: &str) -> Option<Value> {
+    let data = event
+        .lines()
+        .filter_map(|line| strip_sse_field(line, "data"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
+}
+
+/// 读一个事件 payload 的顶层 `type`，**容忍截断**：先用常规解析，失败后退到
+/// 流式读取——只要 `type` 键出现在截断点之前就能拿到。
+///
+/// 为什么要这一步：上游中途断流时，最后一帧往往是半条 JSON
+/// （`data: {"type":"response.failed"`），常规解析直接报错，于是「上游已经宣告失败」
+/// 被误判成「什么都没发」，本层会多补一帧重复的失败帧。终止事件的对象极小，
+/// `type` 通常就在开头，退一步读它是安全且高收益的。
+/// 与 `NativeResponsesSseObserver` 的观察口径保持一致，两处判据不该宽窄不一。
+fn sse_event_type(event: &str) -> Option<String> {
+    let data = event
+        .lines()
+        .filter_map(|line| strip_sse_field(line, "data"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = serde_json::from_str::<Value>(&data) {
+        return parsed
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    /// 只取顶层 `type`，其余值一律跳过；遇到截断错误就把手上已有的返回出去。
+    struct TopLevelType<'a>(&'a mut Option<String>);
+    impl<'de> serde::de::Visitor<'de> for TopLevelType<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an SSE event object")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            while let Ok(Some(key)) = map.next_key::<String>() {
+                if key == "type" {
+                    if let Ok(value) = map.next_value::<String>() {
+                        *self.0 = Some(value);
+                    }
+                } else {
+                    let _ = map.next_value::<serde::de::IgnoredAny>();
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut found = None;
+    let mut deserializer = serde_json::Deserializer::from_str(&data);
+    let _ = serde::Deserializer::deserialize_map(&mut deserializer, TopLevelType(&mut found));
+    found
+}
+
+/// 剥掉文本里 `{...}` 形态的片段（含嵌套）。用于 message 类字段：上游回显请求内容时
+/// 几乎总是以 JSON 形态出现，先去掉这些片段，剩下的散文才是「上游自己想说的话」。
+///
+/// 刻意做保守剥离：括号不闭合时把残段一并丢掉——宁可少认一次点名（判假、走透传），
+/// 也不要把回显内容当成拒绝理由。
+fn strip_json_fragments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 事件块的 `event:` 行内容（用于 payload 顶层没有 `type` 的形态）。
+fn sse_event_name(event: &str) -> Option<&str> {
+    event
+        .lines()
+        .find_map(|line| strip_sse_field(line, "event"))
+        .map(str::trim)
+}
+
 /// 原生 Responses 上游的旁路终止守卫：只观察 SSE 里的终止事件，不改写任何响应字节，
 /// 也不保存诊断正文。只保留每个事件的有限前缀，避免图片等大 payload 令诊断缓冲无界增长。
 #[derive(Default)]
@@ -1168,6 +1461,223 @@ pub fn native_stream_failure_frame(message: &str, error_type: &str) -> String {
         }),
     );
     output
+}
+
+#[cfg(test)]
+mod native_compaction_probe_tests {
+    use super::{
+        compaction_input_rejected, upstream_compaction_item_count, upstream_has_terminal_failure,
+    };
+
+    /// 定稿事件：`response.output_item.done` + `item.type == "compaction"`。
+    fn done_item(index: usize, id: &str) -> String {
+        format!(
+            "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":{index},\"item\":{{\"id\":\"{id}\",\"type\":\"compaction\"}}}}\n\n"
+        )
+    }
+
+    #[test]
+    fn exactly_one_done_compaction_item_counts_one() {
+        let created = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n";
+        let sse = format!("{created}{}", done_item(0, "cmsg_1"));
+        assert_eq!(upstream_compaction_item_count(&sse), 1);
+    }
+
+    #[test]
+    fn zero_items_counts_zero_including_empty_and_done_marker_only() {
+        for sse in ["", "data: [DONE]\n\n", "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n"] {
+            assert_eq!(upstream_compaction_item_count(sse), 0, "{sse:?} 不该数出压缩项");
+        }
+    }
+
+    /// 两个定稿项必须数成 2 —— 「恰好一项」判定的另一半：多了要能发现。
+    #[test]
+    fn two_done_compaction_items_count_two() {
+        let sse = format!("{}{}", done_item(0, "cmsg_1"), done_item(1, "cmsg_2"));
+        assert_eq!(upstream_compaction_item_count(&sse), 2);
+    }
+
+    /// 同一项跨多条 `data:` 行只算一项：SSE 语义是逐行以 `\n` 拼接后再解析。
+    /// 这是按行正则最容易数错的地方，所以专门钉住。
+    #[test]
+    fn multi_line_data_for_one_event_counts_once() {
+        let sse = "event: response.output_item.done\n\
+data: {\"type\":\"response.output_item.done\",\n\
+data: \"output_index\":0,\n\
+data: \"item\":{\"id\":\"cmsg_1\",\"type\":\"compaction\"}}\n\n";
+        assert_eq!(upstream_compaction_item_count(sse), 1);
+    }
+
+    /// 增量事件里反复出现的 item 片段不计入：只有 `.done` 表示定稿。
+    #[test]
+    fn added_and_delta_events_do_not_count() {
+        let sse = "event: response.output_item.added\n\
+data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"cmsg_1\",\"type\":\"compaction\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n\
+data: [DONE]\n\n";
+        assert_eq!(upstream_compaction_item_count(sse), 0);
+    }
+
+    /// CRLF 与 LF 同构；缺尾部空行的残帧也要判到（上游截断时的唯一证据）。
+    #[test]
+    fn crlf_and_trailing_partial_frame_are_handled() {
+        let crlf = done_item(0, "cmsg_1").replace('\n', "\r\n");
+        assert_eq!(upstream_compaction_item_count(&crlf), 1);
+        let partial = crlf.trim_end_matches("\r\n\r\n");
+        assert_eq!(
+            upstream_compaction_item_count(partial),
+            1,
+            "缺尾部空行的残帧必须照样判到"
+        );
+    }
+
+    #[test]
+    fn malformed_json_and_comment_lines_are_ignored_not_counted() {
+        // 心跳注释帧不算项。
+        assert_eq!(upstream_compaction_item_count(": keep-alive\n\n"), 0);
+        // 坏 JSON 的那一帧保守不计。
+        let broken = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\"\n\n";
+        assert_eq!(upstream_compaction_item_count(broken), 0, "坏 JSON 保守不计");
+        // 坏帧之后的合法项必须照数：一帧坏不得连带吞掉后面的好帧。
+        let good_after_bad = format!("{}{}", broken, done_item(0, "cmsg_1"));
+        assert_eq!(
+            upstream_compaction_item_count(&good_after_bad),
+            1,
+            "一帧坏 JSON 不得吞掉后面的合法项"
+        );
+    }
+
+    /// 非压缩类型的定稿项不计。
+    #[test]
+    fn done_items_of_other_types_do_not_count() {
+        let sse = "event: response.output_item.done\n\
+data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n";
+        assert_eq!(upstream_compaction_item_count(sse), 0);
+    }
+
+    #[test]
+    fn terminal_failure_is_detected_from_payload_type_or_event_line() {
+        for (sse, label) in [
+            ("data: {\"type\":\"response.failed\"}\n\n", "payload type"),
+            ("event: response.failed\ndata: {}\n\n", "event 行兜底"),
+            ("event: response.incomplete\ndata: {\"type\":\"response.incomplete\"}\n\n", "incomplete"),
+            ("data: {\"type\":\"error\",\"error\":{\"message\":\"上游炸了\"}}\n\n", "error 事件"),
+            (
+                &format!(
+                    "{}data: {{\"type\":\"response.failed\"}}\n\n",
+                    done_item(0, "cmsg_1")
+                ),
+                "压缩项之后再失败",
+            ),
+        ] {
+            assert!(upstream_has_terminal_failure(sse), "{label} 必须识别为终止失败");
+        }
+    }
+
+    /// 正常流与截断流不得被当成「上游自报失败」——那条路会漏掉本层补帧。
+    #[test]
+    fn healthy_and_silently_truncated_streams_are_not_terminal_failures() {
+        for sse in [
+            "data: {\"type\":\"response.completed\"}\n\ndata: [DONE]\n\n",
+            done_item(0, "cmsg_1").as_str(),
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"He\"}\n\n",
+            "",
+            "data: [DONE]\n\n",
+        ] {
+            assert!(
+                !upstream_has_terminal_failure(sse),
+                "{sse:?} 不得被判成上游自报失败"
+            );
+        }
+    }
+
+    /// 残帧里的终止事件必须读得到：截断响应的最后一帧常缺尾部空行。
+    #[test]
+    fn terminal_failure_survives_a_truncated_last_frame() {
+        let sse = format!("{}data: {{\"type\":\"response.failed\"", done_item(0, "cmsg_1"));
+        assert!(upstream_has_terminal_failure(&sse));
+    }
+
+    #[test]
+    fn non_4xx_never_counts_as_rejecting_the_trigger() {
+        let body = "{\"error\":{\"code\":\"unsupported_compaction_trigger\"}}";
+        for status in [200u16, 301, 499, 500, 502, 503] {
+            if status == 499 {
+                continue;
+            }
+            assert!(!compaction_input_rejected(status, body), "{status} 不该判真");
+        }
+        // 499 在 4xx 段内，同一条错误体在这里判真，证明状态码闸门是真的。
+        assert!(compaction_input_rejected(499, body));
+    }
+
+    #[test]
+    fn structured_rejection_fields_are_recognized() {
+        for body in [
+            "{\"error\":{\"code\":\"unsupported_compaction_trigger\"}}",
+            "{\"error\":{\"type\":\"invalid_request_error\",\"param\":\"input[7].compaction_trigger\"}}",
+            "{\"error\":{\"message\":\"bad\",\"field\":\"compaction_trigger\",\"code\":\"unknown_item_type\"}}",
+            "{\"code\":\"unsupported_compaction\"}",
+        ] {
+            assert!(compaction_input_rejected(400, body), "{body} 应判真");
+        }
+    }
+
+    /// 核心防误判：错误体**回显**了请求里的 trigger 字样，但报的是别的毛病 → 不算拒绝。
+    #[test]
+    fn echoed_trigger_in_message_is_not_a_rejection() {
+        for body in [
+            // 只回显，不含拒绝措辞。
+            "{\"error\":{\"message\":\"invalid item in input: {\\\"type\\\":\\\"compaction_trigger\\\"}\"}}",
+            // 拒绝措辞有，但没点名压缩输入。
+            "{\"error\":{\"message\":\"input array cannot be empty\"}}",
+            "{\"error\":{\"type\":\"invalid_request_error\",\"param\":\"tools[0].name\"}}",
+            // 裸 input 不算点名压缩输入。
+            "{\"error\":{\"message\":\"input must not contain unknown fields\"}}",
+        ] {
+            assert!(
+                !compaction_input_rejected(400, body),
+                "{body} 属回显或无关错误，不该判真"
+            );
+        }
+    }
+
+    /// message 同时点名压缩输入并给出拒绝措辞 → 判真。
+    #[test]
+    fn message_naming_the_trigger_with_rejection_wording_is_recognized() {
+        for body in [
+            "{\"error\":{\"message\":\"Unsupported item type: compaction_trigger\"}}",
+            "{\"error\":{\"message\":\"This model does not support compaction requests\"}}",
+            "{\"error\":{\"message\":\"Invalid 'compaction_trigger': unknown item type\"}}",
+            "{\"error_message\":\"compaction trigger rejected by backend\"}",
+        ] {
+            assert!(compaction_input_rejected(400, body), "{body} 应判真");
+        }
+    }
+
+    /// 非 JSON 错误体（网关 HTML、纯文本）一律判假：读不出结构就无权推断上游的意图。
+    #[test]
+    fn non_json_error_bodies_are_never_a_rejection() {
+        for body in [
+            "",
+            "<html><body>400 Bad Request</body></html>",
+            "compaction_trigger is unsupported",
+            "{\"error\":",
+        ] {
+            assert!(!compaction_input_rejected(400, body), "{body:?} 不该判真");
+        }
+    }
+
+    /// 判定只产出布尔：错误体里可能含用户内容，绝不能被带进下游文本。
+    #[test]
+    fn verdict_is_a_bare_bool_without_error_body_leakage() {
+        let secret = "PRIVATE-USER-CONTENT";
+        let body = format!("{{\"error\":{{\"code\":\"unsupported_compaction_trigger\",\"message\":\"{secret}\"}}}}");
+        let verdict = compaction_input_rejected(400, &body);
+        let rendered = format!("{verdict}");
+        assert!(verdict);
+        assert!(!rendered.contains(secret), "判定结果不得携带错误体内容");
+    }
 }
 
 #[cfg(test)]
