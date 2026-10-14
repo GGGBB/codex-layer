@@ -1,0 +1,101 @@
+# release 产物：打 tag（v*）时构建预构建包并挂到该 tag 的 release 上。
+#
+# 产物**未做代码签名与公证**：macOS Gatekeeper 首次运行会提示无法验证开发者，
+# 属已知代价，需在 release 正文写明（见 issue 边界「不做清单」）。
+# 本 workflow 只负责产物与校验和，不做源码构建之外的任何事。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 产物 (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 本项目 dogfood 形态优先，其次是 Linux x86_64
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Rust stable（指定目标三元组）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: cargo 缓存
+        uses: Swatinem/rust-cache@v2
+      - name: 构建 release 产物
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: 打包（二进制 + LICENSE + 示例配置）
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="dist/codex-layer-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/codex-layer" "$STAGE/"
+          cp LICENSE codex-layer.toml.example "$STAGE/"
+          tar -czf "dist/codex-layer-${VERSION}-${{ matrix.target }}.tar.gz" \
+            -C dist "codex-layer-${VERSION}-${{ matrix.target }}"
+          echo "产物内容："
+          tar -tzf "dist/codex-layer-${VERSION}-${{ matrix.target }}.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: dist/*.tar.gz
+
+  publish:
+    name: 挂到 release 并校验
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+      # 校验和与产物一起发布；install.sh 校验后才落盘，因此这份清单必须
+      # 与产物同名同批生成，不能事后再补。
+      - name: 生成 sha256 清单
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -1 codex-layer-*.tar.gz | sort > ../names.txt
+          test -s ../names.txt || { echo "没有任何产物可发布" >&2; exit 1; }
+          sha256sum $(cat ../names.txt) > sha256sums.txt
+          cat sha256sums.txt
+      - name: 上传到本 tag 的 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ARGS=(dist/*.tar.gz dist/sha256sums.txt)
+          # tag 已存在 release（人工先建的草稿）就补产物，否则按 tag 名新建。
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${ARGS[@]}" --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" "${ARGS[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "预构建产物（未签名）。校验：\`sha256sum -c sha256sums.txt\`。"
+          fi
+          # 正判据：上传后回读 release，确认产物条数与本地一致。只“上传命令
+          # 返回 0”不算成功——清单为空时同样返回 0。
+          REMOTE=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets | length')
+          LOCAL=$(ls -1 dist/* | wc -l | tr -d ' ')
+          echo "远端产物 $REMOTE 个，本地 $LOCAL 个"
+          test "$REMOTE" -eq "$LOCAL" || { echo "产物条数与本地不一致" >&2; exit 1; }
