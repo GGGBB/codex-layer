@@ -24,6 +24,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # 产物版本名的唯一定义处。绝不可直接取引用名：手动触发（workflow_dispatch）下
+  # 它是分支名，会产出 codex-layer-main-<三元组>.tar.gz 这种下载侧永远认不出的包。
+  # 两个作业共用这一个来源，避免「同一规则两端各写一遍、单边漂移无人检查」。
+  ARTIFACT_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.0-dev' }}
 
 jobs:
   build:
@@ -51,15 +55,32 @@ jobs:
       - name: 打包（二进制 + LICENSE + 示例配置）
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
+          VERSION="${ARTIFACT_VERSION}"
+          PKG="codex-layer-${VERSION}-${{ matrix.target }}.tar.gz"
           STAGE="dist/codex-layer-${VERSION}-${{ matrix.target }}"
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/codex-layer" "$STAGE/"
           cp LICENSE codex-layer.toml.example "$STAGE/"
-          tar -czf "dist/codex-layer-${VERSION}-${{ matrix.target }}.tar.gz" \
-            -C dist "codex-layer-${VERSION}-${{ matrix.target }}"
+          tar -czf "dist/$PKG" -C dist "codex-layer-${VERSION}-${{ matrix.target }}"
           echo "产物内容："
-          tar -tzf "dist/codex-layer-${VERSION}-${{ matrix.target }}.tar.gz"
+          tar -tzf "dist/$PKG"
+          # 跨端一致性的正判据。包名与包内目录名是 install.sh 的两处硬约定
+          # （下载 URL 拼包名、取成员拼目录名），此前两端各写一遍、谁都不核对。
+          # 形态判据先自测再判真值：正则一旦写窄（例如三元组段数写死），
+          # 会把合规产物判死；写宽则恒绿。用一正一负两条对照钉住判据本身。
+          NAME_RE='^codex-layer-v[0-9][0-9A-Za-z.-]*(-[a-z0-9_]+){2,}\.tar\.gz$'
+          printf '%s\n' "codex-layer-v0.0.0-x86_64-unknown-linux-gnu.tar.gz" \
+            | grep -Eq "$NAME_RE" \
+            || { echo "判据自测失败：合规形态被正则判死" >&2; exit 1; }
+          printf '%s\n' "codex-layer-vmain-aarch64-apple-darwin.tar.gz" \
+            | grep -Eq "$NAME_RE" \
+            && { echo "判据自测失败：分支命名的包未被正则判死，判据恒绿" >&2; exit 1; }
+          echo "判据自测通过（正/负各一条）"
+          echo "$PKG" | grep -Eq "$NAME_RE" \
+            || { echo "产物名 $PKG 不匹配下载侧命名约定" >&2; exit 1; }
+          tar -tzf "dist/$PKG" \
+            | grep -qx "codex-layer-${VERSION}-${{ matrix.target }}/codex-layer" \
+            || { echo "包内成员名与下载侧 member 判据不一致" >&2; exit 1; }
       - uses: actions/upload-artifact@v4
         with:
           name: pkg-${{ matrix.target }}
@@ -92,20 +113,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          TAG="${ARTIFACT_VERSION}"
+          # 非 tag 触发建出的只能是开发用产物，必须标 prerelease：GitHub 的
+          # releases/latest 端点会跳过 prerelease，而 install.sh 正是取 latest。
+          # 不标就会让开发包占住 latest，把所有人导到 main 的构建上。
+          PRE=""
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            PRE="--prerelease"
+          fi
           ARGS=(dist/*.tar.gz dist/sha256sums.txt)
-          # tag 已存在 release（人工先建的草稿）就补产物，否则按 tag 名新建。
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${ARGS[@]}" --clobber \
+          # tag 已存在 release（人工先建的草稿）就补产物，否则按版本名新建。
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ARGS[@]}" --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$GITHUB_REF_NAME" "${ARGS[@]}" \
+            gh release create "$TAG" $PRE "${ARGS[@]}" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "$GITHUB_REF_NAME" \
+              --title "$TAG" \
               --notes "预构建产物（未签名）。校验：\`sha256sum -c sha256sums.txt\`。"
           fi
           # 正判据：上传后回读 release，确认产物条数与本地一致。只“上传命令
           # 返回 0”不算成功——清单为空时同样返回 0。
-          REMOTE=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+          REMOTE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
             --json assets --jq '.assets | length')
           LOCAL=$(ls -1 dist/* | wc -l | tr -d ' ')
           echo "远端产物 $REMOTE 个，本地 $LOCAL 个"
