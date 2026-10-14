@@ -2562,11 +2562,9 @@ async fn upstream_request_parts(
         // 也不带 compaction_trigger，compact 判定落空；由前缀对齐按指令签名检出，
         // 做「末尾唯一 user 指令 + tools 字节回填」。检出即跳过 remember_tools，
         // 杜绝把压缩轮的 tools=[] 毒化进回填缓存；未检出才是普通轮，照常记录。
-        let aligned = if relay.protocol == RelayProtocol::ChatCompletions {
-            crate::compaction_align::align_compaction_request(&request_json)
-        } else {
-            None
-        };
+        // 对齐算法的输入本就是 Responses 形态原始请求体（顶层 instructions /
+        // input 项），在协议转换之前调用，两条方言同样适用。
+        let aligned = crate::compaction_align::align_compaction_request(&request_json);
         match aligned {
             Some((aligned, report)) => {
                 log_compaction_align(&report);
@@ -2576,10 +2574,7 @@ async fn upstream_request_parts(
         }
     }
     // 探针用 key 需在 request_json 被转换层 move 之前取出。
-    let probe_key = if relay.protocol == RelayProtocol::ChatCompletions
-        && relay.stabilize_prompt_prefix
-        && !compact
-    {
+    let probe_key = if relay.stabilize_prompt_prefix && !compact {
         request_json
             .get("prompt_cache_key")
             .and_then(Value::as_str)
@@ -2602,7 +2597,9 @@ async fn upstream_request_parts(
     // 前缀分叉探针（opt-in）：普通轮观察「system 块序列 + tools」前缀，
     // 字节突变即 dump 分叉点（重启首轮重放取证用）；压缩轮前缀本就有意
     // 重写，跳过观察以免噪声。
-    if relay.protocol == RelayProtocol::ChatCompletions && relay.stabilize_prompt_prefix && !compact {
+    if relay.stabilize_prompt_prefix && !compact {
+        // 指纹按请求形态自派生：转换前形态（Responses 直通）走 instructions/input
+        // 口径，转换后形态（messages）走 system 块口径。
         if let Some(report) = crate::prefix_divergence::observe(probe_key.as_deref(), &body) {
             crate::diagnostic_log::log_event(
                 if matches!(report.kind, crate::prefix_divergence::DivergenceKind::Baseline) {

@@ -70,10 +70,75 @@ fn message_text(message: &Value) -> Option<String> {
     }
 }
 
-/// 会话前缀指纹 = 头部连续 system/developer 块内容 + 末尾分隔 + tools 序列化。
+/// 会话前缀指纹（按请求形态分派）。
+///
+/// - Chat Completions 形态（有 `messages`）：头部连续 system/developer 块内容
+///   + 末尾分隔 + tools 序列化；
+/// - 原生 Responses 形态（无 `messages`、有 `input`）：顶层 `instructions`
+///   + `input` 头部连续 system/developer 消息项 + tools 序列化。
+///
 /// 只取「头部连续段」：历史消息里混入的 system 项属于消息区，由稳定层
 /// 折叠逻辑负责，不归本探针（探针盯的是重启分叉最高发的 prompt 最前端）。
 pub fn prompt_prefix_fingerprint(body: &Value) -> Option<String> {
+    if body.get("messages").and_then(Value::as_array).is_none()
+        && body.get("input").and_then(Value::as_array).is_some()
+    {
+        return responses_prefix_fingerprint(body);
+    }
+    chat_completions_prefix_fingerprint(body)
+}
+
+/// 原生 Responses 形态的前缀指纹：`instructions`（字符串或分片数组）
+/// → `input` 头部连续 system/developer 消息项（遇其它角色或非消息项即停）
+/// → 分隔符 → tools 序列化。形态不认识一律 None（放弃观察，宁缺毋滥）。
+fn responses_prefix_fingerprint(body: &Value) -> Option<String> {
+    let mut fingerprint = String::new();
+    match body.get("instructions") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(text)) => {
+            fingerprint.push_str(text);
+            fingerprint.push('\n');
+        }
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                let text = part.get("text").and_then(Value::as_str)?;
+                fingerprint.push_str(text);
+                fingerprint.push('\n');
+            }
+        }
+        Some(_) => return None,
+    }
+    let items = body.get("input").and_then(Value::as_array)?.clone();
+    for item in &items {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            break;
+        }
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("");
+        if role != "system" && role != "developer" {
+            break;
+        }
+        fingerprint.push_str(&message_text(item)?);
+        fingerprint.push('\n');
+    }
+    tools_suffix(&fingerprint, body)
+}
+
+/// tools 序列化的拼接口径（两条方言共用，保证跨形态的语义一致）：
+/// 非空数组才计入前缀（上游模板把 tools 渲染在 prompt 前部）；缺省与 null
+/// 视为「本就无 tools」；其它形态不认识，放弃观察。
+fn tools_suffix(fingerprint: &str, body: &Value) -> Option<String> {
+    match body.get("tools") {
+        Some(Value::Array(tools)) if !tools.is_empty() => {
+            serde_json::to_string(&Value::Array(tools.clone()))
+                .ok()
+                .map(|tools| format!("{fingerprint}\u{1}{tools}"))
+        }
+        None | Some(Value::Null) => Some(fingerprint.to_string()),
+        _ => None,
+    }
+}
+
+fn chat_completions_prefix_fingerprint(body: &Value) -> Option<String> {
     let mut fingerprint = String::new();
     let messages = body.get("messages").and_then(Value::as_array);
     for message in messages.unwrap_or(&Vec::new()) {
@@ -84,13 +149,7 @@ pub fn prompt_prefix_fingerprint(body: &Value) -> Option<String> {
         fingerprint.push_str(&message_text(message)?);
         fingerprint.push('\n');
     }
-    match body.get("tools") {
-        Some(Value::Array(tools)) if !tools.is_empty() => {
-            serde_json::to_string(&Value::Array(tools.clone())).ok().map(|tools| format!("{fingerprint}\u{1}{tools}"))
-        }
-        None | Some(Value::Null) => Some(fingerprint),
-        _ => None,
-    }
+    tools_suffix(&fingerprint, body)
 }
 
 /// UTF-8 安全的分叉点上下文切片：按 first_diff 所在 char 边界向两侧扩半径。
@@ -318,5 +377,78 @@ mod tests {
         assert!(observe(key_of(&request(key)), &sub).is_none(), "共键交替不是分叉");
         // 第三种全新形态：必须仍能报
         assert!(matches!(observe(key_of(&request(key)), &sub2).unwrap().kind, DivergenceKind::Diverged));
+    }
+
+    fn responses_body(instructions: Value, head_role: &str, tools: Value) -> Value {
+        json!({
+            "instructions": instructions,
+            "input": [
+                {"type": "message", "role": head_role, "content": [{"type": "input_text", "text": "头部块"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ],
+            "tools": tools,
+        })
+    }
+
+    #[test]
+    fn responses_fingerprint_covers_instructions_head_items_and_tools() {
+        let body = responses_body(json!("CORE"), "developer", json!([{"type": "function"}]));
+        let fp = prompt_prefix_fingerprint(&body).expect("Responses 形态必须被识别");
+        assert!(fp.starts_with("CORE\n头部块\n"), "instructions 与头部项按序拼接: {fp:?}");
+        assert!(fp.contains('\u{1}'), "非空 tools 必须计入前缀");
+    }
+
+    #[test]
+    fn responses_head_stops_at_first_non_system_item() {
+        // 历史中段的 system 项属消息区，不得计入头部。
+        let mut body = responses_body(json!("CORE"), "user", json!([]));
+        body["input"] = json!([
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "u1"}]},
+            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "中段 system"}]},
+        ]);
+        // 该体量 tools 为空数组，与既有口径一致地放弃观察；头部停止边界另测。
+        let _ = body;
+        let stop_only = json!({
+            "instructions": "CORE",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "u1"}]},
+                {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "中段 system"}]},
+            ],
+        });
+        assert_eq!(prompt_prefix_fingerprint(&stop_only).unwrap(), "CORE\n");
+    }
+
+    #[test]
+    fn responses_instructions_shapes_and_tools_absence() {
+        // 分片数组形态
+        let parts = json!({
+            "instructions": [{"text": "A"}, {"text": "B"}],
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+        });
+        assert_eq!(prompt_prefix_fingerprint(&parts).unwrap(), "A\nB\n");
+        // 空数组 tools 沿用既有口径：形态不认识、放弃观察（tools 由整块变空
+        // 正是最需要看见的分叉，不可与「本就无 tools」混为一谈）。
+        let with_empty = responses_body(json!("CORE"), "user", json!([]));
+        assert!(prompt_prefix_fingerprint(&with_empty).is_none());
+        // 非数组 tools：形态不认识，放弃观察
+        let weird = json!({"instructions": "C", "input": [], "tools": {"weird": true}});
+        assert!(prompt_prefix_fingerprint(&weird).is_none());
+        // instructions 形态不认识：放弃观察
+        let bad = json!({"instructions": 42, "input": []});
+        assert!(prompt_prefix_fingerprint(&bad).is_none());
+    }
+
+    #[test]
+    fn responses_shape_diverges_when_instructions_change() {
+        let key = "thread-div-responses-1";
+        let first = responses_body(json!("CORE"), "developer", json!([{"type": "function"}]));
+        assert!(matches!(observe(key_of(&request(key)), &first).unwrap().kind, DivergenceKind::Baseline));
+        let mut flipped = first.clone();
+        flipped["instructions"] = json!("CORE CHANGED");
+        let report = observe(key_of(&request(key)), &flipped).expect("instructions 变化必须报分叉");
+        assert!(matches!(report.kind, DivergenceKind::Diverged));
+        assert_eq!(report.first_diff, "CORE".len());
+        // 回摆到已见形态不得再报
+        assert!(observe(key_of(&request(key)), &first).is_none());
     }
 }
