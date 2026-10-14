@@ -5449,6 +5449,11 @@ fn relocate_deferred_tools_notice_blocks(messages: &mut Vec<Value>) {
             break;
         };
         let close_at = open + close_rel;
+        // 禁跨界配对：闭标签前又出现开标签说明存在未闭合残片，保守放弃后续扫描，
+        // 不把「这个开标签配那个闭标签」的跨界产物当成块搬走。
+        if content[open + OPEN.len()..close_at].contains(OPEN) {
+            break;
+        }
         let end = close_at + CLOSE.len();
         if content[open + OPEN.len()..close_at].contains(NOTICE_MARK) {
             spans.push((open, end));
