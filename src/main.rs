@@ -179,7 +179,7 @@ fn print_usage() {
 
 用法：
   codex-layer [serve]   [--config <路径> | -c <路径>]   前台运行（默认子命令）
-  codex-layer start     [--config <路径>] [--label <L>]  注册 LaunchAgent 常驻（macOS）
+  codex-layer start     [--config <路径>] [--label <L>]  注册常驻并等监户（macOS）
   codex-layer stop      [--label <L>]                    注销常驻（macOS）
   codex-layer restart   [--config <路径>] [--label <L>]  重写 plist 并整包重载
   codex-layer status    [--config <路径>] [--label <L>]  打印 pid / 监听口 / 配置路径
