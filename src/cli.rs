@@ -342,6 +342,10 @@ pub struct RestartWaitEvidence {
     pub new_pid: Option<u32>,
     /// 正在监听该端口的进程 pid（lsof 采集）。
     pub listener_pids: Vec<u32>,
+    /// 旧实例是否仍亲自监听该端口（新旧交接的真判据：注册视图里的 pid
+    /// 不能替代它——新实例 bind 失败重试期间，注册 pid 可能已是新的，
+    /// 但端口上跑着的仍是旧实例）。
+    pub old_listening: bool,
     pub drain_seconds: u64,
 }
 
@@ -377,7 +381,7 @@ pub fn classify_restart_wait(evidence: &RestartWaitEvidence) -> RestartWaitOutco
     }
     if evidence.last_probe == ListenProbe::Ready {
         if let Some(old_pid) = evidence.old_pid {
-            if evidence.old_alive && evidence.new_pid == Some(old_pid) {
+            if evidence.old_listening {
                 return RestartWaitOutcome::ReadyServedByOld {
                     old_pid,
                     drain_seconds: evidence.drain_seconds,
@@ -580,8 +584,12 @@ fn wait_listen_ready_and_report(
     loop {
         last_probe = probe_listen(host, port);
         if last_probe == ListenProbe::Ready {
-            let current = launchd_pid(launchd_target);
-            let stale = old_pid.is_some() && current == old_pid && process_alive(old_pid);
+            // 真判据：端口上监听着的进程里不能还有旧实例。注册视图的 pid
+            // 会先于实际交接变化（新实例 bind 失败重试期间也是「新 pid」），
+            // 只有 lsof 能证明旧实例确实放开了端口。
+            let stale = old_pid
+                .map(|old| listener_pids_on_port(port).contains(&old))
+                .unwrap_or(false);
             if !stale {
                 println!(
                     "监听口:   {host}:{port} 已就绪（等待 {:.1}s）",
@@ -596,12 +604,17 @@ fn wait_listen_ready_and_report(
         }
         std::thread::sleep(LISTEN_READY_INTERVAL);
     }
+    let listener_pids = listener_pids_on_port(port);
+    let old_listening = old_pid
+        .map(|old| listener_pids.contains(&old))
+        .unwrap_or(false);
     let evidence = RestartWaitEvidence {
         last_probe,
         old_pid,
         old_alive: process_alive(old_pid),
         new_pid: launchd_pid(launchd_target),
-        listener_pids: listener_pids_on_port(port),
+        listener_pids,
+        old_listening,
         drain_seconds,
     };
     let outcome = classify_restart_wait(&evidence);
@@ -1215,6 +1228,7 @@ mod tests {
             old_pid: Some(100),
             old_alive: true,
             new_pid: Some(200),
+            old_listening: listeners.contains(&100),
             listener_pids: listeners,
             drain_seconds: 45,
         }
@@ -1248,9 +1262,9 @@ mod tests {
             classify_restart_wait(&dead_old),
             RestartWaitOutcome::NewProcessNotListening
         );
-        // 端口连得上、注册视图里还是旧 pid、旧进程活着：旧实例仍在服务。
-        let mut serving = evidence(ListenProbe::Ready, vec![100]);
-        serving.new_pid = Some(100);
+        // 端口连得上、监听者里还有旧实例：即便注册视图已换新 pid，
+        // 也只能报「旧实例仍在服务」——端口归 lsof 管，不归注册表管。
+        let serving = evidence(ListenProbe::Ready, vec![100]);
         assert_eq!(
             classify_restart_wait(&serving),
             RestartWaitOutcome::ReadyServedByOld {
@@ -1258,7 +1272,7 @@ mod tests {
                 drain_seconds: 45
             }
         );
-        // 端口连得上且接管者已换新 pid：就绪。
+        // 端口连得上且监听者里没有旧实例：就绪。
         let fresh = evidence(ListenProbe::Ready, vec![200]);
         assert_eq!(classify_restart_wait(&fresh), RestartWaitOutcome::ReadyFresh);
         // 全部线索落空：如实判定不了（start 场景无旧 pid、无注册、无监听）。
