@@ -45,6 +45,13 @@ target_triple() {
     printf '%s-%s\n' "$arch" "$os"
 }
 
+# 从 GitHub releases API 的 JSON 响应里取 tag_name。写成 stdin 过滤器，
+# 这样这条解析能被单独断言（见 scripts/ci/install_tag_parse_test.sh）。
+latest_tag_from_json() {
+    grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | head -1 | cut -d'"' -f4
+}
+
 expected_sum() {
     local manifest="$1" name="$2" line
     line="$(awk -v n="$name" '$2 == n {print $1; exit}' "$manifest" 2>/dev/null || true)"
@@ -104,10 +111,13 @@ try_download() {
     if [ -n "${VERSION:-}" ]; then
         tag="${VERSION#v}"
     else
-        # 只读 tag 名；取不到就当未命中，交给源码构建
+        # 只读 tag 名；取不到就当未命中，交给源码构建。
+        # 不要用 tr 拆 JSON：tr ',{}" ' 的字符集含冒号，会把 "tag_name":"vX" 拆成
+        # tag_name 与 vX 两个孤立行，后续 sed 的 s/^tag_name:// 永不匹配（恒空，
+        # 表现为默认路径静默回落源码构建）。按 key:value 成对提取才可靠。
         tag="$(curl -fsSL --max-time 20 \
             "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-            | tr ',{}" ' '\n\n\n\n\n' | sed -n 's/^tag_name://p' | head -1 || true)"
+            | latest_tag_from_json || true)"
     fi
     if [ -z "$tag" ]; then
         echo "==> 取不到版本号，回落源码构建"

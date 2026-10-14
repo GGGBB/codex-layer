@@ -72,3 +72,6 @@ jobs:
         env:
           GATE_PUSH_BEFORE: ${{ github.event.before }}
         run: python3 scripts/ci/new_file_fmt_gate.py
+      # 安装脚本的 latest tag 解析：正反对照 + 旧写法恒空对照（离线跑，不碰网络）
+      - name: 安装脚本 latest tag 解析测试
+        run: bash scripts/ci/install_tag_parse_test.sh
