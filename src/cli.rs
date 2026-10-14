@@ -292,6 +292,121 @@ pub fn bootstrap_terminal_outcome(print_ok: bool) -> BootstrapTerminalOutcome {
     }
 }
 
+/// launchd 注册视图相对旧实例的**身份**（issue #47 的核心判据：「已注册」
+/// 不等于「新实例已接管」）。旧实例排空期间进程还活着，launchd 对该 Label
+/// 依旧 `print` 得到、pid 就是旧 pid——只看注册与否会把它读成「已生效」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationIdentity {
+    /// 注册表查无此 Label：旧注册已彻底消失。
+    Absent,
+    /// 仍注册着且 pid 就是旧实例：那是还没退场的残留，不是新实例接管。
+    ResidueOld,
+    /// 已注册但 launchd 未报 pid：新注册刚建立、进程还没起来。
+    RegisteredNoPid,
+    /// 已注册且 pid 与旧实例不同：新实例接管。
+    Fresh,
+}
+
+pub fn registration_identity(
+    print_ok: bool,
+    registered_pid: Option<u32>,
+    old_pid: Option<u32>,
+) -> RegistrationIdentity {
+    if !print_ok {
+        return RegistrationIdentity::Absent;
+    }
+    match (registered_pid, old_pid) {
+        (Some(pid), Some(old)) if pid == old => RegistrationIdentity::ResidueOld,
+        (Some(_), _) => RegistrationIdentity::Fresh,
+        // 旧实例占位时 launchd 必报 pid；pid 缺失只能是刚注册的新空槽。
+        (None, _) => RegistrationIdentity::RegisteredNoPid,
+    }
+}
+
+/// restart 语境下 bootstrap 失败、预算耗尽后的终判（issue #47 期望行为 2）。
+/// 与 `BootstrapTerminalOutcome` 的差别就是多了一支「旧实例残留」——那一支在
+/// 旧实现里被并进了「已生效」，正是永久死口的成因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartBootstrapOutcome {
+    /// 新实例已接管注册（含刚注册、进程未起）。
+    TakenOver,
+    /// 注册表里仍是旧实例：新实例从未接管，旧实例退场后端口即死口。
+    OldResidue { old_pid: Option<u32> },
+    /// 注册表查无此 Label：服务已被本次操作卸掉。
+    Unregistered,
+}
+
+pub fn restart_bootstrap_outcome(
+    identity: RegistrationIdentity,
+    old_pid: Option<u32>,
+) -> RestartBootstrapOutcome {
+    match identity {
+        RegistrationIdentity::Fresh | RegistrationIdentity::RegisteredNoPid => {
+            RestartBootstrapOutcome::TakenOver
+        }
+        RegistrationIdentity::ResidueOld => RestartBootstrapOutcome::OldResidue { old_pid },
+        RegistrationIdentity::Absent => RestartBootstrapOutcome::Unregistered,
+    }
+}
+
+/// 卸除窗口内 bootstrap 失败后的下一步（issue #47 期望行为 1）。旧实例排空
+/// 期间 bootstrap 必然失败，所以重试预算必须按排空上界推导（见
+/// `restart_takeover_budget_seconds`），不能再是固定小次数；身份判定优先于
+/// 预算——注册视图已是新实例时立刻停手，哪怕预算还剩。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapRetryPolicy {
+    /// 旧注册未散、预算未尽：等旧实例退场后继续 bootstrap。
+    Retry,
+    /// 注册视图已是新实例：bootstrap 其实已生效，别再重试。
+    StopTakenOver,
+    /// 确定性失败，或预算耗尽：停手，交终判归因。
+    StopGiveUp,
+}
+
+pub fn bootstrap_retry_policy(
+    over_budget: bool,
+    transient_error: bool,
+    identity: RegistrationIdentity,
+) -> BootstrapRetryPolicy {
+    if !transient_error {
+        return BootstrapRetryPolicy::StopGiveUp;
+    }
+    match identity {
+        RegistrationIdentity::Fresh | RegistrationIdentity::RegisteredNoPid => {
+            BootstrapRetryPolicy::StopTakenOver
+        }
+        RegistrationIdentity::Absent | RegistrationIdentity::ResidueOld => {
+            if over_budget {
+                BootstrapRetryPolicy::StopGiveUp
+            } else {
+                BootstrapRetryPolicy::Retry
+            }
+        }
+    }
+}
+
+/// 终判「旧实例仍占据注册、新实例从未接管」的失败正文（issue #47 期望行为
+/// 3）：显式失败 + 可直接复制的两段式恢复命令，绝不以成功口吻返回 0。
+pub fn restart_takeover_failure(
+    stderr: &str,
+    old_pid: Option<u32>,
+    label: &str,
+    config_path: &Path,
+    budget_seconds: u64,
+) -> String {
+    let residue = match old_pid {
+        Some(pid) => format!("注册表里的 pid={pid} 仍是旧实例"),
+        None => "注册表里的进程仍不是本次要拉起的新实例".to_string(),
+    };
+    format!(
+        "launchctl bootstrap 在 {budget_seconds}s 预算内始终未成功（末次报错：{stderr}）——\
+         {residue}，新实例从未接管；旧实例一旦退出，监听口将无人接手，直到人工救援。\
+         恢复走两段式（别再压 restart，它内部就是 bootout+bootstrap）：\
+         `codex-layer stop --label {label}` 确认输出「未注册」后，再 {recovery}",
+        recovery = restart_unregistered_recovery(label, config_path),
+    )
+}
+
 /// 「未注册」终态的完整恢复命令（含 --label 的确切形态，可直接复制）。
 pub fn restart_unregistered_recovery(label: &str, config_path: &Path) -> String {
     format!(
@@ -328,6 +443,13 @@ pub fn classify_listen_probe(result: &std::io::Result<std::net::TcpStream>) -> L
 pub fn listen_ready_window_seconds(drain_seconds: u64) -> u64 {
     let covering = drain_seconds + crate::drain::FORCE_EXIT_GRACE.as_secs() + 5;
     covering.max(5)
+}
+
+/// restart 的**总**等待预算（issue #47 期望行为 1）：bootstrap 重试与就绪等待
+/// 两阶段**共享**这一个窗口，合计不超过它——#47 把 bootstrap 预算从固定 3s 抬
+/// 到排空量级，但 restart 的可预期上界不因两阶段排队而翻倍。
+pub fn restart_takeover_budget_seconds(drain_seconds: u64) -> u64 {
+    listen_ready_window_seconds(drain_seconds)
 }
 
 /// restart 就绪等待收口时的证据包（探测侧采集，判定全在纯函数）。
@@ -402,6 +524,12 @@ pub fn classify_restart_wait(evidence: &RestartWaitEvidence) -> RestartWaitOutco
         return RestartWaitOutcome::NewProcessNotListening;
     }
     RestartWaitOutcome::Indeterminate
+}
+
+/// restart 的成败判据（issue #47 期望行为 3）：只有新实例亲自监户才算接管，
+/// 其余一律算失败——「判定不了」按未接管处理比按成功处理安全。
+pub fn restart_wait_is_failure(outcome: &RestartWaitOutcome) -> bool {
+    !matches!(outcome, RestartWaitOutcome::ReadyFresh)
 }
 
 /// 各判定态的终端话术。红线（issue #34 期望行为 4）：不许把猜测写成结论；
