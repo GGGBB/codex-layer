@@ -68,6 +68,8 @@ git -c user.name="codex-layer-<角色>" \
    `smoke (pinning / streaming)`），任一不绿则 PR 无法合并；且为 strict 模式，
    main 前进后需 rebase 重跑。若出现 "job was not started" 类红，
    先辨别是否为账号计费锁造成的假红，是则重跑（`gh run rerun`）。
+   另有 `gates` job 跑两条流程门禁（提交作者角色身份、新增 Rust 文件格式），
+   目前**不是** ruleset 必需检查，红了先按下面「流程门禁」一节自查修正。
 6. **review 返工**：在源分支上追加增量 commit，不 force-push（合并前的最终 rebase
    除外）。
 7. **merge**：由维护者执行 rebase 合并（ruleset 只允许 rebase 方式，squash 与
@@ -109,6 +111,35 @@ git -c user.name="codex-layer-<角色>" \
   配置示例一律用占位符（见 `codex-layer.toml.example`）。
 - `AGENTS.md` 是 agent 本地协作文件，**不入库**（已在 `.gitignore`），
   其中纪律已固化进本文档与 [docs/CODING_STANDARDS.md](docs/CODING_STANDARDS.md)。
+
+## 流程门禁（本地可先跑）
+
+CI 的 `gates` job 里有两条判据，都可以本地先跑，不必等 CI：
+
+```bash
+python3 scripts/ci/commit_author_gate.py --base origin/main   # 提交作者角色身份
+python3 scripts/ci/new_file_fmt_gate.py --base origin/main    # 本次新增 *.rs 的格式
+```
+
+- **提交作者**：区间内每个 commit 的 author 名必须是 `codex-layer-<角色>`，
+  邮箱必须是 `<角色>@users.noreply.github.com`，且两侧角色一致。漏带 `-c`
+  会静默回落本机全局身份（真实姓名与真实邮箱），这条判据就是为此而设。
+  已提交但写岔的，就地补身份：
+
+  ```bash
+  git -c user.name="codex-layer-<角色>" \
+      -c user.email="<角色>@users.noreply.github.com" \
+      commit --amend --reset-author --no-edit
+  ```
+
+  合并提交的 author 是合并执行者，不判。
+- **新增文件格式**：只判区间内**新增**的 `.rs`，既有文件的格式改动不误伤。
+  红了只格式化被点名的那一个文件（`rustfmt --edition 2024 <文件>`），
+  **不许**全仓 `cargo fmt`。
+
+两条判据都带 `--self-test`，先自证判据可用再判真实区间。若本地报「无法执行」
+（取不到基线、找不到 rustfmt），那是判据自身不可用，会以非零退出，
+**不要**把它当成「通过」。
 
 ## 测试要求
 
