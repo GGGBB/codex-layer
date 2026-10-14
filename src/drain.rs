@@ -12,10 +12,28 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use tokio::sync::watch;
+
+/// 进程级运行时载体（与 `protocol_proxy::set_runtime_settings` 同一套路）：
+/// serve 装配时写入一次，HTTP 分发链从这里取。未初始化时返回「永不排空」
+/// 状态——组合器退化为纯透传，与接入本模块前的行为逐字节一致（安全默认）。
+static RUNTIME_DRAIN: OnceLock<DrainState> = OnceLock::new();
+
+/// 装配入口：安装进程级排空状态并返回生效实例（重复调用以首个为准，
+/// 返回的同样是首个——调用方拿到的句柄与分发链看到的必然同源）。
+pub fn init_runtime(drain: DrainState) -> DrainState {
+    let _ = RUNTIME_DRAIN.set(drain);
+    runtime()
+}
+
+/// 分发链读取的当前排空状态。
+pub fn runtime() -> DrainState {
+    RUNTIME_DRAIN.get().cloned().unwrap_or_else(DrainState::new)
+}
 
 // 内部约定：截止点用 `Option<Instant>` 表示，`None` = 尚未收到退出信号。
 // 不得拿「无穷远的 Instant」当哨兵去 `sleep_until`：距离远超 tokio 定时器

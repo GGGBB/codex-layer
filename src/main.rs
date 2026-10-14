@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 
 use codex_layer::config::Config;
 use codex_layer::cli::{self, Command};
+use codex_layer::drain::{self, DrainState, FORCE_EXIT_GRACE};
 use codex_layer::diagnostic_log;
 use codex_layer::diagnostic_log::events;
 use codex_layer::http_client;
@@ -144,9 +145,28 @@ fn run_serve(config_override: Option<std::path::PathBuf>) -> anyhow::Result<()> 
                 "stabilizePromptPrefix": active.stabilize_prompt_prefix,
             }),
         );
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        // 关停排空装配（issue #34）：进程载体先行安装，分发链给在途流注入
+        // 收口截止点；服务层再兜一层硬上界，监听口释放时间从此有界。
+        let drain = drain::init_runtime(DrainState::new());
+        let drain_seconds = config.server.drain_seconds;
+        let serve = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal(drain.clone(), drain_seconds));
+        tokio::select! {
+            result = serve => {
+                result?;
+            }
+            () = drain.wait_force_exit() => {
+                // 走到这里说明正常收口（截止点 + 各分支终止事件）没跑完：
+                // 个别连接不读字节、或非流式分支卡在读上游整包。立即退出，
+                // 由进程终止释放监听口——重启空窗被硬上界钉死，不再无上界。
+                tracing::warn!(
+                    target: "codex-layer",
+                    "排空超过上界（{}s + {}s 宽限），进程退出并关闭剩余连接",
+                    drain_seconds,
+                    FORCE_EXIT_GRACE.as_secs()
+                );
+            }
+        }
         Ok::<(), anyhow::Error>(())
     })
 }
@@ -191,7 +211,7 @@ fn init_tracing() {
     let _ = registry.try_init();
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(drain: DrainState, drain_seconds: u64) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -211,7 +231,14 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tracing::info!(target: "codex-layer", "收到退出信号，停止接收新请求");
+    // 先给在途流设定收口截止点，再让 with_graceful_shutdown 完成
+    // 「停止接收新请求」：在途流拿不到 deadline 的窗口期越短越好。
+    drain.begin(std::time::Instant::now(), drain_seconds);
+    tracing::info!(
+        target: "codex-layer",
+        "收到退出信号，停止接收新请求；在途流最多排空 {drain_seconds}s，进程硬上界另加 {}s",
+        FORCE_EXIT_GRACE.as_secs()
+    );
 }
 
 async fn healthz() -> Response {
@@ -390,6 +417,8 @@ fn unix_now_ms() -> u64 {
 }
 
 async fn dispatch(request: Request) -> Response {
+    // 排空状态注入到请求装配（issue #34）：在途流由此拿到收口截止点。
+    let drain = drain::runtime();
     let (parts, body) = request.into_parts();
     let path = parts.uri.path().to_string();
     let method = parts.method.clone();
@@ -472,7 +501,7 @@ async fn dispatch(request: Request) -> Response {
     };
 
     if is_chat_completions_proxy_path(&path) && method == Method::POST {
-        return chat_completions_proxy(&text_body, user_agent.as_deref(), &path).await;
+        return chat_completions_proxy(&text_body, user_agent.as_deref(), &path, drain).await;
     }
     if is_responses_proxy_path(&path) && method == Method::POST {
         return responses_proxy(
@@ -481,6 +510,7 @@ async fn dispatch(request: Request) -> Response {
             beta_features.as_deref(),
             session_headers,
             &path,
+            drain,
         )
         .await;
     }
@@ -695,6 +725,7 @@ async fn responses_proxy(
     beta_features: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
     path: &str,
+    drain: DrainState,
 ) -> Response {
     let request_json: Option<Value> = serde_json::from_str(body).ok();
     // 请求级关联 id（issue #19）：只进诊断日志，绝不进发往上游的请求体或请求头——
@@ -737,6 +768,7 @@ async fn responses_proxy(
             request_json,
             model,
             request_id,
+            drain,
         ));
     }
 
@@ -802,7 +834,12 @@ async fn responses_proxy(
     }
 }
 
-async fn chat_completions_proxy(body: &str, user_agent: Option<&str>, path: &str) -> Response {
+async fn chat_completions_proxy(
+    body: &str,
+    user_agent: Option<&str>,
+    path: &str,
+    drain: DrainState,
+) -> Response {
     let upstream = match open_chat_completions_proxy_request(body, user_agent).await
     {
         Ok(upstream) => upstream,
@@ -820,6 +857,13 @@ async fn chat_completions_proxy(body: &str, user_agent: Option<&str>, path: &str
             .response
             .bytes_stream()
             .map(|chunk| chunk.map_err(|error| -> Box<dyn StdError + Send + Sync> { error.into() }));
+        // 排空截止点保护（issue #34）：到点停止转发并补一帧 SSE 错误事件。
+        // 绝不补 `[DONE]`——把被截断的一轮流说成正常收尾是红线。
+        let stream = drain::terminate_at_deadline(stream, drain, || {
+            Ok(axum::body::Bytes::from_static(
+                b"data: {\"error\":{\"message\":\"codex-layer is shutting down: drain deadline reached, stream terminated\",\"type\":\"server_error\"}}\n\n",
+            ))
+        });
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, content_type)
@@ -845,6 +889,7 @@ fn stream_from_upstream(
     request_json: Option<Value>,
     model: String,
     request_id: String,
+    drain: DrainState,
 ) -> impl futures_util::Stream<Item = StreamItem> + Send + 'static {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let wire_api = upstream.wire_api;
@@ -853,6 +898,8 @@ fn stream_from_upstream(
         // 后面每个诊断事件只借用一次：影子绑定成 &str，json! 序列化时各自复制。
         let request_id = request_id.as_str();
         let mut chunks = response.bytes_stream();
+        // 排空截止点（issue #34）：三条支路共用同一个等待，select 臂至多命中一次。
+        let mut drain_wait = std::pin::pin!(drain.wait_deadline());
         if upstream.compaction {
             // 压缩轮无增量展示诉求：收齐上游文本后一次性下发单个 compaction 项。
             // SSE 事件可能被网络 chunk 拆开，converter 内部按事件边界缓冲。
@@ -860,7 +907,22 @@ fn stream_from_upstream(
             if wire_api != UpstreamWireApi::Responses {
                 converter = converter.with_chat_upstream();
             }
-            while let Some(chunk) = chunks.next().await {
+            // 截止点命中：fail 显式收口（不得静默截断成「看起来成功」），
+            // 仍走既有 finish 下发路径，诊断改记 stream_failed。
+            let mut drained = false;
+            loop {
+                let next = tokio::select! {
+                    next = chunks.next() => next,
+                    () = drain_wait.as_mut() => {
+                        drained = true;
+                        converter.fail(
+                            "服务器关停：排空截止点到达，上游响应流被截断".to_string(),
+                            Some("drain_deadline".to_string()),
+                        );
+                        None
+                    }
+                };
+                let Some(chunk) = next else { break };
                 match chunk {
                     Ok(bytes) => converter.push_upstream_bytes(&bytes),
                     Err(error) => {
@@ -875,10 +937,17 @@ fn stream_from_upstream(
             // unpaired 里，单轮耗时分布统计也就无从谈起。
             // 口径：收口时间记在 payload 下发之时，不含客户端读流耗时——
             // 压缩轮耗时系统性偏小是有意的服务端侧口径，便于跨轮对比（PR #24 review）。
-            log_event(
-                events::layer::STREAM_COMPLETED,
-                json!({ "model": model.clone(), "requestId": request_id, "compaction": true }),
-            );
+            if drained {
+                log_event(
+                    events::layer::STREAM_FAILED,
+                    json!({ "reason": "关停排空截止点到达，压缩轮提前收口", "requestId": request_id, "compaction": true }),
+                );
+            } else {
+                log_event(
+                    events::layer::STREAM_COMPLETED,
+                    json!({ "model": model.clone(), "requestId": request_id, "compaction": true }),
+                );
+            }
             return;
         }
         if wire_api == UpstreamWireApi::Responses {
@@ -886,7 +955,16 @@ fn stream_from_upstream(
             // 守卫要解决的是「上游在完成事件前断流」：原样转发时客户端只看到连接关闭，
             // 分不清正常结束还是半途而废，所以收口时由本层补一帧显式 response.failed。
             let mut observer = NativeResponsesSseObserver::default();
-            while let Some(chunk) = chunks.next().await {
+            let mut drained = false;
+            loop {
+                let next = tokio::select! {
+                    next = chunks.next() => next,
+                    () = drain_wait.as_mut() => {
+                        drained = true;
+                        None
+                    }
+                };
+                let Some(chunk) = next else { break };
                 match chunk {
                     Ok(bytes) => {
                         observer.push_bytes(&bytes);
@@ -920,8 +998,15 @@ fn stream_from_upstream(
             }
             // HTTP EOF 不是 Responses 协议的完成事件，`[DONE]` 也不算：
             // 没观察到完成事件就一律补失败帧（与 Chat 泵的收口口径一致）。
-            match close_native_responses_stream(observer, "stream_incomplete", &tx) {
+            // 排空截止点命中时同样走这条收口，只是 error_type 与措辞区分开。
+            let error_type = if drained { "drain_deadline" } else { "stream_incomplete" };
+            match close_native_responses_stream(observer, error_type, &tx) {
                 Some(reason) => {
+                    let reason = if drained {
+                        format!("关停排空截止点到达，透传流提前终止（{reason}）")
+                    } else {
+                        reason
+                    };
                     log_event(
                         events::layer::STREAM_FAILED,
                         json!({ "reason": reason, "requestId": request_id }),
@@ -941,7 +1026,16 @@ fn stream_from_upstream(
             .as_ref()
             .map(ChatSseToResponsesConverter::with_request)
             .unwrap_or_default();
-        while let Some(chunk) = chunks.next().await {
+        let mut drained = false;
+        loop {
+            let next = tokio::select! {
+                next = chunks.next() => next,
+                () = drain_wait.as_mut() => {
+                    drained = true;
+                    None
+                }
+            };
+            let Some(chunk) = next else { break };
             match chunk {
                 Ok(bytes) => {
                     let converted = converter.push_bytes(&bytes);
@@ -972,15 +1066,27 @@ fn stream_from_upstream(
         }
         // EOF 不是 Chat 协议的完成事件：已发出的文本和工具增量不能自动重放，
         // 必须显式补一个 failed 事件，否则客户端会永远等下去。
+        // 排空截止点命中：语义相同（都是「完成事件前终止」），措辞与
+        // error_type 区分开，现场要能分清是上游断的还是本机在关停。
         if !converter.has_terminal_event() {
-            let failed = converter.fail(
-                "上游在完成事件前结束了响应流".to_string(),
-                Some("stream_incomplete".to_string()),
-            );
+            let (message, error_type, reason) = if drained {
+                (
+                    "服务器关停：排空截止点到达，上游响应流被截断",
+                    "drain_deadline",
+                    "关停排空截止点到达，提前收口",
+                )
+            } else {
+                (
+                    "上游在完成事件前结束了响应流",
+                    "stream_incomplete",
+                    "上游缺少完成事件",
+                )
+            };
+            let failed = converter.fail(message.to_string(), Some(error_type.to_string()));
             let _ = tx.send(Ok(Bytes::from(failed)));
             log_event(
                 events::layer::STREAM_FAILED,
-                json!({ "reason": "上游缺少完成事件", "requestId": request_id }),
+                json!({ "reason": reason, "requestId": request_id }),
             );
             return;
         }
@@ -1007,6 +1113,7 @@ fn stream_from_upstream(
         rx.recv().await.map(|item| (item, rx))
     })
 }
+
 
 /// 原生透传支路的收口。守卫未证明成功时，向客户端补一帧显式 `response.failed`
 ///（口径同转换层：只发 failed 事件、不补 `[DONE]`，见 `native_stream_failure_frame`）。
