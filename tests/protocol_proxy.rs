@@ -7033,3 +7033,224 @@ path = "{}"
         );
     }
 }
+
+// —— 延迟工具命名空间通告块搬迁（2026-10-13 监看实锤的 50KB 处分叉毒源，issue #36）——
+
+/// 真实客户端形态：通告块是 system 区里一个独立注入项，文本自带前导换行。
+fn deferred_notice_body(notices: &[&str]) -> Value {
+    let mut input = vec![json!({"role": "developer", "content": "tools doc"})];
+    for notice in notices {
+        input.push(json!({"role": "system", "content": notice}));
+    }
+    input.push(json!({"role": "user", "content": "first question"}));
+    input.push(json!({"role": "assistant", "content": "answer"}));
+    input.push(json!({"role": "user", "content": "second question"}));
+    json!({
+        "model": "MiniMax-M2.7",
+        "instructions": "core instructions text",
+        "input": input,
+    })
+}
+
+fn deferred_notice_text(verb: &str) -> String {
+    format!("\n<tools>\n{verb} deferred tool namespaces:\n- mcp__ddg_search\n</tools>")
+}
+
+#[test]
+fn prefix_stabilizer_deferred_tools_notice_moved_before_last_user_message() {
+    let added = deferred_notice_text("Added");
+    let out =
+        responses_to_chat_completions_with_options(deferred_notice_body(&[&added]), false, true)
+            .unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    let head = messages[0]["content"].as_str().unwrap();
+    assert!(
+        !head.contains("<tools>"),
+        "system 头部不得残留命名空间通告块"
+    );
+    let last_user = messages
+        .iter()
+        .rposition(|m| m["role"].as_str() == Some("user"))
+        .expect("必须存在 user 消息");
+    assert_eq!(
+        messages[last_user - 1]["content"].as_str().unwrap(),
+        "<tools>\nAdded deferred tool namespaces:\n- mcp__ddg_search\n</tools>",
+        "块必须原样搬到最后一条 user 消息之前（仅块本体，不含拼接空白）"
+    );
+    assert_eq!(
+        messages[last_user]["content"].as_str().unwrap(),
+        "<current_user_turn>\nsecond question\n</current_user_turn>\n",
+        "末轮同时带轮次标记（通告块仍在标记外、其之前）"
+    );
+}
+
+#[test]
+fn prefix_stabilizer_deferred_tools_notice_keeps_system_head_pure_append() {
+    // 核心不变式（端到端口径）：通告块以独立 system 消息进入入参，在
+    // 「无 / Added / Removed / 两者叠加」四态间翻转，头部 system 合并文本必须
+    // 始终逐字节等于「从未注入该块」的产物（前缀恢复纯追加）。
+    let added = deferred_notice_text("Added");
+    let removed = deferred_notice_text("Removed");
+    let without =
+        responses_to_chat_completions_with_options(deferred_notice_body(&[]), false, true)
+            .unwrap();
+    for notices in [
+        vec![added.clone()],
+        vec![removed.clone()],
+        vec![added.clone(), removed.clone()],
+    ] {
+        let with = responses_to_chat_completions_with_options(
+            deferred_notice_body(&notices.iter().map(String::as_str).collect::<Vec<_>>()),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            without["messages"][0][
+                "content"
+            ],
+            with["messages"][0]["content"],
+            "通告块增删不得扰动 system 头部字节：{:?}",
+            notices
+        );
+    }
+    // 两条通告同时存在时，瞬态区按原序各挂一条
+    let both = responses_to_chat_completions_with_options(
+        deferred_notice_body(&[&added, &removed]),
+        false,
+        true,
+    )
+    .unwrap();
+    let messages = both["messages"].as_array().unwrap();
+    let last_user = messages
+        .iter()
+        .rposition(|m| m["role"].as_str() == Some("user"))
+        .unwrap();
+    assert_eq!(
+        messages[last_user - 2]["content"].as_str().unwrap(),
+        "<tools>\nAdded deferred tool namespaces:\n- mcp__ddg_search\n</tools>"
+    );
+    assert_eq!(
+        messages[last_user - 1]["content"].as_str().unwrap(),
+        "<tools>\nRemoved deferred tool namespaces:\n- mcp__ddg_search\n</tools>"
+    );
+}
+
+#[test]
+fn prefix_stabilizer_deferred_tools_notice_relocation_is_idempotent() {
+    // 幂等：把搬迁产物重新喂回转换（模拟历史回放），头部与块位都不得再变。
+    let added = deferred_notice_text("Added");
+    let out =
+        responses_to_chat_completions_with_options(deferred_notice_body(&[&added]), false, true)
+            .unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    let replay_input: Vec<Value> = messages
+        .iter()
+        .map(|m| json!({"role": m["role"], "content": m["content"]}))
+        .collect();
+    let replay = json!({
+        "model": "MiniMax-M2.7",
+        // 不另设 instructions：头部文本已以 system 消息形态在 input 里，
+        // 再写一份会双写重复，那不是回放而是构造新输入。
+        "input": replay_input,
+    });
+    let out2 = responses_to_chat_completions_with_options(replay, false, true).unwrap();
+    assert_eq!(
+        out["messages"][0]["content"], out2["messages"][0]["content"],
+        "二次搬迁不得再扰动头部"
+    );
+    let n = out2["messages"].as_array().unwrap().len();
+    assert_eq!(
+        out2["messages"][n - 2]["content"].as_str().unwrap(),
+        "<tools>\nAdded deferred tool namespaces:\n- mcp__ddg_search\n</tools>",
+        "块仍在瞬态区同位（末条 user 之前），未被二次搬迁重复改动"
+    );
+}
+
+#[test]
+fn prefix_stabilizer_deferred_tools_notice_malformed_left_untouched() {
+    // 只见开标签的残缺块：原样保留，宁留分叉不腐蚀 system
+    let body = json!({
+        "model": "MiniMax-M2.7",
+        "instructions": "core instructions text",
+        "input": [
+            {"role": "developer", "content": "tools doc\n\n<tools>\nAdded deferred tool namespaces:\n- x"},
+            {"role": "user", "content": "q"},
+        ],
+    });
+    let stabilized =
+        responses_to_chat_completions_with_options(body.clone(), false, true).unwrap();
+    let plain = responses_to_chat_completions_with_options(body, false, false).unwrap();
+    assert_eq!(
+        stabilized["messages"][0]["content"], plain["messages"][0]["content"],
+        "残缺块必须原样保留，头部与关开关逐字节一致"
+    );
+    // 成对块与未闭合残片共存：保守放弃，全部原样留在头部（禁跨界配对）
+    let added = deferred_notice_text("Added");
+    let mixed = json!({
+        "model": "MiniMax-M2.7",
+        "instructions": "core instructions text",
+        "input": [
+            {"role": "developer", "content": "tools doc"},
+            {"role": "system", "content": added},
+            {"role": "system", "content": "\n<tools>\nAdded deferred tool namespaces:\n- dangling"},
+            {"role": "user", "content": "q"},
+        ],
+    });
+    let out = responses_to_chat_completions_with_options(mixed, false, true).unwrap();
+    let messages = out["messages"].as_array().unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "共存时保守放弃：不得新增瞬态区消息"
+    );
+    let head = messages[0]["content"].as_str().unwrap();
+    assert!(
+        head.contains("<tools>\nAdded deferred tool namespaces:\n- dangling"),
+        "残片必须原样留在头部"
+    );
+    assert!(
+        head.contains("- mcp__ddg_search"),
+        "成对块在残片存在时也原样保留（宁留分叉不跨界搬块）"
+    );
+}
+
+#[test]
+fn prefix_stabilizer_deferred_tools_notice_leaves_tool_definition_blocks_alone() {
+    // 非通告内容的 <tools> 块（真正的工具定义等）不得被碰
+    let def_chunk = "<tools>\n{\"type\":\"function\",\"name\":\"exec_command\"}\n</tools>";
+    let body = json!({
+        "model": "MiniMax-M2.7",
+        "instructions": "core instructions text",
+        "input": [
+            {"role": "developer", "content": format!("tools doc\n\n{def_chunk}")},
+            {"role": "user", "content": "q"},
+        ],
+    });
+    let stabilized =
+        responses_to_chat_completions_with_options(body.clone(), false, true).unwrap();
+    let plain = responses_to_chat_completions_with_options(body, false, false).unwrap();
+    assert_eq!(
+        stabilized["messages"][0]["content"], plain["messages"][0]["content"],
+        "工具定义块不得被搬迁或改写"
+    );
+}
+
+#[test]
+fn prefix_stabilizer_deferred_tools_notice_stays_when_stabilizer_disabled() {
+    // opt-in 边界：开关关闭时行为与旧版逐字节一致（块留在 system）
+    let added = deferred_notice_text("Added");
+    let out =
+        responses_to_chat_completions_with_options(deferred_notice_body(&[&added]), false, false)
+            .unwrap();
+    let rendered = serde_json::to_string(&out["messages"]).unwrap();
+    assert!(
+        rendered.contains("deferred tool namespaces"),
+        "关开关不得改动任何字节"
+    );
+    let messages = out["messages"].as_array().unwrap();
+    assert!(
+        messages[0]["content"].as_str().unwrap().contains("<tools>")
+    );
+}
+
