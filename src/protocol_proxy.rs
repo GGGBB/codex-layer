@@ -3384,17 +3384,19 @@ pub async fn open_chat_completions_proxy_request(
 }
 
 /// 前缀对齐诊断事件（命名沿用 prefix_stabilizer_* 风格）。
+/// 落盘层的观测沿用本事件、只加字段（toolsFlushed / toolsWarmed），零新增事件名。
 fn log_compaction_align(report: &crate::compaction_align::CompactionAlignReport) {
-    crate::diagnostic_log::log_event(
-        events::proxy::STABILIZER_COMPACTION_APPENDED,
-        json!({
-            "instances": report.instances,
-            "moved": report.moved,
-            "appended": report.appended,
-            "toolsBackfilled": report.tools_backfilled,
-            "skippedMixed": report.skipped_mixed,
-        }),
-    );
+    let mut detail = json!({
+        "instances": report.instances,
+        "moved": report.moved,
+        "appended": report.appended,
+        "toolsBackfilled": report.tools_backfilled,
+        "skippedMixed": report.skipped_mixed,
+    });
+    if let Some(map) = detail.as_object_mut() {
+        map.extend(crate::compaction_tools::persistence_diagnostic_fields());
+    }
+    crate::diagnostic_log::log_event(events::proxy::STABILIZER_COMPACTION_APPENDED, detail);
 }
 
 async fn upstream_request_parts(
@@ -3410,10 +3412,12 @@ async fn upstream_request_parts(
     if synthetic_compaction {
         // 稳定层开启：先取回该会话最近一次普通请求的 tools 字节（压缩轮自带 tools:[]，
         // 会让转换层丢掉折叠历史 tool 项的 schema，全历史重构、前缀全弃）。
-        let preserved_tools = relay
-            .stabilize_prompt_prefix
-            .then(|| crate::compaction_tools::preserved_tools(&request_json))
-            .flatten();
+        // 取之前先按需预热（#69 第 6 条：进程内只读一次盘，重启后的第一个
+        // 压缩轮也能命中回填）；开关关闭时 prepare 直接早退，零 IO。
+        let preserved_tools = relay.stabilize_prompt_prefix.then(|| {
+            crate::compaction_tools::prepare_persistence(true);
+            crate::compaction_tools::preserved_tools(&request_json)
+        }).flatten();
         request_json = rewrite_request_for_compaction(strip_compaction_trigger(request_json));
         if let Some(tools) = preserved_tools {
             request_json["tools"] = tools;
@@ -3427,6 +3431,9 @@ async fn upstream_request_parts(
                 log_compaction_align(&report);
                 request_json = aligned;
             }
+            // 压缩轮立即刷（命中或未命中之后各一次，见 align 分支）：重启后
+            // 必须能取到最近一轮。逐字节相同不写，预热后首刷通常是空操作。
+            crate::compaction_tools::flush_immediate();
         }
     } else if relay.stabilize_prompt_prefix {
         // 514-msg 流式压缩路径（客户端自动压缩形态）：既不走 /responses/compact
@@ -3435,13 +3442,24 @@ async fn upstream_request_parts(
         // 杜绝把压缩轮的 tools=[] 毒化进回填缓存；未检出才是普通轮，照常记录。
         // 对齐算法的输入本就是 Responses 形态原始请求体（顶层 instructions /
         // input 项），在协议转换之前调用，两条方言同样适用。
+        // 用到缓存之前按需预热（进程内只读一次盘；开关关闭时上面的分支
+        // 根本不会执行，这里天然满足「关闭路径零 IO」）。
+        crate::compaction_tools::prepare_persistence(true);
         let aligned = crate::compaction_align::align_compaction_request(&request_json);
         match aligned {
             Some((aligned, report)) => {
+                // 压缩轮（对齐检出形态）：回填在 align 内部完成，命中或未命中
+                // 之后立即刷一次，保证重启后取到最近一轮。
                 log_compaction_align(&report);
                 request_json = aligned;
+                crate::compaction_tools::flush_immediate();
             }
-            None => crate::compaction_tools::remember_tools(&request_json),
+            None => {
+                // 普通轮：照常记录。落盘交给 flush 的节流判据（逐字节相同不写、
+                // 窗口合并），本路径不做每请求同步写盘。
+                crate::compaction_tools::remember_tools(&request_json);
+                crate::compaction_tools::flush_to_disk();
+            }
         }
     }
     // 探针用 key 需在 request_json 被转换层 move 之前取出。
