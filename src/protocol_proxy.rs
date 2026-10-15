@@ -1043,6 +1043,13 @@ pub struct ChatSseToResponsesConverter {
     utf8_remainder: Vec<u8>,
     state: ChatSseState,
     failed: bool,
+    /// 空终帧护栏开关。只有装配层能在「本轮还能向同一上游重发」时打开
+    /// （Chat 方言 + 客户端原请求在手 + 重发通道已注入）；裸 converter 恒关，
+    /// 既有行为一个字节不变。
+    guard_enabled: bool,
+    /// 被护栏扣下的终帧（completed 事件与 `[DONE]`）：本轮判成静默终帧且还允许
+    /// 重试时先不下发，等装配层决定「重开一轮」还是「原样放行」。
+    deferred_terminal: Option<String>,
 }
 
 /// 以下是 Responses 原生压缩轮（`compaction_trigger`）的探针判据。
@@ -2641,6 +2648,8 @@ impl Default for ChatSseToResponsesConverter {
             utf8_remainder: Vec::new(),
             state: ChatSseState::default(),
             failed: false,
+            guard_enabled: false,
+            deferred_terminal: None,
         }
     }
 }
@@ -2667,6 +2676,33 @@ impl ChatSseToResponsesConverter {
         }
     }
 
+    /// 开关空终帧护栏。判断「本轮能不能重发」是装配层的事（它才知道请求体、
+    /// 重发通道与本轮是不是压缩轮），转换层只负责照开关行事。
+    pub fn set_guard_enabled(&mut self, enabled: bool) {
+        self.guard_enabled = enabled;
+    }
+
+    /// 护栏是否正扣着终帧。装配层据此判断「上游流已自然收口，但 completed 还没
+    /// 出门」：true 就去走重试决策，false 就是正常完成。
+    pub fn terminal_deferred(&self) -> bool {
+        self.deferred_terminal.is_some()
+    }
+
+    /// 放弃重试：把扣下的终帧原样吐出（completed 事件与 `[DONE]` 一起），
+    /// 这一轮按原行为收口。扣帧只可能有一次，吐出即清空，绝不清空成「静默断流」。
+    pub fn release_deferred_terminal(&mut self) -> Vec<u8> {
+        self.deferred_terminal.take().unwrap_or_default().into_bytes()
+    }
+
+    /// 重开一轮重试：丢弃扣下的终帧，重置本轮的条目槽位（reasoning / 正文 /
+    /// 工具增量 / inline think / finish_reason / usage），但保留响应身份、
+    /// output_index 计数与已定稿的 output_items——第二次的条目续排在同一个
+    /// response 里，客户端看到的始终是一条连续、单一的 Responses 事件流。
+    pub fn begin_retry_attempt(&mut self) {
+        self.deferred_terminal = None;
+        self.state.begin_retry_attempt();
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
@@ -2691,7 +2727,7 @@ impl ChatSseToResponsesConverter {
 
         let mut output = String::new();
         if !self.failed {
-            self.state.finalize_into(&mut output);
+            self.finalize_guarded(&mut output);
         }
         output.into_bytes()
     }
@@ -2720,7 +2756,7 @@ impl ChatSseToResponsesConverter {
         }
         let data = data_parts.join("\n");
         if data.trim() == "[DONE]" {
-            self.state.finalize_into(output);
+            self.finalize_guarded(output);
             return;
         }
 
@@ -2735,6 +2771,95 @@ impl ChatSseToResponsesConverter {
         }
         self.state.handle_chat_chunk_into(&chunk, output);
     }
+
+    /// finalize 的护栏版：先把终帧收进 scratch，再决定出门还是扣下。
+    /// 只有「开关开 + 本轮判成静默终帧 + 此前没扣过帧」才扣；其余一律原样下发。
+    /// `finalize_into` 自带 completed 幂等，扣帧后再次到达 [DONE]/EOF 不会
+    /// 重复产出终帧（scratch 为空，直接透传空串）。
+    fn finalize_guarded(&mut self, output: &mut String) {
+        let mut scratch = String::new();
+        self.state.finalize_into(&mut scratch);
+        if scratch.is_empty() || !self.guard_enabled || self.deferred_terminal.is_some() {
+            output.push_str(&scratch);
+            return;
+        }
+        if self.state.empty_final_frame() {
+            self.deferred_terminal = Some(scratch);
+        } else {
+            output.push_str(&scratch);
+        }
+    }
+}
+
+/// 空终帧护栏的单客户端轮重试上限：对同一次上游调用的最坏重发次数。
+/// 上限存在的意义是让「模型反复静默」的病态循环有代价上界，而不是无限重放。
+pub const EMPTY_FRAME_MAX_RETRIES: usize = 2;
+
+/// 第二次重试的推动文案：同体重采样（第一次重试）可能再次静默，第二次在
+/// `input` 尾部显式要求「可见正文或工具调用」。只拼进重发请求，客户端历史里
+/// 不会出现这条消息。
+pub const EMPTY_FRAME_NUDGE_TEXT: &str = "系统提示：你上一段输出只包含思考内容，既无正文回复也无工具调用，会话因此被自动结束。请现在立即行动：要么给出面向用户的正文，要么发起必要的工具调用；不允许再次只输出思考内容。";
+
+/// 空终帧护栏的判据本体（纯函数）：finalize 后的「completed」终帧是不是
+/// 静默帧——没有任何工具调用项、也没有非空可见正文，只有 reasoning（或什么都没有）。
+/// codex 客户端会把这种终帧判成「本轮无动作」并立即交回控制权，这正是
+/// 「会话自动结束」在协议层的投影。
+///
+/// 三条边界：
+/// - `incomplete` 终态（finish_reason=length）不算静默：那是合法的截断信号，
+///   客户端自己看得见，轮不到护栏替它决定；
+/// - 除 reasoning / message 外的任何条目形态（工具调用、原生搜索项等）一律
+///   算有效输出：判不准就不重发，宁可不护不可误护；
+/// - 空条目列表算静默：上游直接 [DONE] 什么也没交付，同样是静默收尾。
+pub fn silent_final_frame(items: &[Value], finish_reason: Option<&str>) -> bool {
+    if response_status(finish_reason) != "completed" {
+        return false;
+    }
+    items.iter().all(|item| {
+        match item.get("type").and_then(Value::as_str) {
+            // reasoning 不是可见输出，客户端不会为它续轮。
+            Some("reasoning") => true,
+            Some("message") => !message_item_has_visible_text(item),
+            _ => false,
+        }
+    })
+}
+
+/// message 项是否携带非空可见正文。读不出 content 数组时按「无正文」处理：
+/// 宁可多重试一次，也不能把读得出的静默帧漏判成有效输出。
+fn message_item_has_visible_text(item: &Value) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type")
+                    .and_then(Value::as_str)
+                    == Some("output_text")
+                    && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            })
+        })
+}
+
+/// 第二次重试的推动请求体：克隆客户端原请求，往 `input` 尾部追加一条用户
+/// 消息（形态与既有压缩摘要指令同款）。`input` 不是数组时返回 None——没有
+/// 可追加的位置，调用方退化为同体重采样，绝不自造 `input` 结构。
+pub fn with_empty_frame_nudge(request_json: &Value) -> Option<Value> {
+    if !request_json.get("input").is_some_and(Value::is_array) {
+        return None;
+    }
+    let mut nudged = request_json.clone();
+    nudged["input"]
+        .as_array_mut()
+        .expect("input 已判过是数组")
+        .push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": EMPTY_FRAME_NUDGE_TEXT }],
+        }));
+    Some(nudged)
 }
 
 pub fn is_responses_proxy_path(path: &str) -> bool {
@@ -4698,6 +4823,35 @@ impl ChatSseState {
         let mut output_items = self.output_items.clone();
         output_items.sort_by_key(|(output_index, _)| *output_index);
         output_items.into_iter().map(|(_, item)| item).collect()
+    }
+
+    /// finalize 之后的终帧是不是静默终帧（判据本体在纯函数 `silent_final_frame`）。
+    /// failed 收口的终帧不属护栏管辖：那是显式终止信号，客户端看得见。
+    fn empty_final_frame(&self) -> bool {
+        self.completed
+            && !self.terminal_failed
+            && silent_final_frame(
+                &self.completed_output_items(),
+                self.finish_reason.as_deref(),
+            )
+    }
+
+    /// 重开一轮重试的状态侧重置。保留与丢弃的字段同等重要：
+    /// - 保留 `response_started`：created/in_progress 已经出过门，重试轮的条目
+    ///   必须续排在同一个 response 身份下；
+    /// - 保留 `next_output_index` 与 `output_items`：重试轮的新条目不能复用已
+    ///   发出的 output_index，第一轮的 reasoning 项也要留在终帧 output 里；
+    /// - 丢弃 `latest_usage`：重试轮的 usage 才是交付物的账；被丢弃的静默轮
+    ///   由诊断事件单独记账，两套账不混。
+    fn begin_retry_attempt(&mut self) {
+        self.completed = false;
+        self.terminal_failed = false;
+        self.text = TextItemState::default();
+        self.reasoning = ReasoningItemState::default();
+        self.inline_think = InlineThinkState::default();
+        self.tools.clear();
+        self.finish_reason = None;
+        self.latest_usage = None;
     }
 
     fn base_response(&self, status: &str, output: Vec<Value>) -> Value {
@@ -10052,5 +10206,205 @@ mod proxy_port_env_tests {
         assert_eq!(detail.get("replacement"), Some(&json!(PROXY_PORT_ENV)));
         assert_eq!(detail.get("effectivePort"), Some(&json!(57996)));
         assert_eq!(detail.get("conflict"), Some(&json!(true)));
+    }
+}
+
+#[cfg(test)]
+mod empty_frame_guard_tests {
+    use super::*;
+
+    fn chat_sse_bytes(chunks: &[&str]) -> Vec<u8> {
+        let mut raw = String::new();
+        for chunk in chunks {
+            raw.push_str("data: ");
+            raw.push_str(chunk);
+            raw.push_str("\n\n");
+        }
+        raw.into_bytes()
+    }
+
+    fn reasoning_chunk() -> &'static str {
+        "{\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"reasoning_content\":\"先想一段\"}}]}"
+    }
+
+    fn done_with_stop() -> &'static str {
+        "{\"id\":\"c1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"
+    }
+
+    #[test]
+    fn silent_verdict_covers_reasoning_only_and_empty_but_not_real_output() {
+        // 判据本体的分界线：reasoning 与「什么都没有」算静默；可见正文、
+        // 工具调用、未知条目形态、length 截断都不算。
+        assert!(silent_final_frame(&[], None));
+        assert!(silent_final_frame(
+            &[json!({ "id": "rs_1", "type": "reasoning" })],
+            Some("stop"),
+        ));
+        assert!(silent_final_frame(
+            &[json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "content": [{ "type": "output_text", "text": "   " }],
+            })],
+            Some("stop"),
+        ));
+        assert!(!silent_final_frame(
+            &[json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "content": [{ "type": "output_text", "text": "有正文" }],
+            })],
+            Some("stop"),
+        ));
+        assert!(!silent_final_frame(
+            &[json!({ "type": "function_call", "name": "shell" })],
+            Some("stop"),
+        ));
+        assert!(!silent_final_frame(
+            &[json!({ "type": "web_search_call" })],
+            Some("stop"),
+        ));
+        // length 截断是 incomplete 终态：合法截断，护栏不接管。
+        assert!(!silent_final_frame(&[], Some("length")));
+    }
+
+    #[test]
+    fn nudge_appends_to_input_array_without_touching_original() {
+        let original = json!({
+            "model": "m",
+            "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "原话" }] }],
+        });
+        let nudged = with_empty_frame_nudge(&original).expect("input 数组必须有可追加位置");
+        assert_eq!(original["input"].as_array().unwrap().len(), 1);
+        let items = nudged["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["role"], json!("user"));
+
+        // 推动项必须是转换层认得的 message/input_text 形态：端到端过一遍
+        // Responses→Chat 转换，它得原样落成最后一条 user 消息。
+        let converted = responses_to_chat_completions(nudged).unwrap();
+        let messages = converted["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], json!("user"));
+        assert_eq!(last["content"].as_str().unwrap(), EMPTY_FRAME_NUDGE_TEXT);
+    }
+
+    #[test]
+    fn nudge_gives_up_when_input_is_not_an_array() {
+        // 没有可追加的位置就绝不自造 input 结构，交由调用方退化为同体重发。
+        assert!(with_empty_frame_nudge(&json!({ "input": "纯字符串" })).is_none());
+        assert!(with_empty_frame_nudge(&json!({ "model": "m" })).is_none());
+    }
+
+    #[test]
+    fn guard_off_keeps_legacy_behavior_byte_for_byte() {
+        // 开关不开时，静默终帧也照常即刻下发——既有行为零变化是本护栏的第一条红线。
+        let mut converter = ChatSseToResponsesConverter::default();
+        let out = converter.push_bytes(&chat_sse_bytes(&[reasoning_chunk(), done_with_stop(), "[DONE]"]));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.completed"));
+        assert!(text.contains("data: [DONE]"));
+        assert!(!converter.terminal_deferred());
+    }
+
+    #[test]
+    fn guard_defers_silent_frame_and_release_restores_it() {
+        let mut converter = ChatSseToResponsesConverter::default();
+        converter.set_guard_enabled(true);
+        let out =
+            converter.push_bytes(&chat_sse_bytes(&[reasoning_chunk(), done_with_stop(), "[DONE]"]));
+        let streamed = String::from_utf8(out).unwrap();
+        // reasoning 增量照常出门，终帧被扣下。
+        assert!(streamed.contains("response.created"));
+        assert!(!streamed.contains("response.completed"));
+        assert!(converter.terminal_deferred());
+        // finish() 不得重复产帧（completed 幂等 + 已扣帧不二次扣）。
+        assert!(converter.finish().is_empty());
+        let released = String::from_utf8(converter.release_deferred_terminal()).unwrap();
+        assert!(released.contains("response.completed"));
+        assert!(released.contains("data: [DONE]"));
+        assert!(!converter.terminal_deferred());
+    }
+
+    #[test]
+    fn guard_never_defers_non_silent_frames() {
+        // 正文帧：原样即刻下发，不扣。
+        let mut converter = ChatSseToResponsesConverter::default();
+        converter.set_guard_enabled(true);
+        let out = converter.push_bytes(&chat_sse_bytes(&[
+            "{\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"交付正文\"}}]}",
+            done_with_stop(),
+            "[DONE]",
+        ]));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.completed"));
+        assert!(!converter.terminal_deferred());
+
+        // length 截断帧：incomplete 终态，同样不扣。
+        let mut truncated = ChatSseToResponsesConverter::default();
+        truncated.set_guard_enabled(true);
+        let out = truncated.push_bytes(&chat_sse_bytes(&[
+            "{\"id\":\"c2\",\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}",
+            "[DONE]",
+        ]));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.completed"));
+        assert!(text.contains("incomplete_details"));
+        assert!(!truncated.terminal_deferred());
+    }
+
+    #[test]
+    fn retry_attempt_continues_the_same_response_stream() {
+        // 端到端三步：静默轮被扣 → 重开重试 → 第二次的条目续排同一条流，
+        // 终帧 output 同时带上第一轮的 reasoning 与第二轮的正文。
+        let mut converter = ChatSseToResponsesConverter::default();
+        converter.set_guard_enabled(true);
+        let _ = converter.push_bytes(&chat_sse_bytes(&[reasoning_chunk(), done_with_stop(), "[DONE]"]));
+        assert!(converter.terminal_deferred());
+
+        converter.begin_retry_attempt();
+        assert!(!converter.terminal_deferred());
+        let out = converter.push_bytes(&chat_sse_bytes(&[
+            "{\"id\":\"c9\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"这是重试后的正文\"}}]}",
+            done_with_stop(),
+            "[DONE]",
+        ]));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("response.completed"));
+        assert!(!text.contains("response.created"), "created 不得第二次出现");
+        assert!(!converter.terminal_deferred());
+
+        // 终帧 output 的完整形态：两轮条目都在，且各占独立的 output_index。
+        let completed = text
+            .lines()
+            .find(|line| line.contains("\"response.completed\""))
+            .and_then(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let payload: Value = serde_json::from_str(completed).unwrap();
+        let output = payload["response"]["output"].as_array().unwrap();
+        let kinds: Vec<&str> = output
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["reasoning", "message"]);
+        assert_eq!(output[1]["content"][0]["text"], json!("这是重试后的正文"));
+        let indices: Vec<u32> = output
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .enumerate()
+            .map(|(index, _)| index as u32)
+            .collect();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn exhausted_guard_releases_the_original_frame_untouched() {
+        // 重发窗口失败/额度用尽时走 release：放行的必须是扣下的那一帧，
+        // 客户端永远不会拿到「既无 completed 也无 failed」的静默断流。
+        let mut converter = ChatSseToResponsesConverter::default();
+        converter.set_guard_enabled(true);
+        let _ = converter.push_bytes(&chat_sse_bytes(&["[DONE]"]));
+        assert!(converter.terminal_deferred());
+        let released = String::from_utf8(converter.release_deferred_terminal()).unwrap();
+        assert!(released.contains("response.completed"));
+        assert!(released.contains("data: [DONE]"));
     }
 }
