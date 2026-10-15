@@ -3414,10 +3414,13 @@ async fn upstream_request_parts(
         // 会让转换层丢掉折叠历史 tool 项的 schema，全历史重构、前缀全弃）。
         // 取之前先按需预热（#69 第 6 条：进程内只读一次盘，重启后的第一个
         // 压缩轮也能命中回填）；开关关闭时 prepare 直接早退，零 IO。
-        let preserved_tools = relay.stabilize_prompt_prefix.then(|| {
-            crate::compaction_tools::prepare_persistence(true);
-            crate::compaction_tools::preserved_tools(&request_json)
-        }).flatten();
+        let preserved_tools = relay
+            .stabilize_prompt_prefix
+            .then(|| {
+                crate::compaction_tools::prepare_persistence(true);
+                crate::compaction_tools::preserved_tools(&request_json)
+            })
+            .flatten();
         request_json = rewrite_request_for_compaction(strip_compaction_trigger(request_json));
         if let Some(tools) = preserved_tools {
             request_json["tools"] = tools;
