@@ -137,6 +137,7 @@ CI 的 `gates` job 里有两条判据，都可以本地先跑，不必等 CI：
 python3 scripts/ci/commit_author_gate.py --base origin/main   # 提交作者角色身份
 python3 scripts/ci/new_file_fmt_gate.py --base origin/main    # 本次新增 *.rs 的格式
 python3 scripts/ci/tools_cache_isolation_gate.py              # 开稳定层的测试是否隔离了缓存落盘
+python3 scripts/ci/lock_version_gate.py                       # Cargo.lock 版本是否跟上一
 ```
 
 - **提交作者**：区间内每个 commit 的 author 名必须是 `codex-layer-<角色>`，
@@ -164,6 +165,18 @@ python3 scripts/ci/tools_cache_isolation_gate.py              # 开稳定层的�
   .env("CODEX_LAYER_HOME", dir.path())
   .env("CODEX_LAYER_TOOLS_CACHE_PATH", dir.path().join("tools-cache.json"))
   ```
+
+- **锁文件版本一致性**：`Cargo.lock` 里本包的 version 必须等于 `Cargo.toml`。
+  发版 bump **必须两处在同一笔 commit**：只改清单会让锁文件漂移，之后任何一次
+  `cargo` 调用都会悄悄重写工作区、把 `git pull` 挡住，而任何用 `cargo build --locked`
+  的地方直接报错。本地同步锁文件（离线，不访问网络）：
+
+  ```bash
+  cargo metadata --format-version 1 --offline > /dev/null
+  ```
+
+  判据只比对本包自己的版本行，不校验依赖解析结果——后者是 `--locked` 的职责，
+  写进来会把正常的依赖升级拦在门外。
 
 两条判据都带 `--self-test`，先自证判据可用再判真实区间。若本地报「无法执行」
 （取不到基线、找不到 rustfmt），那是判据自身不可用，会以非零退出，
