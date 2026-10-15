@@ -331,6 +331,23 @@ pub struct PersistenceStatus {
     pub last_flush_ok: Option<bool>,
 }
 
+/// 落盘状态 → 诊断字段（沿用既有事件的附加字段，零新增事件名）。
+/// `toolsFlushed` 是本进程最近一次落盘尝试的结果（还没尝试过 = null）；
+/// `toolsWarmed` 是预热命中条数。只有值、没有路径、更没有缓存内容。
+pub fn persistence_diagnostic_fields() -> serde_json::Map<String, Value> {
+    let status = persistence_status();
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "toolsFlushed".to_string(),
+        match status.last_flush_ok {
+            Some(ok) => json!(ok),
+            None => Value::Null,
+        },
+    );
+    fields.insert("toolsWarmed".to_string(), json!(status.warmed_entries));
+    fields
+}
+
 /// 读落盘层状态。幂等、无 IO、不改状态。
 pub fn persistence_status() -> PersistenceStatus {
     let Ok(state) = persist_state().lock() else {
