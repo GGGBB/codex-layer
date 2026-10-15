@@ -169,6 +169,12 @@ path = "{}"
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_codex-layer"))
         .env("CODEX_LAYER_CONFIG", &config_path)
+        // 稳定层开启后 tools 回填缓存会落盘（#69 第 6 条）：必须指到临时目录，
+        // 否则 cargo test 会往真实状态目录写测试键。与 [log] path 同一隔离思路。
+        .env(
+            "CODEX_LAYER_TOOLS_CACHE_PATH",
+            dir.path().join("tools-cache.json"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
