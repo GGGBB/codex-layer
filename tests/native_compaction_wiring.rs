@@ -171,6 +171,15 @@ path = "{}"
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_codex-layer"))
         .env("CODEX_LAYER_CONFIG", &config_path)
+        // 稳定层开启后 tools 回填缓存会落盘（#69 第 6 条）：状态目录与缓存路径都要
+        // 指到临时目录，否则 cargo test 会往真实状态目录写测试键，把「重启后第一个
+        // 压缩轮是否命中预热」这个真机判据搅浑。缓存路径单独也注入一遍：它是独立
+        // 的覆盖变量，只改 HOME 时旧二进制或改动优先级链都会让隔离失效。
+        .env("CODEX_LAYER_HOME", log_path.parent().unwrap())
+        .env(
+            "CODEX_LAYER_TOOLS_CACHE_PATH",
+            log_path.with_extension("tools-cache.json"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
