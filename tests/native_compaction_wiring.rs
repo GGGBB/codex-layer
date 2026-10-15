@@ -6,7 +6,8 @@
 //! 3) 4xx 但判假（无关错误）→ 错误原样透传，不降级（反判据）；
 //! 4) 截断/零项的流 → 显式 response.failed，无静默半截流；
 //! 5) 上游自报失败的流 → 不补重复帧；
-//! 6) 非流式原生项 → 透传上游 JSON，不被本地摘要冒充。
+//! 6) 非流式原生项 → 透传上游 JSON，不被本地摘要冒充；
+//! 7) 响应体超过累计上限 → 按失败收口，且残缺正文一个字都不下发。
 
 use serde_json::{Value, json};
 use std::io::Read;
@@ -434,6 +435,86 @@ async fn truncated_compaction_stream_still_gets_failure_frame() {
     assert!(
         !seen.contains("response.completed"),
         "本层不得替上游伪造完成事件, got={seen}"
+    );
+}
+
+/// 累计上限与实现侧常量同值；刻意写死而不是导入，是为了让「有人抬上限」时这条
+/// 测试必须显式改动，而不是跟着悄悄放宽（padding 也要同步加大，否则测不到超限）。
+const MAX_COMPACTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const OVER_LIMIT_PADDING_BYTES: usize = MAX_COMPACTION_RESPONSE_BYTES + 1024 * 1024;
+
+/// 恰好一个原生项、但正文体积超过上限的填充：padding 挂在 message 项的文本里，
+/// 使正文既有原生项、又必然超限——两种判据同时在场时上限必须赢。
+fn oversized_text() -> String {
+    "x".repeat(OVER_LIMIT_PADDING_BYTES)
+}
+
+/// 非流式超限：即使正文里确有恰好一个原生 compaction 项，也不得透传。
+/// 残缺正文建立在不可信文本上，据它宣布成功会让客户端拿到「看起来压缩完了、
+/// 其实状态被截断」的响应；必须按失败收口，且 opaque 一个字都不下发。
+#[tokio::test]
+async fn oversized_non_stream_body_fails_instead_of_passing_through() {
+    let body = json!({
+        "id": "r5",
+        "status": "completed",
+        "output": [
+            {"id": "msg_1", "type": "message", "content": [
+                {"type": "output_text", "text": oversized_text()}
+            ]},
+            {"id": "cmp_1", "type": "compaction", "encrypted_content": OPAQUE},
+        ],
+    })
+    .to_string();
+    let (port, _guard, _dir, _log, _capture) =
+        harness(vec![raw_response("200 OK", "application/json", &body)]).await;
+    let key = format!("over-limit-nonstream-{}", std::process::id());
+
+    let mut request = trigger_request(&key);
+    request["stream"] = json!(false);
+    let seen = post(port, &request).await;
+    assert!(
+        seen.contains("response.failed"),
+        "超限必须显式失败收口, got 前 200 字={}",
+        &seen[..seen.len().min(200)]
+    );
+    assert!(
+        seen.contains("compaction_over_limit"),
+        "失败原因必须点明是体积超限, got 前 400 字={}",
+        &seen[..seen.len().min(400)]
+    );
+    assert!(!seen.contains(OPAQUE), "超限响应不得把残缺正文下发给客户端");
+    assert!(!seen.contains("codexlayer:summary"), "超限不得冒充本地摘要");
+}
+
+/// 流式超限：超限时**停止转发**（继续下发只会让客户端拿到一段注定按失败收口的
+/// 残缺流），并以显式失败帧收口。
+#[tokio::test]
+async fn oversized_stream_stops_forwarding_and_fails() {
+    let upstream_body = format!(
+        "{}event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"msg_1\",\"type\":\"message\",\"content\":[{{\"type\":\"output_text\",\"text\":\"{}\"}}]}}}}\n\n{}",
+        created_event(),
+        oversized_text(),
+        compaction_item_event()
+    );
+    let (port, _guard, _dir, _log, _capture) = harness(vec![sse_response(&upstream_body)]).await;
+    let key = format!("over-limit-stream-{}", std::process::id());
+
+    let seen = post(port, &trigger_request(&key)).await;
+    assert!(
+        seen.contains("response.failed"),
+        "超限流必须显式失败收口，不得静默半截流"
+    );
+    assert!(
+        seen.contains("compaction_over_limit"),
+        "失败原因必须点明是体积超限"
+    );
+    assert!(!seen.contains(OPAQUE), "超限后不得继续转发后续事件");
+    // 实现口径是「累计到上限后停止转发」，所以上限以内的前缀允许先下发；
+    // 这条断言钉的是「不会把整段超限正文倾泻给客户端」——即下发量必须被上限截住。
+    assert!(
+        seen.len() < MAX_COMPACTION_RESPONSE_BYTES,
+        "转发量必须被累计上限截住，不该接近完整正文, 实际下发 {} 字节",
+        seen.len()
     );
 }
 
