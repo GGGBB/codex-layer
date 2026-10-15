@@ -83,6 +83,8 @@ git -c user.name="codex-layer-<角色>" \
    先辨别是否为账号计费锁造成的假红，是则重跑（`gh run rerun`）。
    另有 `gates` job 跑两条流程门禁（提交作者角色身份、新增 Rust 文件格式），
    目前**不是** ruleset 必需检查，红了先按下面「流程门禁」一节自查修正。
+   另有 `self-approval` job 做事后检测（批准口径 × 合并时间 × 批准后的新提交），
+   同样**不是**必需检查，且刻意永不列必需——见下节末条。
 6. **review 返工**：在源分支上追加增量 commit，不 force-push（合并前的最终 rebase
    除外）。
 7. **merge**：由维护者执行 rebase 合并（ruleset 只允许 rebase 方式，squash 与
@@ -155,6 +157,22 @@ python3 scripts/ci/new_file_fmt_gate.py --base origin/main    # 本次新增 *.r
 两条判据都带 `--self-test`，先自证判据可用再判真实区间。若本地报「无法执行」
 （取不到基线、找不到 rustfmt），那是判据自身不可用，会以非零退出，
 **不要**把它当成「通过」。
+
+第三条判据交叉的是 GitHub 事件而不是 git 区间，需要 token，本地这样跑：
+
+```bash
+python3 scripts/ci/self_approval_gate.py --self-test          # 离线夹具对照
+GITHUB_TOKEN=$(gh auth token) python3 scripts/ci/self_approval_gate.py
+```
+
+- **它判什么**：禁令生效后合并的每个 PR，必须①合并前存在批准口径的留痕，
+  ②批准之后没有未再批准的新提交。批准口径要求结论句式或合并口径，
+  裸的「通过」（「cargo test 通过」「判据自测通过」一类技术事实）不算批准。
+- **它不判什么**：不判「谁批准」。单账号仓库里批准者与作者永远是同一个登录名，
+  那条判据恒真、毫无区分力；能被机器辨认的只有时间顺序与提交顺序。
+- **为什么永不列必需检查**：它判的是「合并已经发生、留痕不合规」。列必需会让一次
+  历史违规永久卡死后续所有合并，等于让闸门反过来掐住主干。它的定位是信号与记档：
+  红了必须当场记档并说明，但不阻塞合并。
 
 ## 测试要求
 
