@@ -80,6 +80,12 @@ jobs:
         run: python3 scripts/ci/tools_cache_isolation_gate.py --self-test
       - name: 集成测试缓存隔离门禁
         run: python3 scripts/ci/tools_cache_isolation_gate.py
+      # 发版 bump 只改 Cargo.toml 会让锁文件悄悄漂移：日常 cargo 调用重写工作区、
+      # git pull 被挡；一旦哪里用了 --locked 直接红。判据只比对本包版本行。
+      - name: 判据自测：锁文件版本一致性
+        run: python3 scripts/ci/lock_version_gate.py --self-test
+      - name: 锁文件版本一致性门禁
+        run: python3 scripts/ci/lock_version_gate.py
       # 安装脚本的 latest tag 解析：正反对照 + 旧写法恒空对照（离线跑，不碰网络）
       - name: 安装脚本 latest tag 解析测试
         run: bash scripts/ci/install_tag_parse_test.sh
