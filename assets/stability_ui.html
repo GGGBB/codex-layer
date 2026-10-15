@@ -130,7 +130,7 @@ th { color: var(--muted); font-weight: 600; }
 tr:last-child td { border-bottom: none; }
 td.num, th.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
 td.snip { white-space: normal; min-width: 160px; max-width: 420px; overflow-wrap: anywhere; font-family: var(--mono); font-size: 11px; color: var(--muted); }
-col.c-time { width: 92px; } col.c-num { width: 84px; } col.c-flag { width: 64px; }
+col.c-time { width: 132px; } col.c-num { width: 84px; } col.c-flag { width: 64px; }
 col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px; }
 .badge { border-radius: 4px; padding: 1px 6px; font-size: 11px; }
 .badge.ok { background: var(--ok-bg); color: var(--ok); }
@@ -266,6 +266,21 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
     var d = new Date(ms);
     return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
   }
+  // 表格与提示一律带日期：日志窗口可跨多日，只有时分会让跨天的行无法判读。
+  function fmtDateTime(ms) {
+    var d = new Date(ms);
+    return pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + fmtTime(ms);
+  }
+  // 区间两端同一天时省掉重复的日期，跨天才两头都写。
+  function fmtRange(fromMs, toMs) {
+    var a = new Date(fromMs);
+    var b = new Date(toMs);
+    var sameDay = a.getFullYear() === b.getFullYear()
+      && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+    return sameDay
+      ? fmtDateTime(fromMs) + " → " + fmtTime(toMs)
+      : fmtDateTime(fromMs) + " → " + fmtDateTime(toMs);
+  }
   function fmtDur(ms) {
     if (ms === null || ms === undefined) { return "—"; }
     if (ms < 1000) { return ms + "ms"; }
@@ -320,7 +335,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
       }
     }
     if (s.session && s.session.firstTimestampMs && s.session.lastTimestampMs) {
-      chip("日志窗口", fmtTime(s.session.firstTimestampMs) + " → " + fmtTime(s.session.lastTimestampMs));
+      chip("日志窗口", fmtRange(s.session.firstTimestampMs, s.session.lastTimestampMs));
     }
     var unpaired = (s.durationsMs && s.durationsMs.unpaired) || {};
     var openLoose = unpaired.openWithoutTerminal || 0;
@@ -397,7 +412,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
     if (hi === lo) { hi = lo + 1; }
     svg.removeAttribute("hidden");
     empty.hidden = true;
-    rangeLabel.textContent = fmtTime(lo) + " → " + fmtTime(hi);
+    rangeLabel.textContent = fmtRange(lo, hi) + "（时间均为本机时区）";
     var X = function (ms) { return 10 + ((ms - lo) / (hi - lo)) * 980; };
 
     // 轴线
@@ -408,7 +423,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
         y: 95, "font-size": "10", fill: "currentColor", opacity: "0.5",
         "text-anchor": i === 0 ? "start" : (i === 2 ? "end" : "middle"),
       });
-      label.textContent = fmtTime(Math.round(ms));
+      label.textContent = fmtDateTime(Math.round(ms));
       svg.appendChild(label);
     });
 
@@ -424,7 +439,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
       var bar = svgEl("rect", {
         x: x, y: 52, width: Math.min(width, 990 - x), height: 26, fill: fill, opacity: opacity,
       });
-      var tip = fmtTime(t.timestampMs) + " · " + (t.path || "—") +
+      var tip = fmtDateTime(t.timestampMs) + " · " + (t.path || "—") +
         (t.compaction ? " · 压缩轮" : "") +
         " · " + (outcome || "开着未收口") +
         " · 耗时 " + fmtDur(t.durationMs) +
@@ -441,7 +456,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
       var x = X(d.timestampMs);
       var tick = svgEl("line", { x1: x, y1: 14, x2: x, y2: 80, stroke: "var(--warn)", "stroke-width": "2" });
       var title = svgEl("title", {});
-      title.textContent = fmtTime(d.timestampMs) + " · 前缀分叉 firstDiff=" + d.firstDiff +
+      title.textContent = fmtDateTime(d.timestampMs) + " · 前缀分叉 firstDiff=" + d.firstDiff +
         " oldLen=" + d.oldLen + " newLen=" + d.newLen + " · 该轮起深缓存冷算";
       tick.appendChild(title);
       svg.appendChild(tick);
@@ -473,7 +488,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
     var showSnips = st.snippets === "truncated";
     rows.forEach(function (d) {
       var tr = el("tr");
-      tr.appendChild(el("td", { text: fmtTime(d.timestampMs) }));
+      tr.appendChild(el("td", { text: fmtDateTime(d.timestampMs) }));
       tr.appendChild(el("td", { "class": "num", text: d.firstDiff === null ? "—" : String(d.firstDiff) }));
       tr.appendChild(el("td", { "class": "num", text: String(d.oldLen) }));
       tr.appendChild(el("td", { "class": "num", text: String(d.newLen) }));
@@ -505,7 +520,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
     }
     turns.forEach(function (t) {
       var row = el("tr");
-      row.appendChild(el("td", { text: fmtTime(t.timestampMs) }));
+      row.appendChild(el("td", { text: fmtDateTime(t.timestampMs) }));
       row.appendChild(el("td", { "class": "num", text: t.compaction ? "是" : "—" }));
       var durCell = el("td", { "class": "num", text: fmtDur(t.durationMs) });
       if (t.compaction && t.durationMs !== null && t.durationMs !== undefined) {
@@ -549,7 +564,7 @@ col.c-dur { width: 92px; } col.c-out { width: 108px; } col.c-req { width: 120px;
       .then(function (snapshot) {
         render(snapshot);
         lastError = false;
-        fetchStateChip("已更新 " + fmtTime(Date.now()));
+        fetchStateChip("已更新 " + fmtDateTime(Date.now()));
       })
       .catch(function (error) {
         // 拉取失败是真实故障信号：红色。
