@@ -1,7 +1,7 @@
 //! 状态目录与文件路径解析。
 //!
-//! 极小子集：本项目只需要「设置文件在哪」与「诊断日志在哪」两条路径，
-//! 以及测试用的路径覆盖钩子。
+//! 极小子集：本项目只需要「设置文件在哪」「诊断日志在哪」与「tools 回填缓存
+//! 落盘在哪」三条路径，以及测试用的路径覆盖钩子。
 //!
 //! 状态目录默认 `~/.codex-layer`，可用环境变量 `CODEX_LAYER_HOME` 整体改写；
 //! 两条路径各自还有更细的覆盖变量，便于临时排障而不改配置。
@@ -11,6 +11,10 @@ use std::sync::{Mutex, OnceLock};
 
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const DIAGNOSTIC_LOG_FILE: &str = "codex-layer.log";
+/// tools 回填缓存的落盘文件名（与设置文件同一状态目录）。
+pub const TOOLS_CACHE_FILE: &str = "tools-cache.json";
+/// tools 回填缓存路径的独立覆盖变量：临时排障或把缓存指向别处，不用改配置。
+pub const TOOLS_CACHE_PATH_ENV: &str = "CODEX_LAYER_TOOLS_CACHE_PATH";
 
 /// 状态目录：`$CODEX_LAYER_HOME`，否则 `~/.codex-layer`。
 pub fn default_app_state_dir() -> PathBuf {
@@ -50,6 +54,21 @@ pub fn default_diagnostic_log_path() -> PathBuf {
     default_app_state_dir().join(DIAGNOSTIC_LOG_FILE)
 }
 
+/// tools 回填缓存落盘路径：`$CODEX_LAYER_TOOLS_CACHE_PATH` 优先，否则
+/// `$CODEX_LAYER_HOME/tools-cache.json`（与设置文件同目录、同优先级链）。
+pub fn default_tools_cache_path() -> PathBuf {
+    if let Some(path) = tools_cache_path_override() {
+        return path;
+    }
+    if let Some(path) = std::env::var_os(TOOLS_CACHE_PATH_ENV) {
+        let path = PathBuf::from(path);
+        if !path.as_os_str().is_empty() {
+            return path;
+        }
+    }
+    default_app_state_dir().join(TOOLS_CACHE_FILE)
+}
+
 /// 测试/进程内路径覆盖：把设置文件指到临时目录，供测试隔离使用。
 fn settings_path_override() -> Option<PathBuf> {
     SETTINGS_PATH_OVERRIDE
@@ -67,6 +86,25 @@ pub fn set_settings_path_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("settings path override lock poisoned");
+    std::mem::replace(&mut *lock, path)
+}
+
+fn tools_cache_path_override() -> Option<PathBuf> {
+    TOOLS_CACHE_PATH_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|path| path.clone())
+}
+
+static TOOLS_CACHE_PATH_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_tools_cache_path_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
+    let mut lock = TOOLS_CACHE_PATH_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("tools cache path override lock poisoned");
     std::mem::replace(&mut *lock, path)
 }
 
@@ -91,5 +129,22 @@ mod tests {
         let _ = set_settings_path_for_tests(Some(target.clone()));
         assert_eq!(default_settings_path(), target);
         set_settings_path_for_tests(previous);
+    }
+
+    #[test]
+    fn tools_cache_path_falls_back_to_state_dir() {
+        let previous = set_tools_cache_path_for_tests(None);
+        assert!(default_tools_cache_path().ends_with(TOOLS_CACHE_FILE));
+        set_tools_cache_path_for_tests(previous);
+    }
+
+    #[test]
+    fn tools_cache_path_override_wins() {
+        let previous = set_tools_cache_path_for_tests(None);
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("tools-cache.json");
+        let _ = set_tools_cache_path_for_tests(Some(target.clone()));
+        assert_eq!(default_tools_cache_path(), target);
+        set_tools_cache_path_for_tests(previous);
     }
 }
