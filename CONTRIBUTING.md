@@ -136,6 +136,7 @@ CI 的 `gates` job 里有两条判据，都可以本地先跑，不必等 CI：
 ```bash
 python3 scripts/ci/commit_author_gate.py --base origin/main   # 提交作者角色身份
 python3 scripts/ci/new_file_fmt_gate.py --base origin/main    # 本次新增 *.rs 的格式
+python3 scripts/ci/tools_cache_isolation_gate.py              # 开稳定层的测试是否隔离了缓存落盘
 ```
 
 - **提交作者**：区间内每个 commit 的 author 名必须是 `codex-layer-<角色>`，
@@ -153,6 +154,16 @@ python3 scripts/ci/new_file_fmt_gate.py --base origin/main    # 本次新增 *.r
 - **新增文件格式**：只判区间内**新增**的 `.rs`，既有文件的格式改动不误伤。
   红了只格式化被点名的那一个文件（`rustfmt --edition 2024 <文件>`），
   **不许**全仓 `cargo fmt`。
+- **集成测试缓存隔离**：源文件里出现 `prompt_prefix = true` 即视为会启动开稳定层的
+  子进程，必须同时出现 `CODEX_LAYER_TOOLS_CACHE_PATH`。落盘上线后，未注入的测试会往
+  **真实状态目录**写 e2e 键（`degrade-ok-*` 这类），真键与测试键混在一个文件里，
+  「重启后第一个压缩轮是否命中预热」这个真机判据就废了。污染只出现在开发者本机、
+  CI 看不见，所以这条必须在 CI 拦。新增用例时照既有三个文件的 spawn 处注入：
+
+  ```rust
+  .env("CODEX_LAYER_HOME", dir.path())
+  .env("CODEX_LAYER_TOOLS_CACHE_PATH", dir.path().join("tools-cache.json"))
+  ```
 
 两条判据都带 `--self-test`，先自证判据可用再判真实区间。若本地报「无法执行」
 （取不到基线、找不到 rustfmt），那是判据自身不可用，会以非零退出，

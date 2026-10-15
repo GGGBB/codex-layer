@@ -74,6 +74,12 @@ jobs:
         env:
           GATE_PUSH_BEFORE: ${{ github.event.before }}
         run: python3 scripts/ci/new_file_fmt_gate.py
+      # 开稳定层的集成测试必须把 tools 回填缓存指到临时目录，否则 cargo test 会
+      # 往真实状态目录写测试键（只污染开发者本机，CI 完全看不见，所以必须在此拦）。
+      - name: 判据自测：集成测试缓存隔离
+        run: python3 scripts/ci/tools_cache_isolation_gate.py --self-test
+      - name: 集成测试缓存隔离门禁
+        run: python3 scripts/ci/tools_cache_isolation_gate.py
       # 安装脚本的 latest tag 解析：正反对照 + 旧写法恒空对照（离线跑，不碰网络）
       - name: 安装脚本 latest tag 解析测试
         run: bash scripts/ci/install_tag_parse_test.sh
