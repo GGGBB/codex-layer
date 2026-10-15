@@ -485,3 +485,32 @@ async fn window_bytes_query_override_takes_effect_and_rejects_garbage() {
         );
     }
 }
+
+/// 监看界面的时间显示必须带日期（issue #20 的后续修订）：
+/// 日志窗口可跨多日，只显示时分让跨天的行无法判读。这里钉住渲染入口，
+/// 防止后续改动把表格与提示的日期又裁回时分。
+#[tokio::test]
+async fn stability_ui_renders_timestamps_with_date() {
+    let harness = spawn_proxy(&[], "\n[stability]\nenabled = true\n").await;
+    let (status, _, body) = http_get_parts(harness.proxy_port, "/stability/ui").await;
+    assert_eq!(status, "200", "body={body}");
+    for marker in [
+        "function fmtDateTime(",
+        "text: fmtDateTime(d.timestampMs)",
+        "text: fmtDateTime(t.timestampMs)",
+        "fmtDateTime(d.timestampMs) + \" · 前缀分叉",
+        "var tip = fmtDateTime(t.timestampMs)",
+        "function fmtRange(",
+    ] {
+        assert!(
+            body.contains(marker),
+            "时间显示缺少带日期的渲染入口 {marker:?}，页面长度={}",
+            body.len()
+        );
+    }
+    // 表格的时间列不许残留「只有时分」的渲染入口（fmtTime 只允许作为 fmtDateTime 的内部实现）。
+    assert!(
+        !body.contains("text: fmtTime("),
+        "表格时间列必须走带日期的格式化"
+    );
+}
