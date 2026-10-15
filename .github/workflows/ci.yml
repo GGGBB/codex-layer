@@ -12,6 +12,8 @@ on:
 
 permissions:
   contents: read
+  # 事后检测要读 PR / review / 评论三类事件，只读权限，不写任何状态
+  pull-requests: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -75,3 +77,24 @@ jobs:
       # 安装脚本的 latest tag 解析：正反对照 + 旧写法恒空对照（离线跑，不碰网络）
       - name: 安装脚本 latest tag 解析测试
         run: bash scripts/ci/install_tag_parse_test.sh
+
+  # 作者不得自审的事后检测（只读，判据自测 + 真实交叉）。
+  # 刻意**不进** ruleset 的必需检查名单：它判的是「合并已经发生、留痕不合规」，
+  # 若列必需会让一次历史违规永久卡死后续所有合并；这里只做信号与记档，
+  # continue-on-error 保证它红的时候流水线仍给出整体可读的结论。
+  self-approval:
+    name: self-approval aftercheck
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 判据自测：措辞表与 PR 夹具正反对照
+        run: python3 scripts/ci/self_approval_gate.py --self-test
+      - name: 事后检测：批准口径 × 合并时间 × 批准后的新提交
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/ci/self_approval_gate.py
