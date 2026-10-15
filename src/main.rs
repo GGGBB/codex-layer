@@ -50,6 +50,7 @@ use codex_layer::protocol_proxy::{
     open_models_proxy_request, open_responses_proxy_request_for_path_with_session_headers,
     responses_json_to_sse_events, responses_error_from_upstream, wrap_non_stream_response_as_compaction,
     upstream_conversion_error_response,
+    EMPTY_FRAME_MAX_RETRIES, with_empty_frame_nudge,
 };
 use codex_layer::stability::{self, StabilityAggregateOptions};
 use codex_layer::stability_ui;
@@ -836,6 +837,50 @@ async fn responses_proxy(
             events::layer::STREAM_OPEN,
             json!({ "path": path, "wireApi": format!("{:?}", upstream.wire_api), "compaction": compaction_round || upstream.compaction, "requestId": request_id.clone() }),
         );
+        // 空终帧护栏的重发通道：四个条件齐了才开——Chat 方言（终帧判定与重发
+        // 在那里才有意义）、非压缩轮（含降级轮，压缩轮有自己的收口账）、客户端
+        // 请求解析得动（重发要靠它重建请求体）。
+        let retry_opener: Option<StreamRetryOpener> =
+            if upstream.wire_api == UpstreamWireApi::ChatCompletions
+                && !compaction_round
+                && !upstream.compaction
+                && request_json.is_some()
+            {
+                let user_agent = user_agent.map(str::to_string);
+                let beta_features = beta_features.map(str::to_string);
+                let path = path.to_string();
+                let session_id = session_headers.session_id.map(str::to_string);
+                let thread_id = session_headers.thread_id.map(str::to_string);
+                let opencode_session = session_headers.opencode_session.map(str::to_string);
+                Some(Box::new(move |body: Value| {
+                    // 请求体由调用方每轮现给（同体或带推动文案的变体），
+                    // 其余装配参数原样复制。
+                    let body = body.to_string();
+                    let user_agent = user_agent.clone();
+                    let beta_features = beta_features.clone();
+                    let path = path.clone();
+                    let session_id = session_id.clone();
+                    let thread_id = thread_id.clone();
+                    let opencode_session = opencode_session.clone();
+                    Box::pin(async move {
+                        let session = ProxySessionHeaders {
+                            session_id: session_id.as_deref(),
+                            thread_id: thread_id.as_deref(),
+                            opencode_session: opencode_session.as_deref(),
+                        };
+                        open_responses_proxy_request_for_path_with_session_headers(
+                            &body,
+                            user_agent.as_deref(),
+                            &path,
+                            beta_features.as_deref(),
+                            session,
+                        )
+                        .await
+                    })
+                }))
+            } else {
+                None
+            };
         return sse_response(stream_from_upstream(
             upstream,
             request_json,
@@ -843,6 +888,7 @@ async fn responses_proxy(
             request_id,
             drain,
             compaction_round,
+            retry_opener,
         ));
     }
 
@@ -1046,6 +1092,15 @@ fn non_stream_native_compaction_response(
     }
 }
 
+/// 空终帧护栏的重发通道：拿本轮要发的请求体（同体重采样或带推动文案的
+/// 变体），用装配层原始参数重新发出一次同客户端轮的上游请求。future 抠成
+/// 'static 装箱，流泵才能就地持有、反复重开。
+type StreamRetryOpener = Box<
+    dyn Fn(Value) -> futures_util::future::BoxFuture<'static, anyhow::Result<UpstreamProxyResponse>>
+        + Send
+        + Sync,
+>;
+
 /// 把上游回包变成一条 Responses 事件流：压缩轮、Responses 方言、Chat 方言三条分支。
 fn stream_from_upstream(
     upstream: UpstreamProxyResponse,
@@ -1054,6 +1109,7 @@ fn stream_from_upstream(
     request_id: String,
     drain: DrainState,
     compaction_round: bool,
+    retry_opener: Option<StreamRetryOpener>,
 ) -> impl futures_util::Stream<Item = StreamItem> + Send + 'static {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let wire_api = upstream.wire_api;
@@ -1238,7 +1294,17 @@ fn stream_from_upstream(
             .as_ref()
             .map(ChatSseToResponsesConverter::with_request)
             .unwrap_or_default();
+        // 空终帧护栏：只在「自然收口」处多一个扣帧重发的决策点，
+        // 失败与排空两条路径与原实现逐字节一致。护栏开关只在重发通道
+        // 存在时打开（装配层已验过四个条件）。
+        converter.set_guard_enabled(retry_opener.is_some());
+        let mut retries_used = 0usize;
         let mut drained = false;
+        // 排空截止用装箱 future：重试轮重开上游流后要换新的截止，
+        // 已命中的截止不可能被重试轮再踩一次。
+        let mut drain_wait: std::pin::Pin<
+            std::boxed::Box<dyn std::future::Future<Output = ()> + Send + '_>,
+        > = Box::pin(drain.wait_deadline());
         loop {
             let next = tokio::select! {
                 next = chunks.next() => next,
@@ -1261,6 +1327,73 @@ fn stream_from_upstream(
                         );
                         return;
                     }
+                    if converter.terminal_deferred() {
+                        // [DONE] 把终帧顶了出来又被护栏扣下：走重试决策。重开
+                        // 成功就换新的上游流继续泵（第二次的条目续排同一条
+                        // 出流）；额度用尽或重开失败则把扣下的帧原样放行后
+                        // 断泵，走既有的收口诊断。绝不造成「无 completed 也无
+                        // failed」的静默断流。
+                        if retries_used >= EMPTY_FRAME_MAX_RETRIES {
+                            log_event(
+                                events::layer::EMPTY_FRAME_EXHAUSTED,
+                                json!({ "requestId": request_id, "attempts": retries_used }),
+                            );
+                            let released = converter.release_deferred_terminal();
+                            if !released.is_empty()
+                                && tx.send(Ok(Bytes::from(released))).is_err()
+                            {
+                                return;
+                            }
+                            break;
+                        }
+                        let opener = retry_opener
+                            .as_ref()
+                            .expect("护栏开关打开时重发通道必在");
+                        // 第一次重试同体重采样（前缀全命中，纯赌温度）；第二次
+                        // 带推动文案。推动项拼不进 input（形态不认识）就原样
+                        // 重发，绝不自造请求结构。
+                        let same_body = request_json
+                            .clone()
+                            .expect("护栏开关打开时客户端请求必解析得动");
+                        let nudged = retries_used >= 1;
+                        let retry_body = if nudged {
+                            with_empty_frame_nudge(&same_body).unwrap_or(same_body)
+                        } else {
+                            same_body
+                        };
+                        retries_used += 1;
+                        log_event(
+                            events::layer::EMPTY_FRAME_RETRY,
+                            json!({ "requestId": request_id, "attempt": retries_used, "nudged": nudged }),
+                        );
+                        match opener(retry_body).await {
+                            Ok(opened) if opened.is_success() => {
+                                converter.begin_retry_attempt();
+                                chunks = opened.response.bytes_stream();
+                                drain_wait = Box::pin(drain.wait_deadline());
+                                continue;
+                            }
+                            other => {
+                                // 重发通道自己失败：扣下的帧放行、照常收口；
+                                // 日志要能分清「重发没开门」还是「又静默」。
+                                let reason = match &other {
+                                    Ok(opened) => {
+                                        format!("重发上游返回状态码 {}", opened.status_code)
+                                    }
+                                    Err(error) => error.to_string(),
+                                };
+                                log_event(
+                                    events::layer::EMPTY_FRAME_EXHAUSTED,
+                                    json!({ "requestId": request_id, "attempts": retries_used, "reason": reason }),
+                                );
+                                let released = converter.release_deferred_terminal();
+                                if !released.is_empty() {
+                                    let _ = tx.send(Ok(Bytes::from(released)));
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     let failed = converter.fail(
@@ -1276,29 +1409,36 @@ fn stream_from_upstream(
                 }
             }
         }
-        // EOF 不是 Chat 协议的完成事件：已发出的文本和工具增量不能自动重放，
-        // 必须显式补一个 failed 事件，否则客户端会永远等下去。
-        // 排空截止点命中：语义相同（都是「完成事件前终止」），措辞与
-        // error_type 区分开，现场要能分清是上游断的还是本机在关停。
-        if !converter.has_terminal_event() {
-            let (message, error_type, reason) = if drained {
-                (
-                    "服务器关停：排空截止点到达，上游响应流被截断",
-                    "drain_deadline",
-                    "关停排空截止点到达，提前收口",
-                )
-            } else {
-                (
-                    "上游在完成事件前结束了响应流",
-                    "stream_incomplete",
-                    "上游缺少完成事件",
-                )
-            };
-            let failed = converter.fail(message.to_string(), Some(error_type.to_string()));
+        // 排空截止点命中（issue #34）：与「完成事件前终止」语义相同，措辞与
+        // error_type 与上游断流区分开。护栏在这里不插嘴：这一轮反正按截断收口；
+        // 若还扣着终帧先放行——客户端至少先拿到完整的「上游说完了」，再收到
+        // 「被截断」的显式信号。
+        if drained {
+            if converter.terminal_deferred() {
+                let _ = tx.send(Ok(Bytes::from(converter.release_deferred_terminal())));
+            }
+            let failed = converter.fail(
+                "服务器关停：排空截止点到达，上游响应流被截断".to_string(),
+                Some("drain_deadline".to_string()),
+            );
             let _ = tx.send(Ok(Bytes::from(failed)));
             log_event(
                 events::layer::STREAM_FAILED,
-                json!({ "reason": reason, "requestId": request_id }),
+                json!({ "reason": "关停排空截止点到达，提前收口", "requestId": request_id }),
+            );
+            return;
+        }
+        // EOF 不是 Chat 协议的完成事件：已发出的文本和工具增量不能自动重放，
+        // 必须显式补一个 failed 事件，否则客户端会永远等下去。
+        if !converter.has_terminal_event() {
+            let failed = converter.fail(
+                "上游在完成事件前结束了响应流".to_string(),
+                Some("stream_incomplete".to_string()),
+            );
+            let _ = tx.send(Ok(Bytes::from(failed)));
+            log_event(
+                events::layer::STREAM_FAILED,
+                json!({ "reason": "上游缺少完成事件", "requestId": request_id }),
             );
             return;
         }

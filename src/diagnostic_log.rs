@@ -34,6 +34,10 @@ pub mod events {
         pub const STREAM_OPEN: &str = "codex_layer.stream_open";
         pub const STREAM_COMPLETED: &str = "codex_layer.stream_completed";
         pub const STREAM_FAILED: &str = "codex_layer.stream_failed";
+        /// 空终帧护栏：静默终帧被扣下，正在向同一上游重发一轮。
+        pub const EMPTY_FRAME_RETRY: &str = "codex_layer.empty_frame_retry";
+        /// 空终帧护栏：重发额度用尽或重发通道不可用，静默终帧被原样放行。
+        pub const EMPTY_FRAME_EXHAUSTED: &str = "codex_layer.empty_frame_exhausted";
         /// 本族登记表：消费侧对齐测试与验收判据的完整性检查用。
         pub const ALL: &[&str] = &[
             STARTED,
@@ -48,6 +52,8 @@ pub mod events {
             STREAM_OPEN,
             STREAM_COMPLETED,
             STREAM_FAILED,
+            EMPTY_FRAME_RETRY,
+            EMPTY_FRAME_EXHAUSTED,
         ];
     }
 
