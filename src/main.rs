@@ -38,15 +38,16 @@ use codex_layer::diagnostic_log;
 use codex_layer::diagnostic_log::events;
 use codex_layer::http_client;
 use codex_layer::protocol_proxy::{
-    self, ChatSseToResponsesConverter, CompactionSseConverter, ProxySessionHeaders, UpstreamWireApi,
-    UpstreamProxyResponse, chat_completion_to_response, chat_completion_to_response_with_request,
-    NativeResponsesSseObserver, native_stream_failure_frame,
-    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_image_edits_proxy_path,
+    self, ChatSseToResponsesConverter, CompactionItemTally, CompactionRound, CompactionSseConverter,
+    ProxySessionHeaders, UpstreamWireApi, UpstreamProxyResponse, chat_completion_to_response,
+    chat_completion_to_response_with_request, NativeResponsesSseObserver,
+    native_stream_failure_frame, is_audio_transcriptions_proxy_path,
+    is_chat_completions_proxy_path, is_compaction_round_request, is_image_edits_proxy_path,
     is_image_generations_proxy_path, is_models_proxy_path, is_responses_proxy_path,
     open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
     open_image_edits_proxy_request, open_image_generations_proxy_request,
     open_models_proxy_request, open_responses_proxy_request_for_path_with_session_headers,
-    responses_error_from_upstream, wrap_non_stream_response_as_compaction,
+    responses_json_to_sse_events, responses_error_from_upstream, wrap_non_stream_response_as_compaction,
     upstream_conversion_error_response,
 };
 use codex_layer::stability::{self, StabilityAggregateOptions};
@@ -54,6 +55,10 @@ use codex_layer::stability_ui;
 
 /// 请求体上限（含解压后）：32 MB。
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// 压缩轮上游响应的累计上限（流式累计与非流式正文各自适用，同为一个响应体的尺度）：
+/// 与请求体同量级。超限不再累计判定，按失败收口——残缺文本上做出来的「恰好一项」
+/// 不能当成成功。
+const MAX_COMPACTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 type StreamItem = Result<Bytes, Box<dyn StdError + Send + Sync + 'static>>;
 

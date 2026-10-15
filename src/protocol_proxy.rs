@@ -1463,6 +1463,357 @@ pub fn native_stream_failure_frame(message: &str, error_type: &str) -> String {
     output
 }
 
+/// Responses 非流式 JSON 重组为 SSE 事件文本。
+///
+/// 为什么必须有这一步：`upstream_compaction_item_count` 是 SSE 感知的计数器，
+/// 直接把 JSON 正文喂给它只会得到 0，于是「上游明明给了原生 compaction 项」被误判成
+/// 「上游没给」，装配流据此错误降级。这里把 `output[]` 每一项重写成计数器的定稿口径
+/// （`response.output_item.done`），并把非 completed 的终态重写成终止事件，
+/// 让两条方言、流式与非流式共用同一套判据，判据本体一字不改。
+///
+/// 只造计数所需的形状，不伪造 id/model/usage；opaque 的 encrypted_content 逐字节进
+/// item。JSON 都解析不出时返回 None，由调用方按「读不出结构」保守处理（宁缺毋滥）。
+pub fn responses_json_to_sse_events(json_body: &[u8]) -> Option<String> {
+    let parsed: Value = serde_json::from_slice(json_body).ok()?;
+    let mut output = String::new();
+    let items = parsed
+        .get("output")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for (index, item) in items.iter().enumerate() {
+        push_sse(
+            &mut output,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": item,
+            }),
+        );
+    }
+    // 终态必须一并重写：否则 `upstream_has_terminal_failure` 读不出
+    // 「上游自报失败」，装配流会再补一帧重复的失败事件。
+    // cancelled 归入 failed：它同为非正常终态，而不是「上游认为自己正常结束」。
+    match parsed.get("status").and_then(Value::as_str) {
+        Some("failed") | Some("cancelled") => push_sse(
+            &mut output,
+            "response.failed",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "object": "response",
+                    "status": "failed",
+                    "error": parsed
+                        .get("error")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"message": "上游返回非成功终态"})),
+                },
+            }),
+        ),
+        Some("incomplete") => push_sse(
+            &mut output,
+            "response.incomplete",
+            json!({
+                "type": "response.incomplete",
+                "response": {
+                    "object": "response",
+                    "status": "incomplete",
+                    "incomplete_details": parsed
+                        .get("incomplete_details")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"reason": "upstream_incomplete"})),
+                },
+            }),
+        ),
+        _ => {}
+    }
+    Some(output)
+}
+
+/// 压缩轮观察结论：三条判据按优先级封装成一个结论，流式与非流式两条支路共用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionRound {
+    /// 恰好一个原生 `compaction` 项：逐字节透传即成功。
+    Native,
+    /// 上游已自带终止失败事件：原样透传，本层**不补**重复的 `response.failed`。
+    UpstreamFailed,
+    /// 其余形态（零项、超上限）：必须显式 `response.failed` 收口，不得静默半截流。
+    NeedsFailure { reason: &'static str },
+}
+
+/// 三条判据的优先级：上限 > 上游自报失败 > 项数。
+///
+/// - 超上限排第一：正文已经不可信，项数判定建立在残缺文本上，不能再据它宣布成功；
+/// - 上游自报失败排第二：客户端手里已有显式终止信号，本层补帧只是重复噪音；
+/// - 项数不等于 1（0 或多项）落第三：既不是原生成功，也不是上游自报失败，
+///   必须由本层收口，否则客户端拿到的是「看起来完成、实际没有压缩状态」的响应。
+pub fn compaction_round_verdict(sse: &str, over_limit: bool) -> CompactionRound {
+    if over_limit {
+        return CompactionRound::NeedsFailure {
+            reason: "压缩轮上游响应累计字节超过上限，按失败收口",
+        };
+    }
+    if upstream_has_terminal_failure(sse) {
+        return CompactionRound::UpstreamFailed;
+    }
+    match upstream_compaction_item_count(sse) {
+        1 => CompactionRound::Native,
+        _ => CompactionRound::NeedsFailure {
+            reason: "上游未给出恰好一个原生 compaction 项",
+        },
+    }
+}
+
+/// 降级重发的请求体：剥离全部 `compaction_trigger` 控制项，再改写成上游能理解的
+/// 普通摘要生成请求。纯函数，便于对拍；真正的「只降级一次」控制在调用方。
+pub fn local_summary_request_body(body: &Value) -> Value {
+    rewrite_request_for_compaction(strip_compaction_trigger(body.clone()))
+}
+
+#[cfg(test)]
+mod native_compaction_assembly_tests {
+    use super::{
+        CompactionRound, compaction_round_verdict, local_summary_request_body,
+        responses_json_to_sse_events, upstream_compaction_item_count,
+    };
+    use serde_json::json;
+
+    fn done_event(index: usize, item_type: &str) -> String {
+        format!(
+            "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":{index},\"item\":{{\"id\":\"c{index}\",\"type\":\"{item_type}\"}}}}\n\n"
+        )
+    }
+
+    /// 核心坑：非流式 JSON 直接喂计数器得 0；重组后必须数出那一个原生项。
+    #[test]
+    fn non_stream_json_needs_reassembly_before_counting() {
+        let body = json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"id": "msg_1", "type": "message", "content": [
+                    {"type": "output_text", "text": "不该被当成压缩项"}
+                ]},
+                {"id": "cmp_1", "type": "compaction", "encrypted_content": "gAAAAxxx"},
+            ],
+        })
+        .to_string();
+        assert_eq!(
+            upstream_compaction_item_count(&body),
+            0,
+            "直接喂 JSON 必须得 0——这正是必须重组的理由"
+        );
+        let reassembled =
+            responses_json_to_sse_events(body.as_bytes()).expect("合法 JSON 必须能重组");
+        assert_eq!(upstream_compaction_item_count(&reassembled), 1);
+    }
+
+    /// 重组必须保留 opaque 内容：encrypted_content 逐字节进 item，不做任何改写。
+    #[test]
+    fn reassembly_keeps_opaque_payload_byte_for_byte() {
+        let opaque = "gAAAAABnogus+abc/def==";
+        let body = json!({
+            "status": "completed",
+            "output": [{"id": "cmp_1", "type": "compaction", "encrypted_content": opaque}],
+        })
+        .to_string();
+        let reassembled = responses_json_to_sse_events(body.as_bytes()).unwrap();
+        assert!(
+            reassembled.contains(opaque),
+            "opaque 状态必须原样出现在重组事件里，reassembled={reassembled}"
+        );
+    }
+
+    /// 非成功终态要重写成终止事件，否则判据读不出「上游自报失败」，会补重复帧。
+    #[test]
+    fn reassembly_rewrites_non_completed_terminal_states() {
+        let failed = json!({
+            "status": "failed",
+            "error": {"code": "server_error", "message": "上游内部错误"},
+            "output": [],
+        })
+        .to_string();
+        assert!(
+            responses_json_to_sse_events(failed.as_bytes())
+                .unwrap()
+                .contains("response.failed")
+        );
+        let incomplete = json!({"status": "incomplete", "output": []}).to_string();
+        assert!(
+            responses_json_to_sse_events(incomplete.as_bytes())
+                .unwrap()
+                .contains("response.incomplete")
+        );
+    }
+
+    /// 判据吃不下坏 JSON：返回 None 交调用方保守处理，不许当成「零项成功」。
+    #[test]
+    fn reassembly_gives_up_on_unparsable_body() {
+        assert!(responses_json_to_sse_events(b"<html>502 Bad Gateway</html>").is_none());
+    }
+
+    /// 优先级对照：超上限压过「恰好一项」——正文残缺时不得宣布成功。
+    #[test]
+    fn verdict_lets_limit_beat_native_item() {
+        let one_item = format!(
+            "{}{}",
+            done_event(0, "compaction"),
+            "event: response.completed\ndata: {{\"type\":\"response.completed\"}}\n\n"
+        );
+        assert_eq!(compaction_round_verdict(&one_item, false), CompactionRound::Native);
+        assert!(matches!(
+            compaction_round_verdict(&one_item, true),
+            CompactionRound::NeedsFailure { .. }
+        ));
+    }
+
+    /// 上游自报失败优先于「零项」：本层不补重复帧。
+    #[test]
+    fn verdict_reports_upstream_failure_before_missing_item() {
+        let sse = "event: response.failed\ndata: {{\"type\":\"response.failed\"}}\n\n";
+        assert_eq!(
+            compaction_round_verdict(sse, false),
+            CompactionRound::UpstreamFailed
+        );
+    }
+
+    /// 零项与超上限项一律要求显式收口，绝不静默半截流。
+    #[test]
+    fn verdict_requires_explicit_failure_when_item_count_is_not_one() {
+        let cases = [
+            "event: response.completed\ndata: {{\"type\":\"response.completed\"}}\n\n"
+                .to_string(),
+            format!("{}{}", done_event(0, "compaction"), done_event(1, "compaction")),
+            String::new(),
+        ];
+        for sse in &cases {
+            assert!(
+                matches!(
+                    compaction_round_verdict(sse, false),
+                    CompactionRound::NeedsFailure { .. }
+                ),
+                "应要求显式收口，sse={sse}"
+            );
+        }
+    }
+
+    /// 降级请求体：trigger 剥干净、摘要指令落在末尾、tools 清空且 tool_choice=none。
+    #[test]
+    fn local_summary_body_strips_trigger_and_disables_tools() {
+        let request = json!({
+            "model": "m",
+            "instructions": "core",
+            "stream": true,
+            "tools": [{"type": "function", "name": "exec_command"}],
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]},
+                {"type": "compaction_trigger"},
+            ],
+        });
+        let rewritten = local_summary_request_body(&request);
+        assert!(
+            !super::request_has_compaction_trigger(&rewritten),
+            "trigger 必须剥干净，rewritten={rewritten}"
+        );
+        assert_eq!(rewritten["tools"], json!([]));
+        assert_eq!(rewritten["tool_choice"], json!("none"));
+        let last = rewritten["input"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], json!("user"));
+        assert!(
+            last["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("CONTEXT CHECKPOINT COMPACTION"),
+            "摘要指令必须落在末尾 user 项，rewritten={rewritten}"
+        );
+    }
+
+    /// 原请求体不许被降级改写污染（调用方还要拿原文做透传对照）。
+    #[test]
+    fn local_summary_body_leaves_source_untouched() {
+        let request = json!({
+            "input": [{"type": "compaction_trigger"}],
+            "tools": [{"type": "function", "name": "t"}],
+        });
+        let before = serde_json::to_string(&request).unwrap();
+        let _ = local_summary_request_body(&request);
+        assert_eq!(serde_json::to_string(&request).unwrap(), before);
+    }
+}
+
+/// 压缩轮流式观察器：旁路累计「有几个原生 compaction 项」「是否自报失败」「累计字节」，
+/// **不产出任何响应字节**——透传路径下发给客户端的字节必须与上游逐字节一致，
+/// 否则前缀钉定与深缓存全废。
+///
+/// 与 `NativeResponsesSseObserver` 的分工：那个守卫只认终止事件（判断这一轮算不算
+/// 成功），本观察器额外数出定稿的 compaction 项。两者都用「有界缓冲」，
+/// 因为压缩项的 encrypted_content 可以大到 MB 级，无界缓冲会让诊断内存失控。
+///
+/// 事件缓冲的两个上限：单事件 24 MiB、拼接文本 24 MiB（判据要求事件 JSON 能整体
+/// 解析，故定稿项必须完整入缓冲才计数）；`total_bytes` 的硬上限由调用方判。
+/// 超限一律走保守侧：数不出来就当作「没给出原生项」，由调用方显式收口，
+/// 绝不把无法验证的流宣布成成功。
+#[derive(Default)]
+pub struct CompactionItemTally {
+    buffer: String,
+    utf8_remainder: Vec<u8>,
+    /// 已完整事件的拼接文本（交给两条 SSE 判据复用，判据本体不改）。
+    observed: String,
+    total_bytes: usize,
+}
+
+const TALLY_EVENT_LIMIT: usize = 24 * 1024 * 1024;
+const TALLY_OBSERVED_LIMIT: usize = 24 * 1024 * 1024;
+
+impl CompactionItemTally {
+    /// 喂入上游的一个网络 chunk：按事件边界切块，完整块进观察文本。
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
+        while let Some(block) = take_sse_block(&mut self.buffer) {
+            if block.trim().is_empty() {
+                continue;
+            }
+            if block.len() > TALLY_EVENT_LIMIT || self.observed.len() >= TALLY_OBSERVED_LIMIT {
+                continue;
+            }
+            self.observed.push_str(&block);
+            self.observed.push_str("\n\n");
+        }
+    }
+
+    /// 流末尾若还剩半个事件，一并入观察文本：截断时那里往往正是唯一的终止事件。
+    pub fn flush_tail(&mut self) {
+        if self.buffer.trim().is_empty() {
+            return;
+        }
+        if self.buffer.len() <= TALLY_EVENT_LIMIT && self.observed.len() < TALLY_OBSERVED_LIMIT {
+            self.observed.push_str(&std::mem::take(&mut self.buffer));
+        } else {
+            self.buffer.clear();
+        }
+    }
+
+    /// 交给判据的观察文本。
+    pub fn observed_events(&self) -> &str {
+        &self.observed
+    }
+
+    /// 上游流累计字节（判上限用）。
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
+
+/// 本层自行判定为压缩轮的依据：路径或 trigger 二者其一。与转换层内部对 `compact`
+/// 的判定等价；这里单独导出一个纯函数，是因为压缩轮的**观察与降级**发生在
+/// `main.rs`，而转换层返回的 `compaction` 标记刻意只代表「合成摘要兼容路径」
+/// （Chat 方言），原生 Responses 方言的压缩轮在它眼里就是普通透传。
+pub fn is_compaction_round_request(path: &str, body: &Value) -> bool {
+    is_responses_compact_proxy_path(path) || request_has_compaction_trigger(body)
+}
+
 #[cfg(test)]
 mod native_compaction_probe_tests {
     use super::{
