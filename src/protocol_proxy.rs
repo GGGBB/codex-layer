@@ -1539,7 +1539,11 @@ pub enum CompactionRound {
     /// 上游已自带终止失败事件：原样透传，本层**不补**重复的 `response.failed`。
     UpstreamFailed,
     /// 其余形态（零项、超上限）：必须显式 `response.failed` 收口，不得静默半截流。
-    NeedsFailure { reason: &'static str },
+    /// `error_type` 是给收口帧的错误类型标签，`reason` 是人读的原因。
+    NeedsFailure {
+        reason: &'static str,
+        error_type: &'static str,
+    },
 }
 
 /// 三条判据的优先级：上限 > 上游自报失败 > 项数。
@@ -1552,6 +1556,7 @@ pub fn compaction_round_verdict(sse: &str, over_limit: bool) -> CompactionRound 
     if over_limit {
         return CompactionRound::NeedsFailure {
             reason: "压缩轮上游响应累计字节超过上限，按失败收口",
+            error_type: "compaction_over_limit",
         };
     }
     if upstream_has_terminal_failure(sse) {
@@ -1561,6 +1566,7 @@ pub fn compaction_round_verdict(sse: &str, over_limit: bool) -> CompactionRound 
         1 => CompactionRound::Native,
         _ => CompactionRound::NeedsFailure {
             reason: "上游未给出恰好一个原生 compaction 项",
+            error_type: "compaction_missing_item",
         },
     }
 }
@@ -1662,10 +1668,14 @@ mod native_compaction_assembly_tests {
             "event: response.completed\ndata: {{\"type\":\"response.completed\"}}\n\n"
         );
         assert_eq!(compaction_round_verdict(&one_item, false), CompactionRound::Native);
+        let over_limit = compaction_round_verdict(&one_item, true);
         assert!(matches!(
-            compaction_round_verdict(&one_item, true),
+            over_limit,
             CompactionRound::NeedsFailure { .. }
         ));
+        if let CompactionRound::NeedsFailure { error_type, .. } = over_limit {
+            assert_eq!(error_type, "compaction_over_limit");
+        }
     }
 
     /// 上游自报失败优先于「零项」：本层不补重复帧。
