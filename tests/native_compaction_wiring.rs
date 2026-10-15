@@ -76,8 +76,8 @@ async fn mock_upstream(
                 assert!(read > 0);
                 buffer.extend_from_slice(&chunk[..read]);
             }
-            let body =
-                String::from_utf8_lossy(&buffer[header_end..header_end + content_length]).to_string();
+            let body = String::from_utf8_lossy(&buffer[header_end..header_end + content_length])
+                .to_string();
             captured.push(serde_json::from_str(&body).expect("发往上游的应是合法 JSON"));
             stream.write_all(&response).await.unwrap();
         }
@@ -140,7 +140,10 @@ async fn post(port: u16, body: &Value) -> String {
     proxied
 }
 
-async fn spawn_proxy(upstream_addr: std::net::SocketAddr, log_path: &std::path::Path) -> (u16, ChildGuard) {
+async fn spawn_proxy(
+    upstream_addr: std::net::SocketAddr,
+    log_path: &std::path::Path,
+) -> (u16, ChildGuard) {
     let proxy_port = reserve_port();
     let config_path = log_path.with_extension("toml");
     std::fs::write(
@@ -206,8 +209,14 @@ async fn harness(responses: Vec<Vec<u8>>) -> Harness {
 /// 上游给恰好一个原生 compaction 项：逐字节透传，不得出现本地摘要命名空间。
 #[tokio::test]
 async fn native_compaction_item_passes_through_byte_for_byte() {
-    let upstream_body = format!("{}{}{}", created_event(), compaction_item_event(), completed_event());
-    let (port, _guard, _dir, log_path, _capture) = harness(vec![sse_response(&upstream_body)]).await;
+    let upstream_body = format!(
+        "{}{}{}",
+        created_event(),
+        compaction_item_event(),
+        completed_event()
+    );
+    let (port, _guard, _dir, log_path, _capture) =
+        harness(vec![sse_response(&upstream_body)]).await;
     let key = format!("native-passthrough-{}", std::process::id());
 
     let seen = post(port, &trigger_request(&key)).await;
@@ -289,7 +298,11 @@ async fn rejected_trigger_degrades_to_local_summary_once() {
     // 摘要阶段必须禁工具调用；tools 本身允许被稳定层回填成首轮那一份——
     // 回填的目的在于保住前缀（tools 整块变空会让历史折叠形态改变、前缀全弃），
     // 禁调用靠 tool_choice=none，不靠把 tools 抹掉。
-    assert_eq!(second["tool_choice"], json!("none"), "摘要阶段必须禁工具, second={second}");
+    assert_eq!(
+        second["tool_choice"],
+        json!("none"),
+        "摘要阶段必须禁工具, second={second}"
+    );
     assert_eq!(
         second["tools"],
         serde_json::to_value(&sent[0]["tools"]).unwrap(),
@@ -358,7 +371,10 @@ async fn upstream_self_reported_failure_gets_no_duplicate_frame() {
     let key = format!("self-failed-{}", std::process::id());
 
     let seen = post(port, &trigger_request(&key)).await;
-    assert!(seen.contains("上游自己失败了"), "上游失败原文应透传, got={seen}");
+    assert!(
+        seen.contains("上游自己失败了"),
+        "上游失败原文应透传, got={seen}"
+    );
     // 数「帧」而不是数字样：上游那一帧的 event: 行与 data 里的 type 都含该字样。
     assert_eq!(
         seen.matches("event: response.failed").count(),
@@ -407,7 +423,10 @@ async fn truncated_compaction_stream_still_gets_failure_frame() {
     let key = format!("truncated-{}", std::process::id());
 
     let seen = post(port, &trigger_request(&key)).await;
-    assert!(seen.contains(OPAQUE), "已给出的 opaque 应原样到达, got={seen}");
+    assert!(
+        seen.contains(OPAQUE),
+        "已给出的 opaque 应原样到达, got={seen}"
+    );
     assert!(
         seen.contains("response.failed"),
         "截断流必须显式失败收口，不得静默半截流, got={seen}"
