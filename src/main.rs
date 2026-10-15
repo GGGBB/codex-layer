@@ -41,8 +41,9 @@ use codex_layer::protocol_proxy::{
     self, ChatSseToResponsesConverter, CompactionItemTally, CompactionRound, CompactionSseConverter,
     ProxySessionHeaders, UpstreamWireApi, UpstreamProxyResponse, chat_completion_to_response,
     chat_completion_to_response_with_request, NativeResponsesSseObserver,
-    native_stream_failure_frame, is_audio_transcriptions_proxy_path,
-    is_chat_completions_proxy_path, is_compaction_round_request, is_image_edits_proxy_path,
+    native_stream_failure_frame, compaction_input_rejected, compaction_round_verdict,
+    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path,
+    is_compaction_round_request, is_image_edits_proxy_path, local_summary_request_body,
     is_image_generations_proxy_path, is_models_proxy_path, is_responses_proxy_path,
     open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
     open_image_edits_proxy_request, open_image_generations_proxy_request,
@@ -744,7 +745,8 @@ async fn responses_proxy(
         .to_string();
 
     // 上游配置来自启动时注入的运行时载体；这里只透传客户端上下文（UA、beta、会话头）。
-    let upstream = match open_responses_proxy_request_for_path_with_session_headers(
+    // mut 只为一处：压缩轮 4xx 判「上游拒绝 trigger」后要换成降级重发的回包。
+    let mut upstream = match open_responses_proxy_request_for_path_with_session_headers(
         body,
         user_agent,
         path,
@@ -756,17 +758,83 @@ async fn responses_proxy(
         Ok(upstream) => upstream,
         Err(error) => return proxy_conversion_error(path, &error, Some(&request_id)),
     };
+    // 压缩轮判定（issue 第 1 条）：路径或 trigger 任一命中即算压缩轮。转换层返回的
+    // `compaction` 标记刻意只代表 Chat 方言的合成摘要路径，原生 Responses 方言的
+    // 压缩轮在它眼里就是普通透传，所以这里必须自己认一次。
+    let compaction_round = request_json
+        .as_ref()
+        .is_some_and(|body| is_compaction_round_request(path, body));
+
     if !upstream.is_success() {
-        return match upstream_error(upstream, path, Some(&request_id)).await {
-            Ok(response) => response,
-            Err(error) => proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string()),
-        };
+        // 压缩轮的 4xx 必须先看到错误体：`compaction_input_rejected` 判真才是
+        // 降级（剥 trigger + 本地摘要）的唯一入口。5xx 一律不降级——上游自身故障
+        // 据此降级会把可重试故障悄悄变成行为改变；4xx 判假同样原样透传。
+        if compaction_round
+            && upstream.wire_api == UpstreamWireApi::Responses
+            && (400..500).contains(&upstream.status_code)
+        {
+            let status_code = upstream.status_code;
+            let content_type = upstream.content_type.clone();
+            let body = match upstream.response.bytes().await {
+                Ok(body) => body,
+                Err(error) => {
+                    return proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string());
+                }
+            };
+            let rejected = compaction_input_rejected(status_code, &String::from_utf8_lossy(&body));
+            let envelope = responses_error_from_upstream(status_code, &content_type, &body);
+            log_event(
+                events::layer::UPSTREAM_ERROR,
+                json!({ "path": path, "statusCode": status_code, "message": envelope, "requestId": request_id }),
+            );
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            let Some(original) = request_json.as_ref().filter(|_| rejected) else {
+                // 判假：错误原样交给客户端，本层不猜上游的意图。
+                return json_response(status, envelope);
+            };
+            log_event(
+                events::proxy::STABILIZER_COMPACTION_APPENDED,
+                json!({ "degradedToLocalSummary": true, "upstreamStatus": status_code }),
+            );
+            // 降级只重发一次，不做重试环（本仓库单上游线性流程）。
+            let degraded_body = local_summary_request_body(original).to_string();
+            upstream = match open_responses_proxy_request_for_path_with_session_headers(
+                &degraded_body,
+                user_agent,
+                path,
+                beta_features,
+                session_headers,
+            )
+            .await
+            {
+                Ok(upstream) => upstream,
+                Err(error) => {
+                    return proxy_conversion_error(path, &error, Some(&request_id));
+                }
+            };
+            if !upstream.is_success() {
+                // 降级轮自己又失败：错误原样透传，不再降级、不再重试。
+                return match upstream_error(upstream, path, Some(&request_id)).await {
+                    Ok(response) => response,
+                    Err(error) => proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string()),
+                };
+            }
+            // trigger 已被剥掉，转换层不会再给出 compaction 标记；这里显式置位，
+            // 让降级轮继续走既有的合成摘要机器，产出客户端唯一认得的
+            // `codexlayer:summary:v1:` 命名空间项。
+            upstream.compaction = true;
+        } else {
+            return match upstream_error(upstream, path, Some(&request_id)).await {
+                Ok(response) => response,
+                Err(error) => proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string()),
+            };
+        }
     }
 
     if upstream.is_stream {
         log_event(
             events::layer::STREAM_OPEN,
-            json!({ "path": path, "wireApi": format!("{:?}", upstream.wire_api), "compaction": upstream.compaction, "requestId": request_id.clone() }),
+            json!({ "path": path, "wireApi": format!("{:?}", upstream.wire_api), "compaction": compaction_round || upstream.compaction, "requestId": request_id.clone() }),
         );
         return sse_response(stream_from_upstream(
             upstream,
@@ -774,6 +842,7 @@ async fn responses_proxy(
             model,
             request_id,
             drain,
+            compaction_round,
         ));
     }
 
@@ -781,6 +850,11 @@ async fn responses_proxy(
         Ok(bytes) => bytes,
         Err(error) => return proxy_error(path, StatusCode::BAD_GATEWAY, &error.to_string()),
     };
+    // 原生 Responses 方言的压缩轮（非流式）：先重组再判，判据过关就**逐字节透传**
+    // 上游 JSON，不再用本地摘要冒充上游状态。Chat 方言与降级轮走下面的合成分支。
+    if compaction_round && !upstream.compaction && upstream.wire_api == UpstreamWireApi::Responses {
+        return non_stream_native_compaction_response(upstream_body, upstream.content_type, &request_id);
+    }
     if upstream.compaction {
         // 压缩轮非流式：无论上游方言，都重组为恰好一个 compaction 输出项。
         match wrap_non_stream_response_as_compaction(&upstream_body, &model) {
@@ -888,6 +962,90 @@ async fn chat_completions_proxy(
     }
 }
 
+/// 原生 Responses 方言的**非流式**压缩轮回包处置。
+///
+/// 顺序：判上限 → 重组 → 交给 `compaction_round_verdict`（判据本体不改）。
+/// 三种结论各自的下发形态：
+/// - `Native`：上游 JSON 逐字节透传，Content-Type 沿用上游。本层不重组、不改写、
+///   不补帧——上游给的原生压缩状态是唯一能被客户端回放的东西。
+/// - `UpstreamFailed`：同样透传，**不补**本地失败帧；上游 JSON 里自带 failed/incomplete
+///   终态，客户端手里已有显式终止信号。
+/// - `NeedsFailure`：下发 SSE `response.failed` 收口帧。绝不把「上游没给出压缩项」的
+///   响应交给客户端当成功，否则会话会静默丢掉上下文。
+///
+/// 重组失败（JSON 都解析不出，例如网关回了 HTML）按 `NeedsFailure` 处理：读不出结构
+/// 就无权宣布这一轮成功。
+fn non_stream_native_compaction_response(
+    body: Bytes,
+    content_type: String,
+    request_id: &str,
+) -> Response {
+    let over_limit = body.len() > MAX_COMPACTION_RESPONSE_BYTES;
+    let reassembled = responses_json_to_sse_events(&body);
+    let observed = reassembled.as_deref().unwrap_or("");
+    let verdict = if reassembled.is_none() {
+        CompactionRound::NeedsFailure {
+            reason: "上游非流式响应不是可解析的 Responses JSON，无法确认原生压缩项",
+            error_type: "compaction_unparsable_body",
+        }
+    } else {
+        compaction_round_verdict(observed, over_limit)
+    };
+    match verdict {
+        CompactionRound::Native => {
+            log_event(
+                events::proxy::STABILIZER_COMPACTION_APPENDED,
+                json!({ "nativePassedThrough": true, "stream": false, "bytes": body.len() }),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    if content_type.is_empty() {
+                        "application/json; charset=utf-8".to_string()
+                    } else {
+                        content_type
+                    },
+                )
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(body))
+                .unwrap()
+        }
+        CompactionRound::UpstreamFailed => {
+            log_event(
+                events::layer::STREAM_FAILED,
+                json!({ "reason": "上游非流式压缩轮自报终止失败，原样透传不补帧", "requestId": request_id, "compaction": true }),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    if content_type.is_empty() {
+                        "application/json; charset=utf-8".to_string()
+                    } else {
+                        content_type
+                    },
+                )
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(body))
+                .unwrap()
+        }
+        CompactionRound::NeedsFailure { reason, error_type } => {
+            log_event(
+                events::layer::STREAM_FAILED,
+                json!({ "reason": reason, "requestId": request_id, "compaction": true }),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .body(Body::from(native_stream_failure_frame(reason, error_type)))
+                .unwrap()
+        }
+    }
+}
+
 /// 把上游回包变成一条 Responses 事件流：压缩轮、Responses 方言、Chat 方言三条分支。
 fn stream_from_upstream(
     upstream: UpstreamProxyResponse,
@@ -895,10 +1053,14 @@ fn stream_from_upstream(
     model: String,
     request_id: String,
     drain: DrainState,
+    compaction_round: bool,
 ) -> impl futures_util::Stream<Item = StreamItem> + Send + 'static {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let wire_api = upstream.wire_api;
     let response = upstream.response;
+    // 原生方言的压缩轮：合成摘要分支（upstream.compaction）优先，那条路是
+    // Chat 方言与降级轮的既有机器；这里只管「原生透传 + 旁路数项」。
+    let native_compaction = compaction_round && !upstream.compaction;
     tokio::spawn(async move {
         // 后面每个诊断事件只借用一次：影子绑定成 &str，json! 序列化时各自复制。
         let request_id = request_id.as_str();
@@ -960,6 +1122,9 @@ fn stream_from_upstream(
             // 守卫要解决的是「上游在完成事件前断流」：原样转发时客户端只看到连接关闭，
             // 分不清正常结束还是半途而废，所以收口时由本层补一帧显式 response.failed。
             let mut observer = NativeResponsesSseObserver::default();
+            let mut tally = CompactionItemTally::default();
+            // 超限后停止转发：继续下发只会让客户端拿到一段注定要按失败收口的残缺流。
+            let mut over_limit = false;
             let mut drained = false;
             loop {
                 let next = tokio::select! {
@@ -973,6 +1138,16 @@ fn stream_from_upstream(
                 match chunk {
                     Ok(bytes) => {
                         observer.push_bytes(&bytes);
+                        if native_compaction {
+                            tally.push_bytes(&bytes);
+                            if tally.total_bytes() > MAX_COMPACTION_RESPONSE_BYTES {
+                                over_limit = true;
+                                continue;
+                            }
+                        }
+                        if over_limit {
+                            continue;
+                        }
                         if tx.send(Ok(bytes)).is_err() {
                             // 客户端已经断开：没有接收方，补帧无意义，直接收工。
                             return;
@@ -997,6 +1172,38 @@ fn stream_from_upstream(
                         let item: StreamItem =
                             Err(Box::new(error) as Box<dyn StdError + Send + Sync>);
                         let _ = tx.send(item);
+                        return;
+                    }
+                }
+            }
+            if native_compaction && !drained {
+                // 压缩轮流式收口：三条判据决定「已透传的字节算不算成功」。
+                // 成功与「上游自报失败」都不补帧（字节已经逐字节透传完了）；
+                // 其余形态必须补一帧显式 response.failed，绝不静默半截流。
+                tally.flush_tail();
+                match compaction_round_verdict(tally.observed_events(), over_limit) {
+                    CompactionRound::Native => {
+                        // 项数过关不等于这一轮成功：还必须有完成事件。这里**不提前 return**，
+                        // 交给下方的原生守卫收口——截断流（有项但无 response.completed）
+                        // 照样补显式失败帧，绝不静默半截流；完整的流守卫会判成正常完成。
+                        log_event(
+                            events::proxy::STABILIZER_COMPACTION_APPENDED,
+                            json!({ "nativePassedThrough": true, "stream": true, "bytes": tally.total_bytes() }),
+                        );
+                    }
+                    CompactionRound::UpstreamFailed => {
+                        log_event(
+                            events::layer::STREAM_FAILED,
+                            json!({ "reason": "上游压缩流自报终止失败，不补重复帧", "requestId": request_id, "compaction": true }),
+                        );
+                        return;
+                    }
+                    CompactionRound::NeedsFailure { reason, error_type } => {
+                        let _ = tx.send(Ok(Bytes::from(native_stream_failure_frame(reason, error_type))));
+                        log_event(
+                            events::layer::STREAM_FAILED,
+                            json!({ "reason": reason, "requestId": request_id, "compaction": true }),
+                        );
                         return;
                     }
                 }
