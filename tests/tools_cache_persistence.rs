@@ -34,9 +34,7 @@ fn reserve_port() -> u16 {
 }
 
 /// 假的原生 Responses 上游：服务 n 次 SSE 正常收口，抓取发往上游的完整报文。
-async fn mock_responses_upstream(
-    n: usize,
-) -> (SocketAddr, tokio::task::JoinHandle<Vec<Value>>) {
+async fn mock_responses_upstream(n: usize) -> (SocketAddr, tokio::task::JoinHandle<Vec<Value>>) {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = upstream.local_addr().unwrap();
     let handle = tokio::spawn(async move {
@@ -73,8 +71,8 @@ async fn mock_responses_upstream(
                 assert!(read > 0);
                 buffer.extend_from_slice(&chunk[..read]);
             }
-            let body =
-                String::from_utf8_lossy(&buffer[header_end..header_end + content_length]).to_string();
+            let body = String::from_utf8_lossy(&buffer[header_end..header_end + content_length])
+                .to_string();
             captured.push(serde_json::from_str(&body).expect("发往上游的应是合法 JSON"));
             stream.write_all(sse.as_bytes()).await.unwrap();
         }
@@ -139,17 +137,15 @@ fn read_log_lines(path: &std::path::Path) -> Vec<Value> {
         .unwrap()
         .read_to_string(&mut text)
         .unwrap();
-    text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
 }
 
 /// 起一个独立进程实例：临时配置 / 临时日志各用一份，但**缓存路径两轮共用**
 /// （跨重启存活的契约就落在这一个文件上）。`CODEX_LAYER_HOME` 与缓存路径都
 /// 经环境变量指向临时目录——真实状态目录一个字节都不碰。
-fn spawn_proxy(
-    upstream_addr: SocketAddr,
-    dir: &std::path::Path,
-    label: &str,
-) -> (u16, ChildGuard) {
+fn spawn_proxy(upstream_addr: SocketAddr, dir: &std::path::Path, label: &str) -> (u16, ChildGuard) {
     let proxy_port = reserve_port();
     let config_path = dir.join(format!("config-{label}.toml"));
     let log_path = dir.join(format!("log-{label}.jsonl"));
