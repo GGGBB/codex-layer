@@ -36,10 +36,12 @@ async fn mock_responses_upstream(
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = upstream.local_addr().unwrap();
     let handle = tokio::spawn(async move {
+        // 终帧必须带可见正文条目：空 output 的 completed 正是空终帧护栏的
+        // 触发形态（issue #83），本测试测的是稳定层可见性，不该顺手点燃护栏。
         let sse = concat!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n",
             "event: response.created\n\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n",
-            "event: response.completed\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n",
+            "event: response.completed\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n",
         );
         let mut captured = Vec::new();
         for _ in 0..n {

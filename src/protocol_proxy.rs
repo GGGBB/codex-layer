@@ -1426,6 +1426,16 @@ impl NativeResponsesSseObserver {
         }
     }
 
+    /// 护栏重开一轮：收口证据只认当前轮的事件。上一轮的 completed 已被扣帧
+    /// 丢弃（永不门），留着它会把「重发轮半途断流」误判成已完成，客户端将
+    /// 收不到任何终帧——红线所在。未读完的事件前缀照常保留，跨重开边界的
+    /// 残帧续读，不重复计入。
+    pub fn begin_retry(&mut self) {
+        self.completed = false;
+        self.failure = None;
+        self.unclassified_large_event = false;
+    }
+
     /// 上游是否已自带终止失败事件（failed / incomplete / error）。
     /// 装配点用它判定「还要不要向客户端补一帧」：上游自己已经宣告失败的流，客户端手里
     /// 已有显式终止信号，再补一帧只是重复噪音；而什么都没发过的流必须由本层补，
@@ -1469,6 +1479,476 @@ pub fn native_stream_failure_frame(message: &str, error_type: &str) -> String {
     );
     output
 }
+
+/// 原生透传护栏的单事件可判定上限：超过即整轮退化为原样透传、不再判定。
+/// 上限与观察侧前缀上限同源——reasoning 摘要、图片 Base64 这类大 payload
+/// 可能整段落在一个事件里，判定器不许为此无界缓冲。
+const NATIVE_GUARD_EVENT_LIMIT: usize = 2 * 1024 * 1024;
+
+/// 原生 Responses 透传支路的空终帧护栏：在**事件边界**上缓冲上游字节，判定
+/// 本轮 `response.completed` 是否静默（判据与 Chat 方言共用
+/// `native_response_is_silent` 本体）。静默则把终帧扣下（连同其后已到字节），
+/// 装配层拿到「扣帧」信号后走重发决策；重发轮的条目事件按位移改写、终帧合并
+/// 改写，续排在同一条客户端事件流里，响应身份全程回填为首轮 id。
+///
+/// 兼容口径（PR 正文同步声明）：护栏开启后，原生透传从「chunk 原样」变为
+/// 「事件边界对齐下发」。SSE 事件本就以空行为完整边界，客户端解析器按事件
+/// 消费，不依赖 TCP chunk 切分——这是本层既有「事件完整性」假设的显式化。
+///
+/// 四条红线：
+/// 1. 扣帧状态下后到的字节全部并入暂存区，`release_deferred` 原样吐回，
+///    绝不静默断流；
+/// 2. 判定读不出结构一律按非静默放行（宁可不护，不可误护）；
+/// 3. 上游自报 failed / incomplete / error 的事件不拦不改，原样放行；
+/// 4. 装配层的观察者始终看上游**原始字节**，补帧判定不受改写影响。
+#[derive(Default)]
+pub struct NativeResponsesGuard {
+    enabled: bool,
+    /// 超限退化位：置位后本流永久直通（护栏失能，收口机器照常）。
+    disabled_for_stream: bool,
+    /// 尚未处理的原始字节（事件边界对齐前的残留）。
+    buffer: Vec<u8>,
+    /// 边界扫描的水位线：同一残段不反复重扫，流式吞吐不随缓冲长度退化。
+    scan_from: usize,
+    /// 已进行的轮次（0 为首轮）。begin_retry 递增；首轮与改写轮的行为分岔点。
+    round: usize,
+    /// 首轮 created/in_progress 事件里的 response id：改写轮一律回填成它，
+    /// 客户端全程只认一个响应身份。
+    first_response_id: Option<String>,
+    /// 被丢弃轮的输出条目：终帧合并时垫在前面，保证客户端最终看到的 output
+    /// 数组与已流式下发过的条目一致（位移量即其长度）。
+    carried_items: Vec<Value>,
+    /// 扣下的终帧及其后到达的全部字节。`Some` 即「装配层该走重发决策了」。
+    deferred: Option<Vec<u8>>,
+    /// 被丢弃轮的 usage 聚合，供诊断事件记账：白烧的 reasoning token 恰是
+    /// 本问题最该被盯住的数字。
+    dropped_usage: Option<Value>,
+}
+
+impl NativeResponsesGuard {
+    /// 开关由装配层控制（它才知道重发通道、请求体与本轮是不是压缩轮），
+    /// 护栏只照开关行事——与 Chat 方言的 `set_guard_enabled` 同一分工。
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// 是否正扣着终帧。true 时装配层必须走重发决策：重开、或放行扣帧收口。
+    pub fn deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    /// 是否已进入改写轮（至少丢弃过一个终帧）。仅用于诊断表述。
+    pub fn rewriting(&self) -> bool {
+        self.round > 0
+    }
+
+    /// 被丢弃轮的 usage 聚合（无则 None）。
+    pub fn dropped_usage(&self) -> Option<&Value> {
+        self.dropped_usage.as_ref()
+    }
+
+    /// 放行扣帧字节：暂存内容与缓冲残留原样返回，一个字节不改。
+    /// 放弃重试、重发失败、关停排空都必须走这里收口——客户端宁可收到一帧
+    /// 静默 completed，也绝不收到「无终帧」的断流。
+    pub fn release_deferred(&mut self) -> Vec<u8> {
+        let mut out = self.deferred.take().unwrap_or_default();
+        out.append(&mut self.buffer);
+        self.scan_from = 0;
+        out
+    }
+
+    /// 丢弃扣下的终帧，进入下一轮：轮次递增、暂存清空。被丢轮的条目与 usage
+    /// 已在扣帧判定时入账（见 `handle_event` 的 Completed 分支），这里不许
+    /// 再记一遍。
+    pub fn begin_retry(&mut self) {
+        if self.deferred.take().is_none() {
+            return;
+        }
+        self.round += 1;
+        self.scan_from = 0;
+    }
+
+    /// 上游本轮的位移量：已垫入的条目数。溢出时返回 None，改写处宁缺毋滥。
+    fn index_offset(&self) -> Option<u32> {
+        u32::try_from(self.carried_items.len()).ok()
+    }
+
+    /// 喂入上游字节，返回此刻可以下发给客户端的字节。
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if !self.enabled || self.disabled_for_stream {
+            return bytes.to_vec();
+        }
+        // 红线 1：扣帧状态下后到字节并入暂存区，等待放行或重开裁决。
+        if let Some(deferred) = self.deferred.as_mut() {
+            deferred.extend_from_slice(bytes);
+            self.buffer.clear();
+            self.scan_from = 0;
+            return Vec::new();
+        }
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() > NATIVE_GUARD_EVENT_LIMIT {
+            // 迟迟等不到事件边界的巨量字节：整段原样放行并永久失能。
+            // 观察者照常旁路读原始字节，收口补帧机器不受影响。
+            self.disabled_for_stream = true;
+            self.scan_from = 0;
+            return std::mem::take(&mut self.buffer);
+        }
+        let mut output = Vec::new();
+        while let Some(boundary) = self.take_boundary() {
+            let raw = &self.buffer[..boundary];
+            let Some(event) = classify_native_event(raw) else {
+                // 读不出任何已知形态（含非 UTF-8）：原样放行，绝不猜测。
+                output.extend_from_slice(&self.drain_event(boundary));
+                continue;
+            };
+            match self.handle_event(&event, boundary) {
+                EventAction::Forward => {
+                    output.extend_from_slice(&self.drain_event(boundary));
+                }
+                EventAction::Drop => {
+                    self.drain_event(boundary);
+                }
+                EventAction::Rewrite { bytes: rebuilt } => {
+                    self.drain_event(boundary);
+                    output.extend_from_slice(&rebuilt);
+                }
+                EventAction::Defer { bytes } => {
+                    // 扣帧：终帧（原始或合并改写形态）连同其后的全部残留进
+                    // 暂存区，本轮处理终止。
+                    let rest = self.buffer.split_off(boundary);
+                    let mut deferred = match bytes {
+                        Some(bytes) => {
+                            self.buffer.clear();
+                            self.scan_from = 0;
+                            bytes
+                        }
+                        None => std::mem::replace(&mut self.buffer, Vec::new()),
+                    };
+                    deferred.extend_from_slice(&rest);
+                    self.deferred = Some(deferred);
+                    self.scan_from = 0;
+                    return output;
+                }
+            }
+        }
+        output
+    }
+
+    /// 从当前缓冲里找下一个事件边界，返回含分隔符的帧长；同步推进扫描水位。
+    fn take_boundary(&mut self) -> Option<usize> {
+        let start = self.scan_from.min(self.buffer.len());
+        let mut lf = None;
+        let mut crlf = None;
+        if let Some(pos) = self.buffer[start..].windows(2).position(|w| w == b"\n\n") {
+            lf = Some(start + pos + 2);
+        }
+        if let Some(pos) = self.buffer[start..].windows(4).position(|w| w == b"\r\n\r\n") {
+            crlf = Some(start + pos + 4);
+        }
+        let boundary = match (lf, crlf) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                // 无边界：水位退到尾部 3 字节，防跨 push 的 `\n\n` 被漏看。
+                self.scan_from = self.buffer.len().saturating_sub(3);
+                return None;
+            }
+        };
+        self.scan_from = boundary;
+        Some(boundary)
+    }
+
+    /// 从缓冲头部摘走一个完整帧（含分隔符）并返回其字节。
+    fn drain_event(&mut self, boundary: usize) -> Vec<u8> {
+        let rest = self.buffer.split_off(boundary);
+        let event = std::mem::replace(&mut self.buffer, rest);
+        self.scan_from = 0;
+        event
+    }
+
+    fn handle_event(&mut self, event: &NativeEventInfo, boundary: usize) -> EventAction {
+        let oversized = boundary > NATIVE_GUARD_EVENT_LIMIT;
+        match event.kind {
+            NativeEventKind::Created | NativeEventKind::InProgress => {
+                if oversized {
+                    return EventAction::Forward;
+                }
+                if self.round == 0 {
+                    if self.first_response_id.is_none() {
+                        self.first_response_id = event.response_id().map(str::to_string);
+                    }
+                    EventAction::Forward
+                } else {
+                    // 改写轮的身份事件（含重复 created）：客户端已见过身份，丢弃。
+                    if self.first_response_id.is_none() {
+                        self.first_response_id = event.response_id().map(str::to_string);
+                    }
+                    EventAction::Drop
+                }
+            }
+            NativeEventKind::Completed => {
+                if oversized {
+                    // 巨帧无法判定：放行等于本轮不护，但绝不误伤成断流。
+                    return EventAction::Forward;
+                }
+                let silent = event
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("response"))
+                    .is_some_and(|resp| native_response_is_silent(resp));
+                if self.round == 0 {
+                    if silent {
+                        // 扣帧即入账：装配层在重发决策点就要拿到被丢轮的账，
+                        // 条目同步垫入基底（首轮无基底，合并帧与原始帧同形）。
+                        self.record_dropped_usage(event_response_field(event, "usage"));
+                        if let Some(items) =
+                            event_response_field(event, "output").and_then(Value::as_array)
+                        {
+                            self.carried_items.extend(items.iter().cloned());
+                        }
+                        EventAction::Defer { bytes: None }
+                    } else {
+                        EventAction::Forward
+                    }
+                } else {
+                    let Some(payload) = event.payload.clone() else {
+                        return EventAction::Forward;
+                    };
+                    let mut merged = payload;
+                    rewrite_completed_payload(
+                        &mut merged,
+                        &self.carried_items,
+                        self.first_response_id.as_deref(),
+                    );
+                    let still_silent = merged
+                        .get("response")
+                        .is_some_and(|resp| native_response_is_silent(resp));
+                    if still_silent {
+                        // 扣帧即入账（usage 取原始 payload：合并帧会把已入账轮
+                        // 算两遍）；本轮条目垫入基底，供下一轮继续续排。
+                        self.record_dropped_usage(event_response_field(event, "usage"));
+                        if let Some(items) =
+                            event_response_field(event, "output").and_then(Value::as_array)
+                        {
+                            self.carried_items.extend(items.iter().cloned());
+                        }
+                        // 暂存区收合并改写帧：放弃重试时放行的也是它——客户端
+                        // 已按位移收过本轮增量事件，原始轮帧会对不上账。
+                        EventAction::Defer {
+                            bytes: Some(rebuild_sse_event(event, &merged)),
+                        }
+                    } else {
+                        EventAction::Rewrite {
+                            bytes: rebuild_sse_event(event, &merged),
+                        }
+                    }
+                }
+            }
+            // 红线 3：上游自报失败不拦不改，装配层的补帧判定照常接管。
+            NativeEventKind::TerminalFailure => EventAction::Forward,
+            NativeEventKind::Done => {
+                // [DONE] 永不会先于终帧出门：事件按到达顺序处理，同缓冲时它
+                // 必在 completed 之后；若本轮判成静默扣帧，它落进暂存区随终帧
+                // 一起走（重试时被丢轮连带丢弃，放行时原序吐回）。
+                EventAction::Forward
+            }
+            NativeEventKind::Other => {
+                if oversized || self.round == 0 {
+                    return EventAction::Forward;
+                }
+                match shift_event_output_indices(event, self.index_offset()) {
+                    Some(shifted) => EventAction::Rewrite {
+                        bytes: rebuild_sse_event(event, &shifted),
+                    },
+                    None => EventAction::Forward,
+                }
+            }
+        }
+    }
+
+    /// 被丢弃轮 usage 的累加：只加 reasoning/total 两口径。丢掉的轮不产出
+    /// 交付，但白烧的 token 必须可见。
+    fn record_dropped_usage(&mut self, usage: Option<&Value>) {
+        accumulate_dropped_usage(&mut self.dropped_usage, usage);
+    }
+}
+
+/// 被丢弃轮 usage 的累加本体：只加 reasoning/total 两口径。丢掉的轮不产出
+/// 交付，但白烧的 token 必须可见；两套方言的护栏共用这一条记账。
+fn accumulate_dropped_usage(accumulated: &mut Option<Value>, usage: Option<&Value>) {
+    let Some(usage) = usage.filter(|usage| usage.is_object()) else {
+        return;
+    };
+    let accumulated = accumulated.get_or_insert_with(|| json!({}));
+    for key in ["reasoning_tokens", "total_tokens"] {
+        let add = usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get(key))
+            .or_else(|| usage.get(key))
+            .and_then(Value::as_u64);
+        let Some(add) = add else { continue };
+        let current = accumulated
+            .get(key)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        accumulated[key] = json!(current.saturating_add(add));
+    }
+}
+
+/// 一个已对齐事件的读后形态：event 行、解析出的 payload、事件类别、
+/// 帧尾分隔符形态（重建时保持原样，CRLF 与 LF 不互换）。
+struct NativeEventInfo {
+    event_name: Option<String>,
+    payload: Option<Value>,
+    kind: NativeEventKind,
+    ends_with_crlf: bool,
+}
+
+enum NativeEventKind {
+    Created,
+    InProgress,
+    Completed,
+    TerminalFailure,
+    Done,
+    Other,
+}
+
+impl NativeEventInfo {
+    /// 事件 payload 里的 response id（`response.id` 优先，顶层 `id` 兜底）。
+    fn response_id(&self) -> Option<&str> {
+        let payload = self.payload.as_ref()?;
+        payload
+            .get("response")
+            .and_then(|resp| resp.get("id"))
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("id").and_then(Value::as_str))
+    }
+}
+
+enum EventAction {
+    Forward,
+    Drop,
+    Rewrite { bytes: Vec<u8> },
+    /// `bytes` 为 `Some` 时用改写后的终帧入暂存区（改写轮放行必须拿到合并帧），
+    /// `None` 时按事件原始字节扣帧（首轮的原始字节与合并帧同形）。
+    Defer { bytes: Option<Vec<u8>> },
+}
+
+/// 把一个原始事件块读成 `NativeEventInfo`。返回 `None` 表示连 UTF-8 都不是，
+/// 调用方必须原样透传（护栏对不可读字节零动作）。
+fn classify_native_event(raw: &[u8]) -> Option<NativeEventInfo> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let event_name = text
+        .lines()
+        .find_map(|line| strip_sse_field(line, "event"))
+        .map(str::trim)
+        .map(str::to_string);
+    let data = text
+        .lines()
+        .filter_map(|line| strip_sse_field(line, "data"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let payload = if data.is_empty() {
+        None
+    } else {
+        serde_json::from_str::<Value>(&data).ok()
+    };
+    // 事件类别判定与观察侧同口径：payload 顶层 type 优先，event 行兜底。
+    let type_name = payload
+        .as_ref()
+        .and_then(|parsed| parsed.get("type").and_then(Value::as_str))
+        .or(event_name.as_deref());
+    let kind = if !data.is_empty() && data.trim() == "[DONE]" {
+        NativeEventKind::Done
+    } else {
+        match type_name {
+            Some("response.created") => NativeEventKind::Created,
+            Some("response.in_progress") => NativeEventKind::InProgress,
+            Some("response.completed") => NativeEventKind::Completed,
+            Some("response.failed") | Some("response.incomplete") | Some("error") => {
+                NativeEventKind::TerminalFailure
+            }
+            _ => NativeEventKind::Other,
+        }
+    };
+    Some(NativeEventInfo {
+        event_name,
+        payload,
+        kind,
+        ends_with_crlf: raw.ends_with(b"\r\n\r\n"),
+    })
+}
+
+/// 读事件 payload 里 `response` 对象的一个字段（护栏只在 completed 判定处用）。
+fn event_response_field<'a>(event: &'a NativeEventInfo, field: &str) -> Option<&'a Value> {
+    event
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("response"))
+        .and_then(|resp| resp.get(field))
+}
+
+/// 改写轮的终帧合并：本轮 output 条目按全局位移垫到 carried 之后，
+/// response.id 回填为首轮身份。位移写进每个条目的 `output_index`，
+/// 与已流式下发过的条目序号衔接。
+fn rewrite_completed_payload(payload: &mut Value, carried: &[Value], first_id: Option<&str>) {
+    let Some(response) = payload.get_mut("response") else {
+        return;
+    };
+    if let Some(id) = first_id {
+        response["id"] = json!(id);
+    }
+    let own: Vec<Value> = response
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut merged = carried.to_vec();
+    for (pos, item) in own.into_iter().enumerate() {
+        let mut item = item;
+        // 只在条目自带 output_index 时位移：数组位置本身就是全局序号，
+        // 上游没写的字段不许替它发明。
+        if item.get("output_index").is_some()
+            && let Some(index) = shifted_index(carried.len(), pos)
+        {
+            item["output_index"] = json!(index);
+        }
+        merged.push(item);
+    }
+    response["output"] = json!(merged);
+}
+
+/// carried 长度 + 轮内序号 → 位移后的全局 index（u32 溢出时不写，宁缺毋滥）。
+fn shifted_index(carried_len: usize, pos: usize) -> Option<u32> {
+    u32::try_from(carried_len.saturating_add(pos)).ok()
+}
+
+/// 改写轮的增量事件位移：顶层 `output_index` 抬到位移量。payload 缺失、
+/// 没有顶层 index、或位移量溢出——一律返回 None 走原样放行。
+fn shift_event_output_indices(event: &NativeEventInfo, offset: Option<u32>) -> Option<Value> {
+    let offset = offset?;
+    let mut shifted = event.payload.clone()?;
+    let top = shifted.get_mut("output_index")?;
+    *top = json!(offset);
+    Some(shifted)
+}
+
+/// 用改写后的 payload 重建事件块，保持原始的事件边界字节形态（CRLF 或 LF）。
+fn rebuild_sse_event(event: &NativeEventInfo, payload: &Value) -> Vec<u8> {
+    let separator = if event.ends_with_crlf { "\r\n\r\n" } else { "\n\n" };
+    let mut out = String::new();
+    if let Some(name) = &event.event_name {
+        out.push_str("event: ");
+        out.push_str(name);
+        out.push('\n');
+    }
+    out.push_str("data: ");
+    out.push_str(&serde_json::to_string(payload).unwrap_or_default());
+    out.push_str(separator);
+    out.into_bytes()
+}
+
 
 /// Responses 非流式 JSON 重组为 SSE 事件文本。
 ///
@@ -2703,6 +3183,12 @@ impl ChatSseToResponsesConverter {
         self.state.begin_retry_attempt();
     }
 
+    /// 被丢弃轮的 usage 聚合（无则 None）。诊断事件 `empty_frame_retry` 靠它
+    /// 记账：丢掉的轮不产出交付，但白烧的 token 必须可见。
+    pub fn dropped_usage(&self) -> Option<&Value> {
+        self.state.dropped_usage.as_ref()
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
@@ -2784,6 +3270,12 @@ impl ChatSseToResponsesConverter {
             return;
         }
         if self.state.empty_final_frame() {
+            // 白烧的 reasoning token 在扣帧这一刻就进诊断账：retry 事件在重发
+            // 决策点出门（早于重开成功），账必须先行，否则事件只能带 null。
+            accumulate_dropped_usage(
+                &mut self.state.dropped_usage,
+                self.state.latest_usage.as_ref(),
+            );
             self.deferred_terminal = Some(scratch);
         } else {
             output.push_str(&scratch);
@@ -2795,10 +3287,40 @@ impl ChatSseToResponsesConverter {
 /// 上限存在的意义是让「模型反复静默」的病态循环有代价上界，而不是无限重放。
 pub const EMPTY_FRAME_MAX_RETRIES: usize = 2;
 
-/// 第二次重试的推动文案：同体重采样（第一次重试）可能再次静默，第二次在
-/// `input` 尾部显式要求「可见正文或工具调用」。只拼进重发请求，客户端历史里
-/// 不会出现这条消息。
-pub const EMPTY_FRAME_NUDGE_TEXT: &str = "系统提示：你上一段输出只包含思考内容，既无正文回复也无工具调用，会话因此被自动结束。请现在立即行动：要么给出面向用户的正文，要么发起必要的工具调用；不允许再次只输出思考内容。";
+/// 第二次重试推动文案（中文形态）。两条约束来自审查定档：
+/// - 不得含「会话被自动结束」这类元叙述——那是把中继内部机制塞进模型上下文；
+/// - 必须显式禁止复述本条提示——推动项以 user 消息注入，防被当成用户指令回显。
+const EMPTY_FRAME_NUDGE_TEXT_ZH: &str =
+    "请立即行动：直接给出面向用户的正文，或发起必要的工具调用。不要只输出思考内容，也不要提及或复述本条提示。";
+const EMPTY_FRAME_NUDGE_TEXT_EN: &str =
+    "Act now: produce the visible answer for the user or call the necessary tools. Do not emit thinking only, and do not mention or repeat this note.";
+
+/// 本层推动项的识别标记：推动文案的尾部含此标记，注入前会先剥除历史同类项，
+/// 防止被污染的会话历史里推动消息跨轮累积。
+const EMPTY_FRAME_NUDGE_MARK: &str = "[relay-empty-frame-nudge]";
+
+/// 推动文案语言选择：从请求尾部向前扫一段，有 CJK 即判中文会话，否则英文。
+/// 只看尾部是因为推动文案只与「用户最近的话」同屏；语言不会在一条会话里
+/// 隔 2K 字符突变，扫描预算定在尾部 2048 字符。
+fn nudge_text_for(request_json: &Value) -> &'static str {
+    let is_cjk = |c: char| {
+        matches!(
+            c as u32,
+            0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+        )
+    };
+    if request_json
+        .to_string()
+        .chars()
+        .rev()
+        .take(2048)
+        .any(is_cjk)
+    {
+        EMPTY_FRAME_NUDGE_TEXT_ZH
+    } else {
+        EMPTY_FRAME_NUDGE_TEXT_EN
+    }
+}
 
 /// 空终帧护栏的判据本体（纯函数）：finalize 后的「completed」终帧是不是
 /// 静默帧——没有任何工具调用项、也没有非空可见正文，只有 reasoning（或什么都没有）。
@@ -2825,41 +3347,80 @@ pub fn silent_final_frame(items: &[Value], finish_reason: Option<&str>) -> bool 
     })
 }
 
-/// message 项是否携带非空可见正文。读不出 content 数组时按「无正文」处理：
+/// message 项是否携带非空可见内容。读不出 content 数组时按「无正文」处理：
 /// 宁可多重试一次，也不能把读得出的静默帧漏判成有效输出。
+/// `refusal` 部件算可见内容（非空即有效输出）：合规的拒绝绝不能被判成静默帧
+/// 重发——那等于拿推动文案顶回一次拒绝，可能顶穿安全边界。
 fn message_item_has_visible_text(item: &Value) -> bool {
+    // 字符串形态的 content：非空即有可见文本（上游形态漂移的防御分支）。
+    if let Some(text) = item.get("content").and_then(Value::as_str) {
+        return !text.trim().is_empty();
+    }
     item.get("content")
         .and_then(Value::as_array)
         .is_some_and(|parts| {
             parts.iter().any(|part| {
-                part.get("type")
-                    .and_then(Value::as_str)
-                    == Some("output_text")
-                    && part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| !text.trim().is_empty())
+                let text = match part.get("type").and_then(Value::as_str) {
+                    Some("output_text") => part.get("text").and_then(Value::as_str),
+                    Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                    _ => None,
+                };
+                text.is_some_and(|text| !text.trim().is_empty())
             })
         })
 }
 
-/// 第二次重试的推动请求体：克隆客户端原请求，往 `input` 尾部追加一条用户
-/// 消息（形态与既有压缩摘要指令同款）。`input` 不是数组时返回 None——没有
-/// 可追加的位置，调用方退化为同体重采样，绝不自造 `input` 结构。
+/// 原生方言的静默终帧判据：终态必须是 completed，且 output 条目列表静默
+/// （与 Chat 方言共用 `silent_final_frame` 这一条判据本体，两处不宽窄不一）。
+pub fn native_response_is_silent(response: &Value) -> bool {
+    response.get("status").and_then(Value::as_str) == Some("completed")
+        && silent_final_frame(
+            response
+                .get("output")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None,
+        )
+}
+
+/// 第二次重试的推动请求体：克隆客户端原请求，先剥除历史里本层此前注入的同类
+/// 推动项（被污染的会话历史不得让推动消息跨轮累积），再往 `input` 尾部追加
+/// 一条用户消息（形态与既有压缩摘要指令同款，文案语言跟随会话）。
+/// `input` 不是数组时返回 None——没有可追加的位置，调用方退化为同体重采样，
+/// 绝不自造 `input` 结构。
 pub fn with_empty_frame_nudge(request_json: &Value) -> Option<Value> {
     if !request_json.get("input").is_some_and(Value::is_array) {
         return None;
     }
     let mut nudged = request_json.clone();
-    nudged["input"]
-        .as_array_mut()
-        .expect("input 已判过是数组")
-        .push(json!({
+    {
+        let items = nudged["input"].as_array_mut().expect("input 已判过是数组");
+        items.retain(|item| !is_relay_nudge_item(item));
+        items.push(json!({
             "type": "message",
             "role": "user",
-            "content": [{ "type": "input_text", "text": EMPTY_FRAME_NUDGE_TEXT }],
+            "content": [{ "type": "input_text", "text": format!("{} {}", nudge_text_for(request_json), EMPTY_FRAME_NUDGE_MARK) }],
         }));
+    }
     Some(nudged)
+}
+
+/// 是否为本层注入的推动项：user 消息且任一文本部件含识别标记。
+fn is_relay_nudge_item(item: &Value) -> bool {
+    if item.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let has_mark = |text: &str| text.contains(EMPTY_FRAME_NUDGE_MARK);
+    match item.get("content") {
+        Some(Value::String(text)) => has_mark(text),
+        Some(Value::Array(parts)) => parts.iter().any(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(has_mark)
+        }),
+        _ => false,
+    }
 }
 
 pub fn is_responses_proxy_path(path: &str) -> bool {
@@ -4198,6 +4759,8 @@ struct ChatSseState {
     tools: BTreeMap<usize, ToolCallState>,
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
+    /// 被护栏丢弃的重试轮 usage 聚合（诊断记账，不进交付）
+    dropped_usage: Option<Value>,
     finish_reason: Option<String>,
     tool_context: CodexToolContext,
     original_request: Option<Value>,
@@ -4219,6 +4782,7 @@ impl Default for ChatSseState {
             tools: BTreeMap::new(),
             output_items: Vec::new(),
             latest_usage: None,
+            dropped_usage: None,
             finish_reason: None,
             tool_context: CodexToolContext::default(),
             original_request: None,
@@ -6576,12 +7140,17 @@ fn mark_current_user_turn(messages: &mut Vec<Value>) {
     // 等待工具结果后的继续请求末尾是 tool/assistant 角色，此时最后一条 user
     // 是历史旧问题，钉上会把历史问题误导成「当前问题」。
     // 非 user 收尾：解包已完成，直接返回。
-    match messages
-        .last()
-        .and_then(|message| message.get("role").and_then(Value::as_str))
-    {
-        Some("user") => wrap_current_turn_mark(messages.last_mut().unwrap()),
-        _ => return,
+    // 护栏推动项豁免：空终帧重发的请求以本层注入的推动消息收尾。轮次标记
+    // 属于「真实用户指令」，绝不钉到推动项上——那会把中继提示当成当前指令。
+    // 豁免后回到原始请求的收尾形态判定：推动项之前若以 user 收尾就钉那条
+    // （与非重试轮逐字节同形，前缀缓存不受重发影响）；是非 user 收尾
+    // （等工具结果的续轮）就维持「不以 user 收尾不钉」的既有语义。
+    let mut tail = messages.len();
+    while tail > 0 && is_relay_nudge_item(&messages[tail - 1]) {
+        tail -= 1;
+    }
+    if tail > 0 && messages[tail - 1].get("role").and_then(Value::as_str) == Some("user") {
+        wrap_current_turn_mark(&mut messages[tail - 1]);
     }
 }
 
@@ -10284,7 +10853,16 @@ mod empty_frame_guard_tests {
         let messages = converted["messages"].as_array().unwrap();
         let last = messages.last().unwrap();
         assert_eq!(last["role"], json!("user"));
-        assert_eq!(last["content"].as_str().unwrap(), EMPTY_FRAME_NUDGE_TEXT);
+        // 会话含中文 → 选中文文案；识别标记必须随文案落地（历史剥除靠它）。
+        let text = last["content"].as_str().unwrap();
+        assert!(
+            text.contains(EMPTY_FRAME_NUDGE_TEXT_ZH),
+            "中文会话必须选中文文案：{text}"
+        );
+        assert!(
+            text.contains(EMPTY_FRAME_NUDGE_MARK),
+            "推动项必须带识别标记：{text}"
+        );
     }
 
     #[test]
@@ -10406,5 +10984,364 @@ mod empty_frame_guard_tests {
         let released = String::from_utf8(converter.release_deferred_terminal()).unwrap();
         assert!(released.contains("response.completed"));
         assert!(released.contains("data: [DONE]"));
+    }
+}
+
+#[cfg(test)]
+mod native_empty_frame_guard_tests {
+    use super::*;
+
+    fn sse_event(name: &str, payload: Value) -> String {
+        format!("event: {name}\ndata: {payload}\n\n")
+    }
+
+    fn created(id: &str) -> String {
+        sse_event(
+            "response.created",
+            json!({"type": "response.created", "response": {"id": id, "status": "in_progress"}}),
+        )
+    }
+
+    fn completed(id: &str, response_extra: Value) -> String {
+        let mut response = json!({"id": id, "status": "completed"});
+        for (key, value) in response_extra.as_object().expect("附加字段必须是对象") {
+            response[key] = value.clone();
+        }
+        sse_event("response.completed", json!({"type": "response.completed", "response": response}))
+    }
+
+    fn reasoning_item() -> Value {
+        json!({"type": "reasoning", "id": "r1"})
+    }
+
+    fn text_item(text: &str) -> Value {
+        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
+    }
+
+    /// 把一个 SSE 文本流切成下发 chunk（护栏必须自己按事件边界对齐，
+    /// chunk 怎么切都不许影响判定）。
+    fn chunks_of(stream: &str) -> Vec<Vec<u8>> {
+        stream.as_bytes().chunks(7).map(<[u8]>::to_vec).collect()
+    }
+
+    fn push_all(guard: &mut NativeResponsesGuard, stream: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in chunks_of(stream) {
+            out.extend_from_slice(&guard.push(&chunk));
+        }
+        out
+    }
+
+    /// 从一段输出里定位 `response.completed` 事件并解析其 payload。
+    /// 增量事件与终帧混在同一段里，按事件名取帧，别拿错 data 行。
+    fn parse_completed(haystack: &[u8]) -> Value {
+        let text = String::from_utf8(haystack.to_vec()).unwrap();
+        for block in split_sse_events(&text) {
+            let is_completed = block
+                .lines()
+                .find_map(|line| strip_sse_field(line, "event"))
+                .map(str::trim)
+                == Some("response.completed");
+            if is_completed {
+                return parse_sse_event_data(&block).expect("终帧必须是合法 JSON");
+            }
+        }
+        panic!("输出里必须有一个 response.completed 事件：{text}")
+    }
+
+    #[test]
+    fn native_silence_judgement_covers_all_shapes() {
+        // reasoning-only / 空 output / 缺 output：都是「客户端不会为它续轮」的静默收尾。
+        assert!(native_response_is_silent(
+            &json!({"status": "completed", "output": [reasoning_item()]})
+        ));
+        assert!(native_response_is_silent(
+            &json!({"status": "completed", "output": []})
+        ));
+        assert!(native_response_is_silent(&json!({"status": "completed"})));
+        // 空白正文按无正文处理（trim 判空与 Chat 方言同口径）。
+        assert!(native_response_is_silent(&json!({
+            "status": "completed",
+            "output": [text_item("   ")]
+        })));
+        // 可见正文 / 非空字符串 content / 工具调用项：一律有效输出。
+        assert!(!native_response_is_silent(&json!({
+            "status": "completed",
+            "output": [text_item("答案")]
+        })));
+        assert!(!native_response_is_silent(&json!({
+            "status": "completed",
+            "output": [{"type": "message", "content": "纯字符串正文"}]
+        })));
+        assert!(!native_response_is_silent(&json!({
+            "status": "completed",
+            "output": [{"type": "function_call", "name": "exec_command"}]
+        })));
+        // refusal 是合规拒绝，不是静默：误判会拿推动文案顶穿安全边界。
+        assert!(!native_response_is_silent(&json!({
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "refusal", "refusal": "不能协助该请求"}]}]
+        })));
+        // 非 completed 终态（截断/失败）不由护栏接管。
+        assert!(!native_response_is_silent(
+            &json!({"status": "incomplete", "output": []})
+        ));
+        assert!(!native_response_is_silent(
+            &json!({"status": "failed", "output": []})
+        ));
+    }
+
+    #[test]
+    fn guard_disabled_is_byte_identical() {
+        // 红线：开关不开时逐字节不变——静默终帧也即刻下发。
+        let mut guard = NativeResponsesGuard::default();
+        let stream = format!("{}{}", created("rA"), completed("rA", json!({"output": []})));
+        let mut out = Vec::new();
+        for chunk in chunks_of(&stream) {
+            out.extend_from_slice(&guard.push(&chunk));
+        }
+        assert_eq!(out, stream.as_bytes());
+        assert!(!guard.deferred());
+    }
+
+    #[test]
+    fn silent_completed_is_deferred_and_released_byte_identical() {
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let first = format!(
+            "{}{}",
+            created("rA"),
+            sse_event(
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item()})
+            )
+        );
+        let out = push_all(&mut guard, &first);
+        assert_eq!(out, first.as_bytes(), "非终帧事件必须原样即刻下发");
+
+        let tail = format!("{}data: [DONE]\n\n", completed("rA", json!({"output": [reasoning_item()]})));
+        let out = push_all(&mut guard, &tail);
+        assert!(out.is_empty(), "静默终帧及其后的 [DONE] 一并扣下");
+        assert!(guard.deferred());
+
+        let released = guard.release_deferred();
+        assert_eq!(released, tail.as_bytes(), "放行必须逐字节原样，绝不静默断流");
+        assert!(!guard.deferred());
+    }
+
+    #[test]
+    fn non_silent_completed_passes_through_untouched() {
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let stream = format!(
+            "{}{}",
+            created("rA"),
+            completed("rA", json!({"output": [text_item("答案")]}))
+        );
+        let out = push_all(&mut guard, &stream);
+        assert_eq!(out, stream.as_bytes());
+        assert!(!guard.deferred());
+        assert!(!guard.rewriting());
+    }
+
+    #[test]
+    fn retry_round_merges_items_shifts_indices_and_backfills_id() {
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let round1 = format!(
+            "{}{}{}",
+            created("resp_first"),
+            sse_event(
+                "response.output_item.done",
+                json!({"type": "response.output_item.done", "output_index": 0, "item": reasoning_item()})
+            ),
+            completed("resp_first", json!({
+                "output": [reasoning_item()],
+                "usage": {"output_tokens_details": {"reasoning_tokens": 120}, "total_tokens": 5000}
+            }))
+        );
+        let _ = push_all(&mut guard, &round1);
+        assert!(guard.deferred());
+        assert_eq!(
+            guard.dropped_usage(),
+            Some(&json!({"reasoning_tokens": 120, "total_tokens": 5000})),
+            "白烧的 reasoning token 必须在扣帧时入账"
+        );
+
+        guard.begin_retry();
+        assert!(guard.rewriting());
+
+        let round2_item = "event: response.output_item.added\r\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m2\"}}\r\n\r\n";
+        let round2 = format!(
+            "{}{}{}",
+            created("resp_second"),
+            round2_item,
+            completed("resp_second", json!({
+                "output": [{"type": "message", "id": "m2", "output_index": 0, "content": [{"type": "output_text", "text": "第二轮正文"}]}],
+                "usage": {"output_tokens_details": {"reasoning_tokens": 30}, "total_tokens": 900}
+            }))
+        );
+        let out = push_all(&mut guard, &round2);
+        let out_text = String::from_utf8(out).unwrap();
+
+        // 第二轮的 created 不许出门（客户端已认得这个响应身份）。
+        assert!(!out_text.contains("response.created"), "{out_text}");
+        // 增量事件位移保留 CRLF 形态，output_index 抬到位移量。
+        assert!(out_text.contains("\"output_index\":1"), "{out_text}");
+        assert!(out_text.contains("\r\n\r\n"), "事件边界字节形态必须保持");
+        // 终帧合并：id 回填首轮，output 前垫第一轮条目、本轮条目接位。
+        let merged = parse_completed(out_text.as_bytes());
+        let response = &merged["response"];
+        assert_eq!(response["id"], json!("resp_first"));
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], json!("reasoning"));
+        assert_eq!(output[1]["id"], json!("m2"));
+        assert_eq!(output[1]["output_index"], json!(1));
+        assert!(!guard.deferred());
+    }
+
+    #[test]
+    fn back_to_back_silence_defers_merged_frame_and_accumulates_usage() {
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let round1 = format!(
+            "{}{}",
+            created("rA"),
+            completed("rA", json!({
+                "output": [reasoning_item()],
+                "usage": {"output_tokens_details": {"reasoning_tokens": 100}, "total_tokens": 4000}
+            }))
+        );
+        let _ = push_all(&mut guard, &round1);
+        guard.begin_retry();
+
+        let round2 = completed("rB", json!({
+            "output": [{"type": "reasoning", "id": "r2"}],
+            "usage": {"output_tokens_details": {"reasoning_tokens": 50}, "total_tokens": 1500}
+        }));
+        let out = push_all(&mut guard, &round2);
+        assert!(out.is_empty());
+        assert!(guard.deferred());
+        assert_eq!(
+            guard.dropped_usage(),
+            Some(&json!({"reasoning_tokens": 150, "total_tokens": 5500})),
+            "连续静默的账必须累加"
+        );
+        // 放弃重试时放行的是合并帧：客户端已按位移收过条目，轮帧对不上账。
+        let released = guard.release_deferred();
+        let merged = parse_completed(&released);
+        assert_eq!(merged["response"]["id"], json!("rA"));
+        let output = merged["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1]["id"], json!("r2"));
+    }
+
+    #[test]
+    fn upstream_failure_event_is_never_rewritten() {
+        // 红线：上游自报失败不拦不改，收口机器照常接管。
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let round1 = format!(
+            "{}{}",
+            created("rA"),
+            completed("rA", json!({"output": [reasoning_item()]}))
+        );
+        let _ = push_all(&mut guard, &round1);
+        guard.begin_retry();
+        let failure = sse_event(
+            "response.failed",
+            json!({"type": "response.failed", "response": {"id": "rB", "status": "failed"}}),
+        );
+        let out = push_all(&mut guard, &failure);
+        assert_eq!(out, failure.as_bytes());
+        assert!(!guard.deferred());
+    }
+
+    #[test]
+    fn oversized_burst_without_boundary_degrades_to_passthrough() {
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let burst = vec![b'x'; NATIVE_GUARD_EVENT_LIMIT + 1];
+        let out = guard.push(&burst);
+        assert_eq!(out, burst, "等不到边界的巨量字节必须原样放行");
+        // 退化后整流直通：后续事件不再判定。
+        let stream = completed("rA", json!({"output": []}));
+        let out = guard.push(stream.as_bytes());
+        assert_eq!(out, stream.as_bytes());
+        assert!(!guard.deferred());
+    }
+
+    #[test]
+    fn nudge_language_follows_request_and_mark_strips_history() {
+        let zh = json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续盯住这个任务"}]}]});
+        let nudged = with_empty_frame_nudge(&zh).unwrap();
+        let items = nudged["input"].as_array().unwrap();
+        let tail_text = items.last().unwrap()["content"][0]["text"].as_str().unwrap();
+        assert!(tail_text.contains(EMPTY_FRAME_NUDGE_TEXT_ZH), "{tail_text}");
+        assert!(tail_text.contains(EMPTY_FRAME_NUDGE_MARK), "{tail_text}");
+
+        let en = json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "keep going on this task"}]}]});
+        let nudged = with_empty_frame_nudge(&en).unwrap();
+        let tail_text = nudged["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(tail_text.contains(EMPTY_FRAME_NUDGE_TEXT_EN), "{tail_text}");
+
+        // 历史里已注入过的推动项必须剥除，不跨轮累积。
+        let polluted = json!({"input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "真问题"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": format!("{} {}", EMPTY_FRAME_NUDGE_TEXT_ZH, EMPTY_FRAME_NUDGE_MARK)}]},
+        ]});
+        let nudged = with_empty_frame_nudge(&polluted).unwrap();
+        let items = nudged["input"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "剥一条、追一条：总数不涨");
+        assert_eq!(items[0]["content"][0]["text"], json!("真问题"));
+        assert!(
+            items[1]["content"][0]["text"].as_str().unwrap().contains(EMPTY_FRAME_NUDGE_MARK)
+        );
+    }
+
+    #[test]
+    fn turn_mark_skips_relay_nudge_item() {
+        // 推动项收尾 + 前面是真实 user 指令：标记钉在真实指令上（与非重试轮同形）。
+        let nudge = json!({"role": "user", "content": [{"type": "text", "text": format!("{} {}", EMPTY_FRAME_NUDGE_TEXT_ZH, EMPTY_FRAME_NUDGE_MARK)}]});
+        let mut messages = vec![
+            json!({"role": "system", "content": [{"type": "text", "text": "前言"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "真问题"}]}),
+            nudge.clone(),
+        ];
+        mark_current_user_turn(&mut messages);
+        assert!(
+            messages[1]["content"][0]["text"].as_str().unwrap().starts_with(CURRENT_TURN_OPEN),
+            "标记必须钉在真实用户指令上"
+        );
+        assert!(
+            !messages[2]["content"][0]["text"].as_str().unwrap().contains(CURRENT_TURN_OPEN),
+            "推动项绝不携带轮次标记"
+        );
+
+        // 推动项收尾 + 前面是工具结果（等工具后续轮）：维持「不以 user 收尾不钉」。
+        let mut messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "旧问题"}]}),
+            json!({"role": "tool", "content": [{"type": "text", "text": "工具结果"}]}),
+            nudge,
+        ];
+        mark_current_user_turn(&mut messages);
+        for message in &messages {
+            let texts: Vec<&str> = message["content"]
+                .as_array()
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part["text"].as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                texts.iter().all(|text| !text.contains(CURRENT_TURN_OPEN)),
+                "非 user 收尾（剔除推动项后）不得钉标记"
+            );
+        }
     }
 }
