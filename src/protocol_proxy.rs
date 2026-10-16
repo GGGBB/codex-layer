@@ -1516,7 +1516,8 @@ pub struct NativeResponsesGuard {
     /// 客户端全程只认一个响应身份。
     first_response_id: Option<String>,
     /// 被丢弃轮的输出条目：终帧合并时垫在前面，保证客户端最终看到的 output
-    /// 数组与已流式下发过的条目一致（位移量即其长度）。
+    /// 数组与已流式下发过的条目一致（位移量即其长度）。条目自带的
+    /// `output_index` 在垫入时已抬成全局序号（见 `absorb_items_into_carried`）。
     carried_items: Vec<Value>,
     /// 扣下的终帧及其后到达的全部字节。`Some` 即「装配层该走重发决策了」。
     deferred: Option<Vec<u8>>,
@@ -1571,6 +1572,24 @@ impl NativeResponsesGuard {
     /// 上游本轮的位移量：已垫入的条目数。溢出时返回 None，改写处宁缺毋滥。
     fn index_offset(&self) -> Option<u32> {
         u32::try_from(self.carried_items.len()).ok()
+    }
+
+    /// 静默轮的条目垫入基底：条目自带的 `output_index` 当场抬成全局序号，
+    /// 位移量取垫入时刻的基底长度。基底原样存轮内序号的话，连续两个静默轮
+    /// 会让终帧数组里出现两批撞车的 0、1，且和客户端已经收过的流式 index
+    /// 对不上账（改写轮的增量事件是按「基底长度 + 轮内序号」出门的）。
+    /// 位移口径与终帧合并同源：不自带 index 不替它发明，溢出宁缺毋滥。
+    fn absorb_items_into_carried(&mut self, items: &[Value]) {
+        let offset = self.carried_items.len();
+        for (pos, item) in items.iter().cloned().enumerate() {
+            let mut item = item;
+            if item.get("output_index").is_some()
+                && let Some(index) = shifted_index(offset, pos)
+            {
+                item["output_index"] = json!(index);
+            }
+            self.carried_items.push(item);
+        }
     }
 
     /// 喂入上游字节，返回此刻可以下发给客户端的字节。
@@ -1705,7 +1724,7 @@ impl NativeResponsesGuard {
                         if let Some(items) =
                             event_response_field(event, "output").and_then(Value::as_array)
                         {
-                            self.carried_items.extend(items.iter().cloned());
+                            self.absorb_items_into_carried(items);
                         }
                         EventAction::Defer { bytes: None }
                     } else {
@@ -1731,7 +1750,7 @@ impl NativeResponsesGuard {
                         if let Some(items) =
                             event_response_field(event, "output").and_then(Value::as_array)
                         {
-                            self.carried_items.extend(items.iter().cloned());
+                            self.absorb_items_into_carried(items);
                         }
                         // 暂存区收合并改写帧：放弃重试时放行的也是它——客户端
                         // 已按位移收过本轮增量事件，原始轮帧会对不上账。
@@ -11296,6 +11315,95 @@ mod native_empty_frame_guard_tests {
     }
 
     #[test]
+    fn consecutive_silent_rounds_keep_carried_indices_global() {
+        // 静默轮条目垫入基底时必须当场把轮内 index 抬成全局序号：连续两个
+        // 静默轮若都存轮内序号，基底里会出现两批撞车的 0、1，终帧数组与
+        // 客户端已收过的流式 index 两侧算术对不上账。夹具刻意让每个静默轮
+        // 都是 reasoning + 空 message 双条目、终帧条目自带 output_index。
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let round1 = format!(
+            "{}{}{}{}",
+            created("resp_a"),
+            sse_event(
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "reasoning", "id": "a"}})
+            ),
+            sse_event(
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "message", "id": "b"}})
+            ),
+            completed("resp_a", json!({
+                "output": [
+                    {"type": "reasoning", "id": "a", "output_index": 0},
+                    {"type": "message", "id": "b", "output_index": 1, "content": []},
+                ]
+            }))
+        );
+        let _ = push_all(&mut guard, &round1);
+        guard.begin_retry();
+
+        // 第二轮仍然静默：两条增量按位移出门，落到全局 2、3。
+        let round2 = format!(
+            "{}{}{}{}",
+            created("resp_b"),
+            sse_event(
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "reasoning", "id": "c"}})
+            ),
+            sse_event(
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "message", "id": "d"}})
+            ),
+            completed("resp_b", json!({
+                "output": [
+                    {"type": "reasoning", "id": "c", "output_index": 0},
+                    {"type": "message", "id": "d", "output_index": 1, "content": []},
+                ]
+            }))
+        );
+        let out2 = String::from_utf8(push_all(&mut guard, &round2)).unwrap();
+        let mut round2_indices = Vec::new();
+        for block in split_sse_events(&out2) {
+            let is_added = block
+                .lines()
+                .find_map(|line| strip_sse_field(line, "event"))
+                .map(str::trim)
+                    == Some("response.output_item.added");
+            if is_added {
+                let payload = parse_sse_event_data(&block).expect("增量事件必须合法");
+                round2_indices.push(payload["output_index"].as_u64().unwrap());
+            }
+        }
+        assert_eq!(round2_indices, vec![2, 3], "第二个静默轮的增量必须按基底长度位移");
+        guard.begin_retry();
+
+        // 第三轮交付：终帧数组的全局 index 必须逐位等于数组位置，客户端按
+        // index 定位条目时既无空洞也无撞车。
+        let round3 = format!(
+            "{}{}",
+            sse_event(
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "e"}})
+            ),
+            completed("resp_c", json!({
+                "output": [
+                    {"type": "message", "id": "e", "output_index": 0, "content": [{"type": "output_text", "text": "交付"}]},
+                ]
+            }))
+        );
+        let out3 = String::from_utf8(push_all(&mut guard, &round3)).unwrap();
+        let merged = parse_completed(out3.as_bytes());
+        let output = merged["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 5, "两轮静默各两条 + 交付轮一条");
+        let indices: Vec<u64> = output
+            .iter()
+            .map(|item| item["output_index"].as_u64().expect("基底与本轮条目都自带 index"))
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4], "全局 index 必须逐位等于数组位置，不许撞车");
+    }
+
+    #[test]
     fn back_to_back_silence_defers_merged_frame_and_accumulates_usage() {
         let mut guard = NativeResponsesGuard::default();
         guard.set_enabled(true);
@@ -11502,3 +11610,4 @@ mod native_empty_frame_guard_tests {
         }
     }
 }
+
