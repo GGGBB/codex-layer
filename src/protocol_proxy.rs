@@ -1924,13 +1924,18 @@ fn shifted_index(carried_len: usize, pos: usize) -> Option<u32> {
     u32::try_from(carried_len.saturating_add(pos)).ok()
 }
 
-/// 改写轮的增量事件位移：顶层 `output_index` 抬到位移量。payload 缺失、
-/// 没有顶层 index、或位移量溢出——一律返回 None 走原样放行。
+/// 改写轮的增量事件位移：顶层 `output_index` 抬成「位移量 + 轮内序号」。
+/// 轮内序号就是上游本轮自带的顶层 index（每轮从 0 起），逐事件独立位移，
+/// 同轮多条目才不会全部撞在同一个 index 上；终帧合并按「carried 数 + 数组
+/// 位置」写条目 index，两侧算术必须对得上账。payload 缺失、顶层 index 不是
+/// 非负整数（形态不认识，宁缺毋滥）、或位移溢出——一律 None 走原样放行。
 fn shift_event_output_indices(event: &NativeEventInfo, offset: Option<u32>) -> Option<Value> {
     let offset = offset?;
     let mut shifted = event.payload.clone()?;
     let top = shifted.get_mut("output_index")?;
-    *top = json!(offset);
+    let in_round = top.as_u64()?;
+    let shifted_index = offset.checked_add(u32::try_from(in_round).ok()?)?;
+    *top = json!(shifted_index);
     Some(shifted)
 }
 
@@ -3299,23 +3304,40 @@ const EMPTY_FRAME_NUDGE_TEXT_EN: &str =
 /// 防止被污染的会话历史里推动消息跨轮累积。
 const EMPTY_FRAME_NUDGE_MARK: &str = "[relay-empty-frame-nudge]";
 
-/// 推动文案语言选择：从请求尾部向前扫一段，有 CJK 即判中文会话，否则英文。
-/// 只看尾部是因为推动文案只与「用户最近的话」同屏；语言不会在一条会话里
-/// 隔 2K 字符突变，扫描预算定在尾部 2048 字符。
+/// 推动文案语言选择：读 `input` 里最后一条 user 消息的文本（推动文案与
+/// 「用户最近的话」同屏，判语言就该读那句人话），没有 user 消息再退
+/// `instructions`；判定文本尾部 2048 字符内出现 CJK 即判中文，否则英文。
+/// 绝不读「整个请求的序列化尾部」：serde_json 对对象键按排序输出，真实
+/// 客户端请求的序列化尾部恒是工具 schema（ASCII），语言判定会恒判英文
+/// ——真实形态下必错（issue #86）。也不为判语言序列化整个请求（可达数百 KB）。
 fn nudge_text_for(request_json: &Value) -> &'static str {
-    let is_cjk = |c: char| {
-        matches!(
-            c as u32,
-            0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
-        )
+    let has_cjk = |text: &str| {
+        text.chars().rev().take(2048).any(|c| {
+            matches!(
+                c as u32,
+                0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+            )
+        })
     };
-    if request_json
-        .to_string()
-        .chars()
-        .rev()
-        .take(2048)
-        .any(is_cjk)
-    {
+    let last_user_text = request_json
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .rev()
+                .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+        })
+        .and_then(|item| match item.get("content") {
+            Some(Value::String(text)) => Some(text.as_str()),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .rev()
+                .find_map(|part| part.get("text").and_then(Value::as_str)),
+            _ => None,
+        })
+        .or_else(|| request_json.get("instructions").and_then(Value::as_str));
+    if last_user_text.is_some_and(has_cjk) {
         EMPTY_FRAME_NUDGE_TEXT_ZH
     } else {
         EMPTY_FRAME_NUDGE_TEXT_EN
@@ -11202,6 +11224,78 @@ mod native_empty_frame_guard_tests {
     }
 
     #[test]
+    fn retry_round_shifts_each_increment_by_offset_plus_in_round_index() {
+        // issue #86 缺陷 1：改写轮的多个增量事件必须逐事件位移「offset + 轮内
+        // 序号」，全部写成同一个 offset 会让条目在客户端互相覆盖。夹具刻意是
+        // 病灶形态的重发成功轮：reasoning + message 两条增量。
+        let mut guard = NativeResponsesGuard::default();
+        guard.set_enabled(true);
+        let round1 = format!(
+            "{}{}",
+            created("resp_first"),
+            completed("resp_first", json!({
+                "output": [reasoning_item()],
+                "usage": {"output_tokens_details": {"reasoning_tokens": 100}, "total_tokens": 900}
+            }))
+        );
+        let _ = push_all(&mut guard, &round1);
+        // push_all 已放行扣帧；这里只要它进入过扣帧，随后手动开第二轮。
+        guard.begin_retry();
+
+        let round2 = format!(
+            "{}{}{}{}",
+            created("resp_second"),
+            sse_event(
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "reasoning", "id": "b"}})
+            ),
+            sse_event(
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 1, "item": {"type": "message", "id": "c"}})
+            ),
+            completed("resp_second", json!({
+                "output": [
+                    {"type": "reasoning", "id": "b", "output_index": 0},
+                    {"type": "message", "id": "c", "output_index": 1, "content": [{"type": "output_text", "text": "交付"}]},
+                ]
+            }))
+        );
+        let out = push_all(&mut guard, &round2);
+        let text = String::from_utf8(out).unwrap();
+
+        // 两条增量事件各自抬到 1 和 2（offset=1 条 carried + 轮内 0/1）。
+        let mut stream_indices = Vec::new();
+        for block in split_sse_events(&text) {
+            let is_added = block
+                .lines()
+                .find_map(|line| strip_sse_field(line, "event"))
+                .map(str::trim)
+                == Some("response.output_item.added");
+            if is_added {
+                let payload = parse_sse_event_data(&block).expect("增量事件必须合法");
+                stream_indices.push(payload["output_index"].as_u64().expect("顶层 index 必须是数字"));
+            }
+        }
+        assert_eq!(stream_indices, vec![1, 2], "同轮两条增量必须逐条位移，不得撞车");
+
+        // 终帧条目数组位置与流式 index 逐一对齐（两侧算术同源）。
+        let merged = parse_completed(text.as_bytes());
+        let output = merged["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3, "首轮 reasoning 垫底 + 本轮两条接位");
+        let merged_indices: Vec<u64> = output
+            .iter()
+            .enumerate()
+            .map(|(pos, item)| {
+                item.get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(pos as u64)
+            })
+            .collect();
+        // 首轮垫底条目没有自带 index（数组位置即序号 0），本轮两条报 1、2。
+        assert_eq!(&merged_indices[1..], &[1, 2], "终帧条目 index 必须与流式事件一致");
+    }
+
+    #[test]
     fn back_to_back_silence_defers_merged_frame_and_accumulates_usage() {
         let mut guard = NativeResponsesGuard::default();
         guard.set_enabled(true);
@@ -11287,6 +11381,69 @@ mod native_empty_frame_guard_tests {
             .as_str()
             .unwrap();
         assert!(tail_text.contains(EMPTY_FRAME_NUDGE_TEXT_EN), "{tail_text}");
+
+        // issue #86 缺陷 2：真实客户端请求的对象键按字母序序列化，tools 落在
+        // 尾部——「序列化尾部找 CJK」的旧判据在这种形态下恒判英文。中文会话
+        // + 大 tools 必须仍判中文；语言判据只读最后一条 user 消息（及
+        // instructions 兜底），与请求里其他键的排布无关。
+        let big_tools: Vec<Value> = (0..12)
+            .map(|i| {
+                json!({
+                    "type": "function",
+                    "name": format!("exec_tool_{}", i),
+                    "description": "Runs a command in the sandbox environment.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string", "description": "Shell command to execute."},
+                            "workdir": {"type": "string", "description": "Working directory."}
+                        }
+                    }
+                })
+            })
+            .collect();
+        let zh_big = json!({
+            "model": "m",
+            "instructions": "You are a coding agent.",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "继续盯着这个任务，别停。"}]}],
+            "tools": big_tools,
+            "parallel_tool_calls": true,
+            "tool_choice": "auto",
+            "reasoning": {"effort": "medium"},
+            "text": {"format": {"type": "text"}},
+        });
+        let nudged = with_empty_frame_nudge(&zh_big).unwrap();
+        let tail_text = nudged["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            tail_text.contains(EMPTY_FRAME_NUDGE_TEXT_ZH),
+            "中文会话 + 大 tools 必须判中文（旧判据读序列化尾部会恒判英文）: {tail_text}"
+        );
+
+        // 语言判据的取词优先级：最后一条 user 文本优先（推动文案与用户的
+        // 话同屏），user 缺席才退 instructions；user 文本英文 + 中文
+        // instructions → 以 user 为准判英文。
+        let mixed = json!({
+            "instructions": "你是一个编码代理。",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "keep going"}]}],
+        });
+        let nudged = with_empty_frame_nudge(&mixed).unwrap();
+        let tail_text = nudged["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(tail_text.contains(EMPTY_FRAME_NUDGE_TEXT_EN), "以最后一条 user 文本为准: {tail_text}");
+
+        // user 缺席时 instructions 兜底判语言。
+        let instr_zh = json!({
+            "instructions": "请用中文回答用户。",
+            "input": [{"type": "compaction_trigger"}],
+        });
+        let nudged = with_empty_frame_nudge(&instr_zh).unwrap();
+        let tail_text = nudged["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(tail_text.contains(EMPTY_FRAME_NUDGE_TEXT_ZH), "user 缺席退 instructions: {tail_text}");
 
         // 历史里已注入过的推动项必须剥除，不跨轮累积。
         let polluted = json!({"input": [
