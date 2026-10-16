@@ -50,7 +50,7 @@ use codex_layer::protocol_proxy::{
     open_models_proxy_request, open_responses_proxy_request_for_path_with_session_headers,
     responses_json_to_sse_events, responses_error_from_upstream, wrap_non_stream_response_as_compaction,
     upstream_conversion_error_response,
-    EMPTY_FRAME_MAX_RETRIES, with_empty_frame_nudge,
+    EMPTY_FRAME_MAX_RETRIES, NativeResponsesGuard, with_empty_frame_nudge,
 };
 use codex_layer::stability::{self, StabilityAggregateOptions};
 use codex_layer::stability_ui;
@@ -837,15 +837,12 @@ async fn responses_proxy(
             events::layer::STREAM_OPEN,
             json!({ "path": path, "wireApi": format!("{:?}", upstream.wire_api), "compaction": compaction_round || upstream.compaction, "requestId": request_id.clone() }),
         );
-        // 空终帧护栏的重发通道：四个条件齐了才开——Chat 方言（终帧判定与重发
-        // 在那里才有意义）、非压缩轮（含降级轮，压缩轮有自己的收口账）、客户端
-        // 请求解析得动（重发要靠它重建请求体）。
+        // 空终帧护栏的重发通道（issue #83：双方言同权）：三个条件齐了才开——
+        // 非压缩轮（含降级轮，压缩轮有自己的收口账）、客户端请求解析得动
+        // （重发要靠它重建请求体）。静默判定与扣帧改写分别住在 Chat 转换层与
+        // 原生透传护栏里，判据共用同一本体。
         let retry_opener: Option<StreamRetryOpener> =
-            if upstream.wire_api == UpstreamWireApi::ChatCompletions
-                && !compaction_round
-                && !upstream.compaction
-                && request_json.is_some()
-            {
+            if !compaction_round && !upstream.compaction && request_json.is_some() {
                 let user_agent = user_agent.map(str::to_string);
                 let beta_features = beta_features.map(str::to_string);
                 let path = path.to_string();
@@ -1174,7 +1171,9 @@ fn stream_from_upstream(
             return;
         }
         if wire_api == UpstreamWireApi::Responses {
-            // 原生 Responses 透传支路：字节原样转发，观察者只旁路读，不产出任何字节。
+            // 原生 Responses 透传支路。护栏关闭时与旧实现逐字节一致：字节原样
+            // 转发，观察者只旁路读，不产出任何字节。护栏开启时按事件边界对齐
+            // 下发（兼容口径见 `NativeResponsesGuard` 文档），静默终帧扣帧重发。
             // 守卫要解决的是「上游在完成事件前断流」：原样转发时客户端只看到连接关闭，
             // 分不清正常结束还是半途而废，所以收口时由本层补一帧显式 response.failed。
             let mut observer = NativeResponsesSseObserver::default();
@@ -1182,6 +1181,17 @@ fn stream_from_upstream(
             // 超限后停止转发：继续下发只会让客户端拿到一段注定要按失败收口的残缺流。
             let mut over_limit = false;
             let mut drained = false;
+            // 空终帧护栏（issue #83）：压缩轮不开——装配层的重发通道本就不为
+            // 压缩轮装配，这里显式再钉一道，两条防线不许只靠一条。
+            let guard_enabled = retry_opener.is_some() && !native_compaction;
+            let mut guard = NativeResponsesGuard::default();
+            guard.set_enabled(guard_enabled);
+            let mut retries_used = 0usize;
+            // 排空截止用装箱 future：重试轮重开上游流后要换新的截止，
+            // 已命中的截止不可能被重试轮再踩一次。
+            let mut drain_wait: std::pin::Pin<
+                std::boxed::Box<dyn std::future::Future<Output = ()> + Send + '_>,
+            > = Box::pin(drain.wait_deadline());
             loop {
                 let next = tokio::select! {
                     next = chunks.next() => next,
@@ -1193,6 +1203,7 @@ fn stream_from_upstream(
                 let Some(chunk) = next else { break };
                 match chunk {
                     Ok(bytes) => {
+                        // 红线 4：观察者永远吃上游原始字节，护栏改写不影响补帧判定。
                         observer.push_bytes(&bytes);
                         if native_compaction {
                             tally.push_bytes(&bytes);
@@ -1204,14 +1215,107 @@ fn stream_from_upstream(
                         if over_limit {
                             continue;
                         }
-                        if tx.send(Ok(bytes)).is_err() {
+                        // 护栏关闭时保持旧行为：每个 chunk 无条件原样下发
+                        // （含空 chunk，逐字节一致的测试红线依赖这一点）。
+                        let forwarded = if guard_enabled {
+                            guard.push(&bytes)
+                        } else {
+                            if tx.send(Ok(bytes)).is_err() {
+                                return;
+                            }
+                            Vec::new()
+                        };
+                        if !forwarded.is_empty() && tx.send(Ok(Bytes::from(forwarded))).is_err() {
                             // 客户端已经断开：没有接收方，补帧无意义，直接收工。
                             return;
                         }
+                        if !guard.deferred() {
+                            continue;
+                        }
+                        // 静默终帧被扣下：走重试决策。语义与 Chat 分支同款——
+                        // 重开成功就换新的上游流继续泵（第二轮条目按位移续排）；
+                        // 额度用尽或重开失败则把扣下的帧原样放行后断泵，
+                        // 走既有收口诊断。绝不造成「无 completed 也无 failed」
+                        // 的静默断流。
+                        if retries_used >= EMPTY_FRAME_MAX_RETRIES {
+                            log_event(
+                                events::layer::EMPTY_FRAME_EXHAUSTED,
+                                json!({ "requestId": request_id, "attempts": retries_used, "droppedUsage": guard.dropped_usage() }),
+                            );
+                            let released = guard.release_deferred();
+                            if !released.is_empty() && tx.send(Ok(Bytes::from(released))).is_err() {
+                                return;
+                            }
+                            break;
+                        }
+                        let opener = retry_opener
+                            .as_ref()
+                            .expect("护栏开关打开时重发通道必在");
+                        // 第一次重试同体重采样（前缀全命中，纯赌温度）；第二次
+                        // 带推动文案。推动项拼不进 input（形态不认识）就原样
+                        // 重发，绝不自造请求结构。
+                        let same_body = request_json
+                            .clone()
+                            .expect("护栏开关打开时客户端请求必解析得动");
+                        let nudged = retries_used >= 1;
+                        let retry_body = if nudged {
+                            with_empty_frame_nudge(&same_body).unwrap_or(same_body)
+                        } else {
+                            same_body
+                        };
+                        retries_used += 1;
+                        // 决策日志先落：此刻重发还没成功，但「扣帧 + 已选请求体」
+                        // 这个事实现场是排障最需要的——重发失败时这里是唯一现场。
+                        // droppedUsage 带的是截至此刻被丢轮的累计账（扣帧时入账）。
+                        log_event(
+                            events::layer::EMPTY_FRAME_RETRY,
+                            json!({ "requestId": request_id, "attempt": retries_used, "nudged": nudged, "droppedUsage": guard.dropped_usage() }),
+                        );
+                        match opener(retry_body).await {
+                            Ok(opened) if opened.is_success() => {
+                                // 扣帧暂存区的条目垫入下一轮基底，换上游流继续泵：
+                                // 第二轮的重复身份事件由护栏吞掉，条目按位移续排
+                                // 在同一条客户端事件流里（Chat 分支同款机器）。
+                                guard.begin_retry();
+                                // 观察者的收口证据同步重开：上一轮 completed 已被
+                                // 扣帧丢弃（永不门），留着它会把「重发轮半途断流」
+                                // 误判成已完成——客户端将收不到任何终帧，红线所在。
+                                observer.begin_retry();
+                                chunks = opened.response.bytes_stream();
+                                drain_wait = Box::pin(drain.wait_deadline());
+                                continue;
+                            }
+                            other => {
+                                // 重发通道自己失败：扣下的帧放行、照常收口；
+                                // 日志要能分清「重发没开门」还是「又静默」。
+                                let reason = match &other {
+                                    Ok(opened) => {
+                                        format!("重发上游返回状态码 {}", opened.status_code)
+                                    }
+                                    Err(error) => error.to_string(),
+                                };
+                                log_event(
+                                    events::layer::EMPTY_FRAME_EXHAUSTED,
+                                    json!({ "requestId": request_id, "attempts": retries_used, "reason": reason, "droppedUsage": guard.dropped_usage() }),
+                                );
+                                let released = guard.release_deferred();
+                                if !released.is_empty() {
+                                    let _ = tx.send(Ok(Bytes::from(released)));
+                                }
+                                break;
+                            }
+                        }
                     }
                     Err(error) => {
-                        // 读流错误：先补帧，再按既有行为把错误交给 HTTP 层中止 body；
-                        // 这个顺序保证客户端至少还能拿到一个显式终止信号。
+                        // 读流错误：扣着的帧先放行（客户端至少先拿到「上游
+                        // 说完了」），再补帧，再按既有行为把错误交给 HTTP 层
+                        // 中止 body；这个顺序保证客户端至少还能拿到显式终止信号。
+                        if guard.deferred() {
+                            let released = guard.release_deferred();
+                            if !released.is_empty() {
+                                let _ = tx.send(Ok(Bytes::from(released)));
+                            }
+                        }
                         let error_text = error.to_string();
                         let reason = match close_native_responses_stream(observer, "stream_error", &tx) {
                             Some(reason) => format!("{reason}（传输错误：{error_text}）"),
@@ -1230,6 +1334,14 @@ fn stream_from_upstream(
                         let _ = tx.send(item);
                         return;
                     }
+                }
+            }
+            if drained && guard.deferred() {
+                // 关停排空截止命中且还扣着终帧：先放行「上游说完了」，
+                // 再走显式失败收口。语义与 Chat 分支同款。
+                let released = guard.release_deferred();
+                if !released.is_empty() {
+                    let _ = tx.send(Ok(Bytes::from(released)));
                 }
             }
             if native_compaction && !drained {
@@ -1264,6 +1376,12 @@ fn stream_from_upstream(
                     }
                 }
             }
+            // EOF 兜底：未成帧残留照发；万一还扣着帧（正常路径走不到这里），
+            // 一并放行——红线高于一切，客户端永远拿得到终帧。
+            let tail = guard.release_deferred();
+            if !tail.is_empty() {
+                let _ = tx.send(Ok(Bytes::from(tail)));
+            }
             // HTTP EOF 不是 Responses 协议的完成事件，`[DONE]` 也不算：
             // 没观察到完成事件就一律补失败帧（与 Chat 泵的收口口径一致）。
             // 排空截止点命中时同样走这条收口，只是 error_type 与措辞区分开。
@@ -1283,7 +1401,7 @@ fn stream_from_upstream(
                 None => {
                     log_event(
                         events::layer::STREAM_COMPLETED,
-                        json!({ "model": model, "requestId": request_id }),
+                        json!({ "model": model, "requestId": request_id, "attempts": retries_used + 1 }),
                     );
                 }
             }
@@ -1336,7 +1454,7 @@ fn stream_from_upstream(
                         if retries_used >= EMPTY_FRAME_MAX_RETRIES {
                             log_event(
                                 events::layer::EMPTY_FRAME_EXHAUSTED,
-                                json!({ "requestId": request_id, "attempts": retries_used }),
+                                json!({ "requestId": request_id, "attempts": retries_used, "droppedUsage": converter.dropped_usage() }),
                             );
                             let released = converter.release_deferred_terminal();
                             if !released.is_empty()
@@ -1362,9 +1480,12 @@ fn stream_from_upstream(
                             same_body
                         };
                         retries_used += 1;
+                        // 决策日志先落：此刻重发还没成功，但「扣帧 + 已选请求体」是
+                        // 排障最需要的现场——重发失败时这里是唯一现场。droppedUsage
+                        // 带的是截至此刻被丢轮的累计账（扣帧时入账）。
                         log_event(
                             events::layer::EMPTY_FRAME_RETRY,
-                            json!({ "requestId": request_id, "attempt": retries_used, "nudged": nudged }),
+                            json!({ "requestId": request_id, "attempt": retries_used, "nudged": nudged, "droppedUsage": converter.dropped_usage() }),
                         );
                         match opener(retry_body).await {
                             Ok(opened) if opened.is_success() => {
@@ -1384,7 +1505,7 @@ fn stream_from_upstream(
                                 };
                                 log_event(
                                     events::layer::EMPTY_FRAME_EXHAUSTED,
-                                    json!({ "requestId": request_id, "attempts": retries_used, "reason": reason }),
+                                    json!({ "requestId": request_id, "attempts": retries_used, "reason": reason, "droppedUsage": converter.dropped_usage() }),
                                 );
                                 let released = converter.release_deferred_terminal();
                                 if !released.is_empty() {
@@ -1457,7 +1578,7 @@ fn stream_from_upstream(
         } else {
             log_event(
                 events::layer::STREAM_COMPLETED,
-                json!({ "model": model, "requestId": request_id }),
+                json!({ "model": model, "requestId": request_id, "attempts": retries_used + 1 }),
             );
         }
     });
